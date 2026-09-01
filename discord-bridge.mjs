@@ -155,6 +155,7 @@ export function createBridgeApplication(dependencies = {}) {
   let healthController = null;
   let healthLifecycle = 'inactive';
   let healthFinalAllowed = false;
+  let startupCleanupComplete = false;
   const idleWaiters = new Set();
 
   const notifyIdle = () => {
@@ -266,6 +267,48 @@ export function createBridgeApplication(dependencies = {}) {
     return outcome === 'ok';
   };
 
+  const reportStartupCleanupFailure = () => {
+    try { Promise.resolve(dependencies.logHealthFailure?.('startup-cleanup-failed')).catch(() => {}); } catch {}
+  };
+  const stopPartialResource = async (resource) => {
+    try { await Promise.resolve().then(() => resource?.stop?.()); } catch { reportStartupCleanupFailure(); }
+  };
+  const cleanupFailedStart = async () => {
+    if (startupCleanupComplete) return;
+    startupCleanupComplete = true;
+    acceptingResources = false;
+    started = false;
+    context.isStopping = true;
+    context.latestErrorCategory = 'startup-failed';
+    context.gatewayStatus = { state: 'failed' };
+    const clearHealthInterval = dependencies.clearInterval ?? globalThis.clearInterval;
+    if (healthTimer != null) {
+      try { clearHealthInterval(healthTimer); } catch { reportStartupCleanupFailure(); }
+      healthTimer = null;
+    }
+    const gateway = context.gateway;
+    const legacyPollers = context.legacyPollers;
+    try { await stopPartialResource(gateway); } finally { context.gateway = null; }
+    try { await stopPartialResource(legacyPollers); } finally { context.legacyPollers = null; }
+    healthController?.abort();
+    healthGeneration++;
+    healthController = new AbortController();
+    healthLifecycle = 'stopping';
+    healthFinalAllowed = true;
+    healthPublication = Promise.resolve();
+    let terminalCommitted = false;
+    try {
+      terminalCommitted = await safePublishHealth({ forceFinal: true });
+      if (!terminalCommitted) {
+        healthController?.abort();
+        await safeInvalidateHealth();
+      }
+    } finally {
+      healthFinalAllowed = false;
+      healthLifecycle = 'stopped';
+    }
+  };
+
   const publishHealthSoon = () => { void safePublishHealth(); };
   const recordActivity = (field, at = dependencies.now?.() ?? Date.now()) => {
     if (!activityFields.has(field)) throw new Error(`Unknown bridge activity field: ${field}`);
@@ -342,6 +385,7 @@ export function createBridgeApplication(dependencies = {}) {
       acceptingResources = true;
       context.isStopping = false;
       stopPromise = null;
+      startupCleanupComplete = false;
       healthController?.abort();
       healthGeneration++;
       healthController = new AbortController();
@@ -367,32 +411,7 @@ export function createBridgeApplication(dependencies = {}) {
         const setHealthInterval = dependencies.setInterval ?? globalThis.setInterval;
         healthTimer = setHealthInterval(() => { publishHealthSoon(); }, 10_000);
       } catch (error) {
-        context.setLatestErrorCategory('startup-failed');
-        context.isStopping = true;
-        context.gatewayStatus = { state: 'failed' };
-        const clearHealthInterval = dependencies.clearInterval ?? globalThis.clearInterval;
-        if (healthTimer != null) {
-          try { clearHealthInterval(healthTimer); } catch {}
-          healthTimer = null;
-        }
-        await context.gateway?.stop?.().catch(() => {});
-        healthController?.abort();
-        healthGeneration++;
-        healthController = new AbortController();
-        healthLifecycle = 'stopping';
-        healthFinalAllowed = true;
-        healthPublication = Promise.resolve();
-        let terminalCommitted = false;
-        try {
-          terminalCommitted = await safePublishHealth({ forceFinal: true });
-          if (!terminalCommitted) {
-            healthController?.abort();
-            await safeInvalidateHealth();
-          }
-        } finally {
-          healthFinalAllowed = false;
-          healthLifecycle = 'stopped';
-        }
+        await cleanupFailedStart();
         throw error;
       }
     },

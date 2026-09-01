@@ -262,6 +262,58 @@ test('startup failure bounds a never-settling health invalidator and preserves i
   assert.match(outcome.message, /startup root cause/);
 });
 
+test('partial startup cleanup detaches resources so entrypoint shutdown preserves the startup cause', async () => {
+  const events = [];
+  const terminalSnapshots = [];
+  let failLegacyStart = true;
+  let failRolloutPersist = true;
+  let failGatewayCleanup = true;
+  let gatewayStops = 0;
+  let rolloutPersists = 0;
+  const gateway = {
+    getStatus: () => ({ state: 'ready' }),
+    async stop() {
+      gatewayStops += 1;
+      if (failGatewayCleanup) throw new Error('gateway cleanup failure');
+    },
+  };
+  const app = createBridgeApplication(makeBridgeDependencies(events, {
+    async startGateway() { return gateway; },
+    async startLegacyPollers() {
+      if (failLegacyStart) throw new Error('legacy startup root cause');
+      return { async stop() {} };
+    },
+    async persistRolloutState() {
+      rolloutPersists += 1;
+      if (failRolloutPersist) throw new Error('partial rollout persistence failure');
+    },
+    publishHealth: async (context, { forceFinal } = {}) => {
+      if (forceFinal) terminalSnapshots.push(structuredClone(context.getSystemStatus()));
+    },
+  }));
+
+  const mainShape = async () => {
+    try {
+      await app.start();
+    } finally {
+      await app.stop();
+    }
+  };
+
+  await assert.rejects(mainShape, /legacy startup root cause/);
+  assert.equal(gatewayStops, 1);
+  assert.equal(rolloutPersists, 0);
+  assert.equal(terminalSnapshots.length, 1);
+  assert.equal(terminalSnapshots[0].gateway.state, 'failed');
+  assert.equal(terminalSnapshots[0].latestErrorCategory, 'startup-failed');
+
+  failLegacyStart = false;
+  failRolloutPersist = false;
+  failGatewayCleanup = false;
+  await app.start();
+  await app.stop();
+});
+
 test('REST tracker publishes failed then recovered state without raw failures', async () => {
   const events = [];
   const published = [];
