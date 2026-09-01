@@ -18,6 +18,18 @@ $boundStartTime = ConvertTo-ControlCreationTime -Value '20260901120000.000000+48
 if (-not (Test-CodexBoundProcessIdentity -BoundProcess ([pscustomobject]@{ ProcessId=42; StartTimeUtc=$boundStartTime.UtcDateTime }) -ProcessId 42 -CreationDate '20260901120000.000000+480')) {
     throw 'bound process identity did not validate a held process object start time'
 }
+if (-not (Test-CodexBoundProcessIdentity -BoundProcess ([pscustomobject]@{ ProcessId=42; StartTimeUtc=$boundStartTime.UtcDateTime.AddTicks(9) }) -ProcessId 42 -CreationDate '20260901120000.000000+480')) {
+    throw 'bound process identity rejected the same CIM-microsecond process because of 100ns ticks'
+}
+if (Test-CodexBoundProcessIdentity -BoundProcess ([pscustomobject]@{ ProcessId=42; StartTimeUtc=$boundStartTime.UtcDateTime.AddTicks(10) }) -ProcessId 42 -CreationDate '20260901120000.000000+480') {
+    throw 'bound process identity accepted a process created at least one CIM microsecond later'
+}
+$currentProcess = Get-Process -Id $PID -ErrorAction Stop
+[void]$currentProcess.Handle
+$currentCim = Get-CimInstance -ClassName Win32_Process -Filter ("ProcessId = {0}" -f $PID) -ErrorAction Stop
+if (-not (Test-CodexBoundProcessIdentity -BoundProcess ([pscustomobject]@{ ProcessId=$currentProcess.Id; StartTimeUtc=$currentProcess.StartTime.ToUniversalTime() }) -ProcessId $PID -CreationDate $currentCim.CreationDate)) {
+    throw 'read-only current pwsh CIM and held-process identity comparison failed'
+}
 foreach ($untrustedPath in @(
     'D:\Program Files\WindowsApps\OpenAI.Codex_1.2.3.0_x64__publisher\app\ChatGPT.exe',
     (Join-Path $programFiles 'WindowsApps\OpenAI.Codex_1.2.3.0_x64__publisher\app\ChatGPT.exe\child.exe'),
@@ -55,9 +67,46 @@ $reusedDesktopParent = @(
     [pscustomobject]@{ ProcessId=101; ParentProcessId=100; Name='codex.exe'; ExecutablePath='C:\Users\test\AppData\Local\OpenAI\Codex\bin\v\codex.exe'; CreationDate='20260901120000.000000+480' }
 )
 $reusedDesktopParentPlan = Get-CodexDesktopProcessPlan -Processes $reusedDesktopParent
-if ((@($reusedDesktopParentPlan.ProcessIds) -join ',') -ne '100') {
-    throw 'bridge app-server with an old reused parent PID was included in the desktop tree'
+if (-not $reusedDesktopParentPlan.PSObject.Properties['IsValid'] -or $reusedDesktopParentPlan.IsValid) {
+    throw 'bridge app-server with an old reused parent PID did not invalidate the desktop tree'
 }
+
+function Assert-UnverifiableCodexTreeFailsBeforeOperations {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][object[]]$Processes
+    )
+
+    $invalidPlan = Get-CodexDesktopProcessPlan -Processes $Processes
+    if (-not $invalidPlan.PSObject.Properties['IsValid'] -or $invalidPlan.IsValid) {
+        throw "$Name did not invalidate the Codex process plan"
+    }
+    $callState = [pscustomobject]@{ open=0; close=0; stop=0 }
+    $invalidResult = Stop-CodexDesktop -Operations @{
+        GetProcesses = { $Processes }
+        OpenProcess = { param($processId) $callState.open++; throw 'invalid tree must not open a process' }
+        RequestClose = { param($bound) $callState.close++ }
+        StopProcess = { param($bound) $callState.stop++ }
+        Sleep = { param($milliseconds) }
+    } -GraceMilliseconds 0
+    if ($invalidResult.ok -or $callState.open -ne 0 -or $callState.close -ne 0 -or $callState.stop -ne 0) {
+        throw "$Name performed a process operation after tree verification failed"
+    }
+}
+
+Assert-UnverifiableCodexTreeFailsBeforeOperations -Name 'same-package parent with invalid ParentProcessId' -Processes @(
+    [pscustomobject]@{ ProcessId=210; ParentProcessId='invalid'; Name='ChatGPT.exe'; ExecutablePath=$trusted; CreationDate='20260901130000.000000+480' },
+    [pscustomobject]@{ ProcessId=211; ParentProcessId=210; Name='ChatGPT.exe'; ExecutablePath=$trusted; CreationDate='20260901130001.000000+480' }
+)
+Assert-UnverifiableCodexTreeFailsBeforeOperations -Name 'direct descendant with invalid CreationDate' -Processes @(
+    [pscustomobject]@{ ProcessId=220; ParentProcessId=10; Name='ChatGPT.exe'; ExecutablePath=$trusted; CreationDate='20260901130000.000000+480' },
+    [pscustomobject]@{ ProcessId=221; ParentProcessId=220; Name='codex.exe'; ExecutablePath='C:\Users\test\AppData\Local\OpenAI\Codex\bin\v\codex.exe'; CreationDate='invalid' }
+)
+Assert-UnverifiableCodexTreeFailsBeforeOperations -Name 'deep descendant with invalid CreationDate' -Processes @(
+    [pscustomobject]@{ ProcessId=230; ParentProcessId=10; Name='ChatGPT.exe'; ExecutablePath=$trusted; CreationDate='20260901130000.000000+480' },
+    [pscustomobject]@{ ProcessId=231; ParentProcessId=230; Name='renderer.exe'; ExecutablePath=$trusted; CreationDate='20260901130001.000000+480' },
+    [pscustomobject]@{ ProcessId=232; ParentProcessId=231; Name='utility.exe'; ExecutablePath=$trusted; CreationDate='invalid' }
+)
 
 $events = [System.Collections.Generic.List[string]]::new()
 $boundProcesses = @{}
@@ -99,8 +148,8 @@ $reusedResult = Stop-CodexDesktop -Operations @{
     StopProcess = { param($bound) $reusedEvents.Add("stop:$($bound.ProcessId)") }
     Sleep = { param($milliseconds) }
 } -GraceMilliseconds 0
-if (-not $reusedResult.ok -or $reusedEvents -contains 'stop:101') {
-    throw 'bridge app-server was stopped after its old desktop parent PID was reused'
+if ($reusedResult.ok -or $reusedEvents.Count -ne 0) {
+    throw 'bridge app-server tree did not fail closed after its old desktop parent PID was reused'
 }
 
 $changedRoot = @(

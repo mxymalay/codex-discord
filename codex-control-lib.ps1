@@ -140,14 +140,11 @@ function ConvertTo-CodexDesktopProcessRecord {
     }
     $creationTimeUtc = ConvertTo-ControlCreationTime -Value $rawCreationDate
     $executablePath = [string](Get-ControlProcessProperty -Process $Process -Name 'ExecutablePath')
-    if (-not $hasValidParentProcessId) {
-        return $null
-    }
-
     return [pscustomobject]@{
         Process = $Process
         ProcessId = $processId
         ParentProcessId = $parentProcessId
+        HasValidParentProcessId = $hasValidParentProcessId
         Name = [string](Get-ControlProcessProperty -Process $Process -Name 'Name')
         ExecutablePath = $executablePath
         CreationDate = $rawCreationDate
@@ -160,6 +157,20 @@ function ConvertTo-CodexDesktopProcessRecord {
 
 function New-EmptyCodexDesktopProcessPlan {
     return [pscustomobject][ordered]@{
+        IsValid = $true
+        ErrorCategory = $null
+        Roots = @()
+        ProcessIds = @()
+        CreationTimes = [ordered]@{}
+        StopProcessIds = @()
+        RootByProcessId = @{}
+    }
+}
+
+function New-UnverifiableCodexDesktopProcessPlan {
+    return [pscustomobject][ordered]@{
+        IsValid = $false
+        ErrorCategory = 'process-tree-unverifiable'
         Roots = @()
         ProcessIds = @()
         CreationTimes = [ordered]@{}
@@ -187,15 +198,19 @@ function Get-CodexDesktopProcessPlan {
     foreach ($record in $records) {
         $key = [string]$record.ProcessId
         if ($byProcessId.ContainsKey($key)) {
-            return New-EmptyCodexDesktopProcessPlan
+            return New-UnverifiableCodexDesktopProcessPlan
         }
         $byProcessId[$key] = $record
     }
 
-    $roots = @($records | Where-Object {
-        if ($_.Name -ine 'ChatGPT.exe' -or -not $_.HasCreationTime -or -not (Test-CodexDesktopRootPath -Path $_.ExecutablePath)) {
-            return $false
-        }
+    $trustedCandidates = @($records | Where-Object {
+        $_.Name -ieq 'ChatGPT.exe' -and (Test-CodexDesktopRootPath -Path $_.ExecutablePath)
+    })
+    if (@($trustedCandidates | Where-Object { -not $_.HasCreationTime -or -not $_.HasValidParentProcessId }).Count -gt 0) {
+        return New-UnverifiableCodexDesktopProcessPlan
+    }
+
+    $roots = @($trustedCandidates | Where-Object {
         $parentKey = [string]$_.ParentProcessId
         if (-not $byProcessId.ContainsKey($parentKey)) {
             return $true
@@ -236,8 +251,8 @@ function Get-CodexDesktopProcessPlan {
         $rootByProcessId[[string]$item.Record.ProcessId] = $item.RootProcessId
         $children = if ($childrenByParent.ContainsKey([string]$item.Record.ProcessId)) { @($childrenByParent[[string]$item.Record.ProcessId]) } else { @() }
         foreach ($child in @($children | Sort-Object ProcessId)) {
-            if (-not $item.Record.HasCreationTime -or -not $child.HasCreationTime -or $child.CreationTimeUtc -le $item.Record.CreationTimeUtc) {
-                continue
+            if (-not $item.Record.HasCreationTime -or -not $item.Record.HasValidParentProcessId -or -not $child.HasCreationTime -or -not $child.HasValidParentProcessId -or $child.CreationTimeUtc -le $item.Record.CreationTimeUtc) {
+                return New-UnverifiableCodexDesktopProcessPlan
             }
             if ($seen.Add($child.ProcessId)) {
                 $queue.Enqueue([pscustomobject]@{ Record=$child; Depth=($item.Depth + 1); RootProcessId=$item.RootProcessId })
@@ -250,6 +265,8 @@ function Get-CodexDesktopProcessPlan {
         $creationTimes[[int]$item.Record.ProcessId] = $item.Record.CreationDate
     }
     return [pscustomobject][ordered]@{
+        IsValid = $true
+        ErrorCategory = $null
         Roots = @($roots | ForEach-Object { $_.Process })
         ProcessIds = @($orderedRecords | ForEach-Object { $_.Record.ProcessId })
         CreationTimes = $creationTimes
@@ -327,7 +344,10 @@ function Test-CodexBoundProcessIdentity {
         return $false
     }
     try {
-        return ([DateTimeOffset]$startTimeUtc).ToUniversalTime().Ticks -eq $expectedTimeUtc.Ticks
+        $actualTimeUtc = ([DateTimeOffset]$startTimeUtc).ToUniversalTime()
+        $actualCimTicks = $actualTimeUtc.Ticks - ($actualTimeUtc.Ticks % 10)
+        $expectedCimTicks = $expectedTimeUtc.Ticks - ($expectedTimeUtc.Ticks % 10)
+        return $actualCimTicks -eq $expectedCimTicks
     }
     catch {
         return $false
@@ -350,6 +370,9 @@ function Stop-CodexDesktop {
     try {
         $before = @(& $Operations.GetProcesses)
         $beforePlan = Get-CodexDesktopProcessPlan -Processes $before
+        if (-not $beforePlan.IsValid) {
+            return [pscustomobject]@{ ok=$false; errorCategory=$beforePlan.ErrorCategory; stoppedProcessCount=0 }
+        }
         if (@($beforePlan.Roots).Count -eq 0) {
             return [pscustomobject]@{ ok=$true; alreadyStopped=$true; stoppedProcessCount=0 }
         }
@@ -364,6 +387,9 @@ function Stop-CodexDesktop {
 
         $after = @(& $Operations.GetProcesses)
         $afterPlan = Get-CodexDesktopProcessPlan -Processes $after
+        if (-not $afterPlan.IsValid) {
+            return [pscustomobject]@{ ok=$false; errorCategory=$afterPlan.ErrorCategory; stoppedProcessCount=0 }
+        }
         $beforeRootCreationTimes = @{}
         foreach ($root in @($beforePlan.Roots)) {
             $beforeRootCreationTimes[[string]$root.ProcessId] = $beforePlan.CreationTimes[[int]$root.ProcessId]
@@ -414,6 +440,9 @@ function Get-CodexControlStatus {
     }
     try {
         $plan = Get-CodexDesktopProcessPlan -Processes @(& $Operations.GetProcesses)
+        if (-not $plan.IsValid) {
+            return [pscustomobject]@{ ok=$false; errorCategory=$plan.ErrorCategory }
+        }
         return [pscustomobject][ordered]@{
             ok = $true
             codexDesktop = [pscustomobject][ordered]@{
