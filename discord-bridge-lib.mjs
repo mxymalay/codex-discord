@@ -160,14 +160,18 @@ export function assertValidInboxStateV2(candidate, { allowLegacyPlaintext = fals
     'processedInteractions', 'createdTasksByInteraction',
   ]);
   if (allowLegacyPlaintext) allowed.add('pendingReplies');
+  const validPendingContinuations = candidate?.pendingContinuations === undefined && allowLegacyPlaintext ||
+    (isRecord(candidate?.pendingContinuations) && Object.entries(candidate.pendingContinuations)
+      .every(([key, value]) => validContinuationEntry(key, value, { allowLegacyPlaintext })));
+  const validProcessedInteractions = candidate?.processedInteractions === undefined && allowLegacyPlaintext ||
+    (Array.isArray(candidate?.processedInteractions) && candidate.processedInteractions.every(validProcessedInteraction));
+  const validCreatedTasks = candidate?.createdTasksByInteraction === undefined && allowLegacyPlaintext ||
+    (isRecord(candidate?.createdTasksByInteraction) && Object.values(candidate.createdTasksByInteraction).every(validTaskCreationRecord));
   const valid = isRecord(candidate) && hasOnlyKeys(candidate, allowed) && candidate.version === 2 &&
     typeof candidate.initialized === 'boolean' && isRecord(candidate.cursors) &&
     Object.entries(candidate.cursors).every(([key, value]) => isNonEmptyString(key) && isNonEmptyString(value)) &&
     Array.isArray(candidate.processedMessageIds) && candidate.processedMessageIds.every(isNonEmptyString) &&
-    isRecord(candidate.pendingContinuations) && Object.entries(candidate.pendingContinuations)
-      .every(([key, value]) => validContinuationEntry(key, value, { allowLegacyPlaintext })) &&
-    Array.isArray(candidate.processedInteractions) && candidate.processedInteractions.every(validProcessedInteraction) &&
-    isRecord(candidate.createdTasksByInteraction) && Object.values(candidate.createdTasksByInteraction).every(validTaskCreationRecord) &&
+    validPendingContinuations && validProcessedInteractions && validCreatedTasks &&
     (!Object.hasOwn(candidate, 'pendingReplies') || (isRecord(candidate.pendingReplies) &&
       Object.entries(candidate.pendingReplies).every(([key, value]) => validLegacyPendingReply(key, value))));
   if (!valid) throw corruptInboxStateError();
@@ -1464,7 +1468,10 @@ export async function initializeAppServerClient(client) {
   await client.request({
     method: 'initialize',
     id: 1,
-    params: { clientInfo: { name: 'codex-discord-bridge', version: '1.0.0' } },
+    params: {
+      clientInfo: { name: 'codex-discord-bridge', version: '1.0.0' },
+      capabilities: { experimentalApi: true },
+    },
   });
   client.send({ method: 'initialized', params: {} });
 }

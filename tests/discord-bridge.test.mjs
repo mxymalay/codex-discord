@@ -136,6 +136,43 @@ test('bridge composition starts registration, index and gateway without disablin
   ]);
 });
 
+test('older v2 inbox state gains the newer empty containers before strict validation', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-older-v2-inbox-'));
+  const inboxPath = path.join(root, 'discord-inbox-state.json');
+  const predecessor = {
+    version: 2,
+    initialized: true,
+    cursors: { '123': '456' },
+    processedMessageIds: ['789'],
+    pendingReplies: {},
+  };
+
+  try {
+    await fs.writeFile(inboxPath, JSON.stringify(predecessor), 'utf8');
+    const bridgeModule = await import('../discord-bridge.mjs');
+    const persisted = [];
+    const loaded = await bridgeModule.loadInboxStateWithRecovery({
+      inboxPath,
+      encryptText: async () => { throw new Error('empty legacy replies require no encryption'); },
+      persistState: async (state) => { persisted.push(structuredClone(state)); },
+      writeLog: async () => { throw new Error('compatible predecessor must not be logged as corrupt'); },
+    });
+
+    assert.equal(loaded.readOnly, false);
+    assert.equal(loaded.errorCategory, null);
+    assert.deepEqual(loaded.state, {
+      ...createEmptyInboxState(),
+      initialized: true,
+      cursors: { '123': '456' },
+      processedMessageIds: ['789'],
+    });
+    assert.deepEqual(persisted, [loaded.state]);
+    assert.deepEqual((await fs.readdir(root)).sort(), ['discord-inbox-state.json']);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 test('corrupt inbox is preserved while an isolated read-only bridge still starts its Gateway', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-corrupt-inbox-'));
   const fixedNow = new Date('2026-09-01T06:07:08.009Z');
@@ -597,7 +634,10 @@ test('exports the App Server client and initializes reusable clients before requ
     {
       method: 'initialize',
       id: 1,
-      params: { clientInfo: { name: 'codex-discord-bridge', version: '1.0.0' } },
+      params: {
+        clientInfo: { name: 'codex-discord-bridge', version: '1.0.0' },
+        capabilities: { experimentalApi: true },
+      },
     },
     { method: 'initialized', params: {} },
   ]);

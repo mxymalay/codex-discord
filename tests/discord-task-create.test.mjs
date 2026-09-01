@@ -198,6 +198,12 @@ test('lists every saved project page in server order on one initialized client',
     codexPath: 'codex',
     processCwd: 'C:\\workspace',
     clientFactory: () => fakeAppServer(methods, {
+      initialize: ({ params }) => {
+        if (params?.capabilities?.experimentalApi !== true) {
+          throw new Error('project/list requires experimentalApi capability');
+        }
+        return {};
+      },
       'project/list': ({ params }) => params.cursor === null
         ? { data: [project({ id: 'p1', name: 'First' })], nextCursor: 'page-2' }
         : { data: [project({ id: 'p2', name: 'Second' })], nextCursor: null },
