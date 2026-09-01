@@ -3,7 +3,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 
-import { AppServerClient, initializeAppServerClient } from './discord-bridge-lib.mjs';
+import { AppServerClient, commitInboxState, initializeAppServerClient } from './discord-bridge-lib.mjs';
 
 export const NO_PROJECT = '__projectless__';
 
@@ -581,15 +581,18 @@ function persistenceError() {
 }
 
 async function persistInteractionRecord({ state, interactionId, record, persistState }) {
-  const records = state.createdTasksByInteraction;
-  const hadPriorRecord = Object.hasOwn(records, interactionId);
-  const priorRecord = records[interactionId];
-  records[interactionId] = record;
   try {
-    await persistState(state);
+    await commitInboxState({
+      state,
+      persistState,
+      entries: { createdTasksByInteraction: [interactionId] },
+      mutate: () => {
+        state.createdTasksByInteraction ??= {};
+        state.createdTasksByInteraction[interactionId] = record;
+      },
+      errorMessage: 'Task creation state persistence failed',
+    });
   } catch {
-    if (hadPriorRecord) records[interactionId] = priorRecord;
-    else delete records[interactionId];
     throw persistenceError();
   }
 }
@@ -777,8 +780,7 @@ export async function createNewTaskOnce({
   if (!state || typeof state !== 'object') throw new TypeError('Task creation state is required');
   if (!interactionId) throw new Error('Interaction ID is required');
   if (typeof persistState !== 'function') throw new TypeError('Task persistence boundary is required');
-  state.createdTasksByInteraction ??= {};
-  const recorded = state.createdTasksByInteraction[interactionId];
+  const recorded = state.createdTasksByInteraction?.[interactionId];
   if (recorded) {
     const pending = inFlightByState.get(state)?.get(interactionId);
     if (pending) return pending;

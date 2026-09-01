@@ -788,7 +788,7 @@ test('continue queue renders safe summaries and atomically cancels then refreshe
     status: 'queued',
   }];
   const events = [];
-  const { dependencies, responses } = makeDependencies({
+  const { dependencies, responses, edits } = makeDependencies({
     getQueue: () => queue,
     cancelContinuationPersisted: async (_queueId, now) => {
       events.push(`cancel:${now}`);
@@ -813,10 +813,10 @@ test('continue queue renders safe summaries and atomically cancels then refreshe
   await router.handle(componentInteraction(cancelId));
 
   assert.deepEqual(events.map((item) => item.startsWith('cancel:') ? 'cancel' : item), ['cancel', 'persist']);
-  const refreshed = responses.shift();
-  assert.equal(refreshed.type, 7);
-  assert.match(refreshed.data.embeds[0].description, /已取消/);
-  assert.equal(refreshed.data.components.length, 0);
+  assert.equal(responses.shift().type, 5);
+  const refreshed = edits.shift();
+  assert.match(refreshed.embeds[0].description, /已取消/);
+  assert.equal(refreshed.components.length, 0);
 });
 
 test('cancel refuses to mutate through the legacy split update path', async () => {
@@ -825,7 +825,7 @@ test('cancel refuses to mutate through the legacy split update path', async () =
     summary: 'cancel me', status: 'queued', createdAt: '2026-09-01T00:00:00.000Z',
   }];
   let mutated = false;
-  const { dependencies, responses } = makeDependencies({
+  const { dependencies, responses, edits } = makeDependencies({
     getQueue: () => queue,
     cancelContinuationPersisted: undefined,
     cancelContinuation: () => { mutated = true; queue[0].status = 'cancelled'; return { status: 'cancelled' }; },
@@ -839,9 +839,9 @@ test('cancel refuses to mutate through the legacy split update path', async () =
 
   assert.equal(mutated, false);
   assert.equal(queue[0].status, 'queued');
-  const error = responses.shift();
-  assert.equal(error.type, 4);
-  assert.match(error.data.content, /取消失败|稍后重试/);
+  assert.equal(responses.shift().type, 5);
+  const error = edits.shift();
+  assert.match(error.content, /取消失败|稍后重试/);
 });
 
 test('cancel persistence failure restores state and returns only a sanitized ephemeral error', async () => {
@@ -851,7 +851,7 @@ test('cancel persistence failure restores state and returns only a sanitized eph
     encryptedText: 'opaque-ciphertext',
   });
   const before = structuredClone(continuationState);
-  const { dependencies, responses } = makeDependencies({
+  const { dependencies, responses, edits } = makeDependencies({
     continuationState,
     getQueue: () => listContinuations(continuationState),
     cancelContinuationPersisted: (queueId, now) => cancelContinuationPersisted({
@@ -868,12 +868,11 @@ test('cancel persistence failure restores state and returns only a sanitized eph
   await router.handle(componentInteraction(cancelId));
 
   assert.deepEqual(continuationState, before);
-  const error = responses.shift();
-  assert.equal(error.type, 4);
-  assert.equal(error.data.flags & 64, 64);
-  assert.match(error.data.content, /取消失败|稍后重试/);
-  assert.equal(error.data.content.includes('private-user'), false);
-  assert.equal(error.data.content.includes('discord-inbox-state'), false);
+  assert.equal(responses.shift().type, 5);
+  const error = edits.shift();
+  assert.match(error.content, /取消失败|稍后重试/);
+  assert.equal(error.content.includes('private-user'), false);
+  assert.equal(error.content.includes('discord-inbox-state'), false);
 });
 
 test('queue body and cancel buttons use the same queued-first displayed collection', async () => {
@@ -935,6 +934,48 @@ test('continue queue truncation prioritizes every active and uncertain state ove
   const cancelStates = [...uiState.values()].filter((state) => state.kind === 'cancel-continuation');
   assert.deepEqual(cancelStates.map((state) => state.queueId), ['live-queued7777']);
   assert.equal(description.includes(cancelStates[0].queueId.slice(-8)), true);
+});
+
+test('queue truncation shows one uncertain start ahead of twenty ordinary queued requests', () => {
+  const queue = [
+    ...Array.from({ length: 20 }, (_, index) => ({
+      queueId: `queued-risk-${String(index).padStart(8, '0')}`, source: 'slash', threadId: 'root-1',
+      summary: `queued ${index}`, status: 'queued', createdAt: `2026-09-01T00:${String(index).padStart(2, '0')}:00Z`,
+    })),
+    {
+      queueId: 'uncertain-priority-9999', source: 'reply', threadId: 'root-1',
+      summary: 'must be visible', status: 'start-uncertain', createdAt: '2026-09-01T01:00:00Z',
+    },
+  ];
+  const rendered = renderContinuationQueue(queue);
+  assert.match(rendered, /must be visible/);
+  assert.match(rendered, /启动结果不确定/);
+  assert.match(rendered, /另有 1 项未显示/);
+});
+
+test('cancel component defers before persistence and edits the original response', async () => {
+  const queue = [{
+    queueId: 'queue-defer-cancel', source: 'slash', threadId: 'root-1', summary: 'cancel',
+    status: 'queued', createdAt: '2026-09-01T00:00:00Z',
+  }];
+  const events = [];
+  const { dependencies, responses, edits } = makeDependencies({
+    getQueue: () => queue,
+    respond: async (body) => { events.push(`respond:${body.type}`); responses.push(body); },
+    editOriginal: async (body) => { events.push('edit'); edits.push(body); },
+    cancelContinuationPersisted: async () => {
+      events.push('cancel');
+      queue[0].status = 'cancelled';
+      return { status: 'cancelled' };
+    },
+  });
+  const router = createInteractionRouter(dependencies);
+  await router.handle(commandInteraction('继续队列'));
+  const cancelId = responses.shift().data.components[0].components[0].custom_id;
+  events.length = 0;
+  await router.handle(componentInteraction(cancelId));
+  assert.deepEqual(events, ['respond:5', 'cancel', 'edit']);
+  assert.match(edits[0].embeds[0].description, /已取消/);
 });
 
 test('continuation queue renderer labels reply sources and omits full unsafe text', () => {

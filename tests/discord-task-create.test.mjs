@@ -6,6 +6,8 @@ import path from 'node:path';
 import { PassThrough } from 'node:stream';
 import test from 'node:test';
 
+import { commitInboxState, createEmptyInboxState, recordInboxMessage } from '../discord-bridge-lib.mjs';
+
 import {
   NO_PROJECT,
   createNewTaskOnce,
@@ -948,7 +950,7 @@ test('a failed thread-created persistence reloads the non-cleanable thread-start
   assert.equal(statusAtThreadStart, 'thread-starting');
   const reloaded = structuredClone(durableSnapshots.at(-1));
   assert.equal(reloaded.createdTasksByInteraction.threadboundary1.status, 'thread-starting');
-  assert.strictEqual(state.createdTasksByInteraction.threadboundary1, threadStartingRecord);
+  assert.deepEqual(state.createdTasksByInteraction.threadboundary1, threadStartingRecord);
   assert.equal(state.createdTasksByInteraction.threadboundary1.status, 'thread-starting');
   assert.equal(gitCalls.some(({ args }) => args.includes('remove') || args.includes('-D')), false);
 
@@ -1001,6 +1003,50 @@ test('failed initial persistence removes the staged live record and the same sta
   await result.completion;
 });
 
+test('task creation shares the inbox commit queue with cursor updates and prunes only terminal creation history', async () => {
+  const state = createEmptyInboxState();
+  for (let index = 0; index < 2_000; index += 1) {
+    state.createdTasksByInteraction[`old-${String(index).padStart(4, '0')}`] = {
+      status: 'started', threadId: `old-thread-${index}`,
+    };
+  }
+  state.createdTasksByInteraction['safety-live'] = { status: 'thread-starting', threadId: 'maybe-live' };
+  let active = 0;
+  let maxActive = 0;
+  const persistState = async (snapshot) => {
+    active += 1;
+    maxActive = Math.max(maxActive, active);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.notStrictEqual(snapshot, state);
+    active -= 1;
+  };
+  const creation = createNewTaskOnce({
+    state,
+    interactionId: 'create-b',
+    selection: { kind: 'projectless', projectId: null, projectName: '无项目', roots: ['C:\\tasks'] },
+    text: 'create concurrently',
+    persistState,
+    fileSystem: { mkdir: async () => {} },
+    clientFactory: () => fakeAppServer([], {
+      'thread/start': { thread: { id: 'thread-create-b', name: 'B' } },
+      'turn/start': { turn: { id: 'turn-create-b' } },
+    }),
+  });
+  const cursor = commitInboxState({
+    state,
+    persistState,
+    fields: ['cursors', 'processedMessageIds'],
+    mutate: () => recordInboxMessage(state, 'channel-b', '999', true),
+  });
+  const [created] = await Promise.all([creation, cursor]);
+  await created.completion;
+  assert.equal(maxActive, 1);
+  assert.equal(state.cursors['channel-b'], '999');
+  assert.equal(state.createdTasksByInteraction['create-b'].status, 'started');
+  assert.equal(state.createdTasksByInteraction['safety-live'].status, 'thread-starting');
+  assert.equal(Object.keys(state.createdTasksByInteraction).length <= 2_000, true);
+});
+
 test('failed started persistence restores the exact thread-created live record', async () => {
   const state = {};
   let threadCreatedRecord = null;
@@ -1018,7 +1064,7 @@ test('failed started persistence restores the exact thread-created live record',
       'turn/start': { turn: { id: 'turn-started-rollback' } },
     }),
   }), /state persistence failed/);
-  assert.strictEqual(state.createdTasksByInteraction.startedrollback1, threadCreatedRecord);
+  assert.deepEqual(state.createdTasksByInteraction.startedrollback1, threadCreatedRecord);
   assert.equal(state.createdTasksByInteraction.startedrollback1.status, 'thread-created');
   assert.equal(state.createdTasksByInteraction.startedrollback1.threadId, 'thread-started-rollback');
 
@@ -1454,7 +1500,7 @@ test('failed journal persistence restores the exact live prerequisite and same-s
         if (record.status === 'cleanup-proven') throw new Error('proof write failed');
       },
     }), /state persistence failed/);
-    assert.strictEqual(state.createdTasksByInteraction[operationId], recoveringRecord);
+    assert.deepEqual(state.createdTasksByInteraction[operationId], recoveringRecord);
     assert.equal(state.createdTasksByInteraction[operationId].status, 'recovering');
     assert.equal(calls.some(({ args }) => args.includes('remove') || args.includes('-D')), false);
 
@@ -1484,7 +1530,7 @@ test('failed journal persistence restores the exact live prerequisite and same-s
         if (record.status === 'worktree-removed') throw new Error('remove write failed');
       },
     }), /state persistence failed/);
-    assert.strictEqual(state.createdTasksByInteraction[operationId], cleanupProvenRecord);
+    assert.deepEqual(state.createdTasksByInteraction[operationId], cleanupProvenRecord);
     assert.equal(state.createdTasksByInteraction[operationId].status, 'cleanup-proven');
     assert.equal(calls.filter(({ args }) => args.includes('remove')).length, 1);
     assert.equal(calls.filter(({ args }) => args.includes('-D')).length, 0);
@@ -1518,7 +1564,7 @@ test('failed journal persistence restores the exact live prerequisite and same-s
         }
       },
     }), /state persistence failed/);
-    assert.strictEqual(state.createdTasksByInteraction[operationId], worktreeRemovedRecord);
+    assert.deepEqual(state.createdTasksByInteraction[operationId], worktreeRemovedRecord);
     assert.equal(state.createdTasksByInteraction[operationId].status, 'worktree-removed');
     assert.equal(calls.filter(({ args }) => args.includes('remove')).length, 1);
     assert.equal(calls.filter(({ args }) => args.includes('-D')).length, 1);

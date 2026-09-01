@@ -385,9 +385,13 @@ export function renderTaskList(tasks, { status = '全部' } = {}) {
 function continuationStatusLabel(status) {
   return ({
     queued: '等待发送',
+    resuming: '正在连接',
+    submitting: '正在提交启动请求',
     attempting: '正在尝试',
+    'start-submitted': '启动请求已提交',
     'start-uncertain': '启动结果不确定',
     'confirmed-start': '已开始',
+    acknowledging: '已开始，正在回执',
     delivered: '已送达',
     cancelled: '已取消',
     failed: '失败',
@@ -408,7 +412,7 @@ function continuationQueueView(items, taskIndex = null) {
   const values = Array.isArray(items) ? items : [];
   if (!values.length) return { description: '## 继续队列\n当前没有继续请求。', displayed: [] };
   const tasks = Array.isArray(taskIndex?.tasks) ? taskIndex.tasks : [];
-  const priorityStatuses = ['queued', 'attempting', 'start-uncertain', 'confirmed-start'];
+  const priorityStatuses = ['start-uncertain', 'start-submitted', 'submitting', 'attempting', 'resuming', 'acknowledging', 'confirmed-start', 'queued'];
   const priorityStatusSet = new Set(priorityStatuses);
   const ordered = [
     ...priorityStatuses.flatMap((status) => values.filter((item) => item?.status === status)),
@@ -1178,6 +1182,7 @@ async function handleComponent(dependencies, interaction) {
     if (invalid || state?.kind !== 'cancel-continuation') {
       return respond(dependencies, interaction, privateResponse(invalid ?? '内容已过期或按钮无效，请重新执行命令。'));
     }
+    await defer(dependencies, interaction);
     let result;
     try {
       const cancelledAt = new Date(nowValue(dependencies)).toISOString();
@@ -1194,12 +1199,9 @@ async function handleComponent(dependencies, interaction) {
         throw new Error('Atomic continuation cancellation is unavailable');
       }
     } catch {
-      return respond(dependencies, interaction, privateResponse('取消失败，队列状态未更改；请稍后重试。'));
+      return editOriginal(dependencies, interaction, { content: '取消失败，队列状态未更改；请稍后重试。' });
     }
-    return respond(dependencies, interaction, {
-      type: 7,
-      data: continuationQueuePayload(dependencies, interaction),
-    });
+    return editOriginal(dependencies, interaction, continuationQueuePayload(dependencies, interaction));
   }
   const continueMatch = customId.match(/^continue-open:([A-Za-z0-9_-]{16})$/u);
   if (continueMatch) {

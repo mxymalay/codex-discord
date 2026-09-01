@@ -16,6 +16,7 @@ import {
   cancelContinuationPersisted,
   classifyReply,
   compareSnowflakes,
+  commitInboxState,
   createContinuationRequest,
   createEmptyInboxState,
   dispatchContinuation,
@@ -36,6 +37,7 @@ import {
   removePendingReply,
   resolveCodexExecutable,
   resumeCodexThread,
+  writeJsonAtomic,
 } from '../discord-bridge-lib.mjs';
 
 const config = {
@@ -445,7 +447,7 @@ test('finalize cursor persistence rollback preserves a concurrently confirmed Sl
     source: 'slash', requestId: 'finalize-concurrent-b', threadId: 'root-b', text: 'B',
   });
   let resumeB = 0;
-  await dispatchContinuation(requestB, {
+  const dispatchB = dispatchContinuation(requestB, {
     state,
     encryptText: async () => 'cipher:b',
     persistState: async () => {},
@@ -454,8 +456,12 @@ test('finalize cursor persistence rollback preserves a concurrently confirmed Sl
       return { turnId: 'turn-b', completion: Promise.resolve({ turn: { status: 'completed' } }) };
     },
   });
+  assert.equal(await Promise.race([
+    dispatchB.then(() => 'completed'),
+    new Promise((resolve) => setTimeout(() => resolve('waiting'), 20)),
+  ]), 'waiting');
   releaseFinalizePersist();
-  const outcome = await finalize;
+  const [outcome] = await Promise.all([finalize, dispatchB]);
 
   assert.equal(outcome.durable, false);
   const confirmedB = listContinuations(state).find((item) => item.requestId === requestB.requestId);
@@ -680,7 +686,7 @@ test('slash dispatch persists its idempotence journal before starting an externa
     },
   });
   assert.equal(result.status, 'started');
-  assert.deepEqual(events.slice(0, 3), ['persist:queued', 'persist:attempting', 'resume']);
+  assert.deepEqual(events.slice(0, 3), ['persist:queued', 'persist:resuming', 'resume']);
 });
 
 test('reply dispatch durably journals encrypted text before any external resume', async () => {
@@ -701,7 +707,7 @@ test('reply dispatch durably journals encrypted text before any external resume'
     },
   });
   assert.equal(result.status, 'started');
-  assert.deepEqual(events.slice(0, 4), ['encrypt', 'persist:queued', 'persist:attempting', 'resume']);
+  assert.deepEqual(events.slice(0, 4), ['encrypt', 'persist:queued', 'persist:resuming', 'resume']);
   assert.equal(Object.hasOwn(snapshots[0].pendingContinuations[Object.keys(snapshots[0].pendingContinuations)[0]], 'text'), false);
   assert.equal(snapshots[0].pendingContinuations[Object.keys(snapshots[0].pendingContinuations)[0]].encryptedText, 'opaque-ciphertext');
 });
@@ -859,9 +865,9 @@ test('a confirmed turn stays started when confirmation persistence, acknowledgem
   assert.equal(result.status, 'started');
   assert.equal(result.turnId, 'turn-confirmed');
   assert.equal(result.reason, 'state-persist-failed');
-  assert.equal(listContinuations(state)[0].status, 'confirmed-start');
+  assert.equal(listContinuations(state)[0].status, 'start-uncertain');
   assert.equal(listContinuations(state)[0].turnId, 'turn-confirmed');
-  assert.equal(events.includes('ack'), true);
+  assert.equal(events.includes('ack'), false);
   assert.equal(events.includes('track'), true);
 });
 
@@ -878,19 +884,20 @@ test('restart preserves an uncertain external start after confirmation persisten
   const first = await dispatchContinuation(request, {
     state,
     encryptText: async () => 'opaque-ciphertext',
-    persistState: async () => {
+    persistState: async (snapshot) => {
       persistCount += 1;
-      if (persistCount === 3) throw new Error('confirmation persistence failed');
-      persistedState = structuredClone(state);
+      if (persistCount === 4) throw new Error('confirmation persistence failed');
+      persistedState = structuredClone(snapshot);
     },
-    resumeCodexThread: async () => {
+    resumeCodexThread: async ({ onStartSubmitted }) => {
       resumeCount += 1;
+      await onStartSubmitted();
       return { turnId: 'turn-uncertain', completion: Promise.resolve({ turn: { status: 'completed' } }) };
     },
   });
   assert.equal(first.status, 'started');
   assert.equal(first.reason, 'state-persist-failed');
-  assert.equal(listContinuations(persistedState)[0].status, 'attempting');
+  assert.equal(listContinuations(persistedState)[0].status, 'start-submitted');
 
   const reloaded = migrateInboxState(structuredClone(persistedState));
   recoverContinuationAttempts(reloaded, '2026-09-01T01:00:00Z');
@@ -1272,6 +1279,129 @@ test('continuation summaries add an ellipsis only when the safe summary is actua
   assert.equal(short.summary, 'short');
   assert.equal(long.summary.endsWith('…'), true);
   assert.equal(long.summary.length, 120);
+});
+
+test('one inbox commit queue serializes writers and a failed continuation rollback preserves cursor and creation commits', async () => {
+  const state = createEmptyInboxState();
+  const queued = enqueueContinuation(state, {
+    ...createContinuationRequest({ source: 'slash', requestId: 'commit-a', threadId: 'root-a', text: 'A' }),
+    encryptedText: 'cipher-a',
+  });
+  let active = 0;
+  let maxActive = 0;
+  let releaseFailure;
+  const failureGate = new Promise((resolve) => { releaseFailure = resolve; });
+  let first = true;
+  const persistState = async (snapshot) => {
+    active += 1;
+    maxActive = Math.max(maxActive, active);
+    try {
+      if (first) {
+        first = false;
+        await failureGate;
+        throw new Error('first write fails');
+      }
+      assert.notStrictEqual(snapshot, state);
+    } finally {
+      active -= 1;
+    }
+  };
+  const cancel = cancelContinuationPersisted({ state, queueId: queued.queueId, persistState });
+  const cursor = commitInboxState({
+    state, persistState, fields: ['cursors', 'processedMessageIds'],
+    mutate: () => recordInboxMessage(state, 'channel', '200', true),
+  });
+  const create = commitInboxState({
+    state, persistState, fields: ['createdTasksByInteraction'],
+    mutate: () => { state.createdTasksByInteraction['create-b'] = { status: 'started', threadId: 'root-b' }; },
+  });
+  releaseFailure();
+  await assert.rejects(cancel, /persistence failed/i);
+  await Promise.all([cursor, create]);
+  assert.equal(maxActive, 1);
+  assert.equal(state.pendingContinuations[queued.queueId].status, 'queued');
+  assert.equal(state.cursors.channel, '200');
+  assert.equal(state.createdTasksByInteraction['create-b'].threadId, 'root-b');
+});
+
+test('post-submit transport ambiguity reloads as uncertain while a pre-submit active writer reloads queued', async () => {
+  const makeRequest = (requestId) => createContinuationRequest({
+    source: 'slash', requestId, threadId: 'root-stage', text: 'continue',
+  });
+  const disk = [];
+  const state = createEmptyInboxState();
+  const ambiguous = await dispatchContinuation(makeRequest('post-submit'), {
+    state,
+    encryptText: async () => 'cipher',
+    persistState: async (snapshot) => { disk.push(structuredClone(snapshot)); },
+    resumeCodexThread: async ({ onStartSubmitted }) => {
+      await onStartSubmitted();
+      const error = new Error('connection closed');
+      error.submissionStage = 'post-submit';
+      throw error;
+    },
+  });
+  assert.equal(ambiguous.status, 'uncertain');
+  const reloadedAmbiguous = migrateInboxState(structuredClone(disk.at(-1)));
+  recoverContinuationAttempts(reloadedAmbiguous);
+  assert.equal(listContinuations(reloadedAmbiguous)[0].status, 'start-uncertain');
+
+  const activeDisk = [];
+  const activeState = createEmptyInboxState();
+  const active = await dispatchContinuation(makeRequest('active-writer-stage'), {
+    state: activeState,
+    encryptText: async () => 'cipher',
+    persistState: async (snapshot) => {
+      activeDisk.push(structuredClone(snapshot));
+      if (listContinuations(snapshot)[0]?.status === 'queued' && activeDisk.length > 2) throw new Error('downgrade failed');
+    },
+    resumeCodexThread: async () => { throw new Error('thread already has an active writer'); },
+  });
+  assert.equal(active.reason, 'state-persist-failed');
+  const reloadedActive = migrateInboxState(structuredClone(activeDisk.at(-2)));
+  recoverContinuationAttempts(reloadedActive);
+  assert.equal(listContinuations(reloadedActive)[0].status, 'queued');
+});
+
+test('confirmed reply acknowledgement does not hold the inbox lock across Discord I/O', async () => {
+  const state = createEmptyInboxState();
+  const ackItem = enqueueContinuation(state, {
+    ...createContinuationRequest({ source: 'reply', requestId: 'ack-a', threadId: 'root-a', text: 'A', channelId: 'c', replyToMessageId: 'ack-a' }),
+    encryptedText: 'cipher-a', status: 'confirmed-start', turnId: 'turn-a',
+  });
+  const cancelItem = enqueueContinuation(state, {
+    ...createContinuationRequest({ source: 'slash', requestId: 'cancel-b', threadId: 'root-b', text: 'B' }),
+    encryptedText: 'cipher-b',
+  });
+  let releaseAck;
+  const ackGate = new Promise((resolve) => { releaseAck = resolve; });
+  let ackStarted;
+  const ackStartedGate = new Promise((resolve) => { ackStarted = resolve; });
+  const ack = dispatchContinuation(ackItem, {
+    state, persistState: async () => {}, decryptText: async () => 'A',
+    sendReply: async () => { ackStarted(); await ackGate; },
+  });
+  await ackStartedGate;
+  const cancelled = await Promise.race([
+    cancelContinuationPersisted({ state, queueId: cancelItem.queueId, persistState: async () => {} }),
+    new Promise((resolve) => setTimeout(() => resolve({ status: 'blocked' }), 50)),
+  ]);
+  assert.equal(cancelled.status, 'cancelled');
+  releaseAck();
+  await ack;
+});
+
+test('atomic JSON writers use collision-free temporary paths', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-inbox-atomic-'));
+  const target = path.join(root, 'state.json');
+  try {
+    await Promise.all(Array.from({ length: 20 }, (_, index) => writeJsonAtomic(`${target}.${index}`, { index })));
+    const written = JSON.parse(await fs.readFile(`${target}.7`, 'utf8'));
+    assert.equal(written.index, 7);
+    assert.deepEqual((await fs.readdir(root)).filter((name) => name.endsWith('.tmp')), []);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
 });
 
 test('migrates legacy pending plaintext before state is rewritten', async () => {

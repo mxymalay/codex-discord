@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { createInterface } from 'node:readline';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
@@ -25,10 +25,10 @@ export function createEmptyInboxState() {
 const MAX_PROCESSED_INTERACTIONS = 2_000;
 const MAX_CREATED_TASK_RECORDS = 2_000;
 const MAX_TERMINAL_CONTINUATIONS = 200;
-const CONTINUATION_STATUSES = new Set(['queued', 'attempting', 'start-uncertain', 'confirmed-start', 'delivered', 'cancelled', 'failed']);
+const CONTINUATION_STATUSES = new Set(['queued', 'resuming', 'submitting', 'attempting', 'start-submitted', 'start-uncertain', 'confirmed-start', 'acknowledging', 'delivered', 'cancelled', 'failed']);
 const TERMINAL_CONTINUATION_STATUSES = new Set(['delivered', 'cancelled', 'failed']);
 const TERMINAL_CREATION_STATUSES = new Set(['started', 'first-turn-failed', 'failed-before-thread', 'recovered-failed']);
-const continuationStateLocks = new WeakMap();
+const inboxStateCommitQueues = new WeakMap();
 
 function continuationQueueId(source, requestId) {
   return createHash('sha256').update(`${source}\0${requestId}`, 'utf8').digest().subarray(0, 12).toString('base64url');
@@ -45,27 +45,8 @@ function continuationSummary(value) {
   return safe.length <= 120 ? safe : `${safe.slice(0, 119)}…`;
 }
 
-function restoreState(state, snapshot) {
-  for (const key of Object.keys(state)) delete state[key];
-  Object.assign(state, structuredClone(snapshot));
-}
-
-function restoreContinuationClaim(state, rollback) {
-  state.pendingContinuations[rollback.queueId] = structuredClone(rollback.item);
-  const otherInteractions = state.processedInteractions.filter((item) =>
-    String(item?.requestId ?? '') !== rollback.requestId);
-  if (rollback.processedInteraction) {
-    otherInteractions.splice(
-      Math.min(rollback.processedInteractionIndex, otherInteractions.length),
-      0,
-      structuredClone(rollback.processedInteraction),
-    );
-  }
-  state.processedInteractions = otherInteractions;
-}
-
-async function withContinuationStateLock(state, operation) {
-  const previous = continuationStateLocks.get(state) ?? Promise.resolve();
+export async function withInboxStateLock(state, operation) {
+  const previous = inboxStateCommitQueues.get(state) ?? Promise.resolve();
   let release;
   const gate = new Promise((resolve) => { release = resolve; });
   const current = previous.catch(() => {}).then(async () => {
@@ -75,27 +56,100 @@ async function withContinuationStateLock(state, operation) {
       release();
     }
   });
-  continuationStateLocks.set(state, gate);
+  inboxStateCommitQueues.set(state, gate);
   try {
     return await current;
   } finally {
-    if (continuationStateLocks.get(state) === gate) continuationStateLocks.delete(state);
+    if (inboxStateCommitQueues.get(state) === gate) inboxStateCommitQueues.delete(state);
   }
 }
 
-async function persistMutation(state, persistState, mutate) {
-  return withContinuationStateLock(state, async () => {
-    const snapshot = structuredClone(state);
-    const result = mutate();
-    pruneContinuationHistory(state);
+function restoreFields(state, snapshots) {
+  for (const [field, snapshot] of snapshots) {
+    if (!snapshot.exists) delete state[field];
+    else state[field] = structuredClone(snapshot.value);
+  }
+}
+
+function restoreEntries(state, snapshots) {
+  for (const snapshot of snapshots) {
+    state[snapshot.field] ??= {};
+    if (!snapshot.exists) delete state[snapshot.field][snapshot.key];
+    else state[snapshot.field][snapshot.key] = structuredClone(snapshot.value);
+  }
+}
+
+function pruneCreatedTaskHistory(state) {
+  const records = state?.createdTasksByInteraction;
+  if (!records || typeof records !== 'object') return;
+  let overflow = Math.max(0, Object.keys(records).length - MAX_CREATED_TASK_RECORDS);
+  if (!overflow) return;
+  for (const [interactionId, record] of Object.entries(records)) {
+    if (!TERMINAL_CREATION_STATUSES.has(String(record?.status ?? ''))) continue;
+    delete records[interactionId];
+    overflow -= 1;
+    if (!overflow) break;
+  }
+}
+
+export async function commitInboxState({
+  state,
+  persistState,
+  fields = [],
+  entries = {},
+  mutate = () => undefined,
+  errorMessage = 'Inbox state persistence failed',
+}) {
+  if (!state || typeof state !== 'object') throw new TypeError('Inbox state is required');
+  return withInboxStateLock(state, async () => {
+    const uniqueFields = [...new Set(fields.map(String))];
+    const before = uniqueFields.map((field) => [field, {
+      exists: Object.hasOwn(state, field),
+      value: Object.hasOwn(state, field) ? structuredClone(state[field]) : undefined,
+    }]);
+    const beforeEntries = Object.entries(entries).flatMap(([field, keys]) =>
+      [...new Set((Array.isArray(keys) ? keys : []).map(String))].map((key) => ({
+        field,
+        key,
+        exists: Object.hasOwn(state[field] ?? {}, key),
+        value: Object.hasOwn(state[field] ?? {}, key) ? structuredClone(state[field][key]) : undefined,
+      })));
+    let result;
     try {
+      result = mutate();
+      if (result && typeof result.then === 'function') throw new TypeError('Inbox state mutation must be synchronous');
       if (typeof persistState !== 'function') throw new Error('Persistence adapter is unavailable');
-      await persistState(state);
+      const immutableSnapshot = structuredClone(state);
+      if (uniqueFields.includes('createdTasksByInteraction') || Object.hasOwn(entries, 'createdTasksByInteraction')) {
+        pruneCreatedTaskHistory(immutableSnapshot);
+      }
+      if (uniqueFields.includes('pendingContinuations') || Object.hasOwn(entries, 'pendingContinuations')) {
+        pruneContinuationHistory(immutableSnapshot);
+      }
+      await persistState(immutableSnapshot);
+      if (uniqueFields.includes('createdTasksByInteraction') || Object.hasOwn(entries, 'createdTasksByInteraction')) {
+        pruneCreatedTaskHistory(state);
+      }
+      if (uniqueFields.includes('pendingContinuations') || Object.hasOwn(entries, 'pendingContinuations')) {
+        pruneContinuationHistory(state);
+      }
       return result;
     } catch {
-      restoreState(state, snapshot);
-      throw new Error('Continuation state persistence failed');
+      restoreFields(state, before);
+      restoreEntries(state, beforeEntries);
+      throw new Error(errorMessage);
     }
+  });
+}
+
+async function persistMutation(state, persistState, mutate, queueIds = []) {
+  return commitInboxState({
+    state,
+    persistState,
+    fields: ['processedInteractions'],
+    entries: { pendingContinuations: queueIds },
+    mutate,
+    errorMessage: 'Continuation state persistence failed',
   });
 }
 
@@ -181,15 +235,7 @@ export function migrateInboxState(candidate) {
   state.createdTasksByInteraction = state.createdTasksByInteraction && typeof state.createdTasksByInteraction === 'object'
     ? state.createdTasksByInteraction
     : {};
-  let creationOverflow = Math.max(0, Object.keys(state.createdTasksByInteraction).length - MAX_CREATED_TASK_RECORDS);
-  if (creationOverflow) {
-    for (const [interactionId, record] of Object.entries(state.createdTasksByInteraction)) {
-      if (!TERMINAL_CREATION_STATUSES.has(String(record?.status ?? ''))) continue;
-      delete state.createdTasksByInteraction[interactionId];
-      creationOverflow -= 1;
-      if (!creationOverflow) break;
-    }
-  }
+  pruneCreatedTaskHistory(state);
 
   pruneContinuationHistory(state);
 
@@ -282,20 +328,29 @@ export function cancelContinuation(state, queueId, now = new Date().toISOString(
 }
 
 export async function cancelContinuationPersisted({ state, queueId, now = new Date().toISOString(), persistState }) {
-  return persistMutation(state, persistState, () => cancelContinuation(state, queueId, now));
+  return persistMutation(state, persistState, () => cancelContinuation(state, queueId, now), [String(queueId)]);
 }
 
 export function recoverContinuationAttempts(state, now = new Date().toISOString()) {
   migrateInboxState(state);
   for (const item of Object.values(state.pendingContinuations)) {
-    if (item?.status !== 'attempting') continue;
-    item.status = 'start-uncertain';
-    item.uncertainAt = String(now);
-    item.failureReason = 'start-outcome-uncertain';
-    if (item.source === 'slash') {
-      recordProcessedInteraction(state, item.requestId, {
-        status: 'uncertain', queueId: item.queueId, reason: 'start-outcome-uncertain',
-      }, now);
+    if (item?.status === 'resuming') {
+      item.status = 'queued';
+      item.failureReason = undefined;
+      if (item.source === 'slash') {
+        recordProcessedInteraction(state, item.requestId, { status: 'queued', queueId: item.queueId }, now);
+      }
+    } else if (['submitting', 'attempting', 'start-submitted'].includes(item?.status)) {
+      item.status = 'start-uncertain';
+      item.uncertainAt = String(now);
+      item.failureReason = 'start-outcome-uncertain';
+      if (item.source === 'slash') {
+        recordProcessedInteraction(state, item.requestId, {
+          status: 'uncertain', queueId: item.queueId, reason: 'start-outcome-uncertain',
+        }, now);
+      }
+    } else if (item?.status === 'acknowledging') {
+      item.status = 'confirmed-start';
     }
   }
   pruneContinuationHistory(state);
@@ -327,10 +382,6 @@ export function isActiveWriterError(error) {
   return /already has an active writer/i.test(String(error?.message ?? error ?? ''));
 }
 
-async function persistContinuationState(dependencies) {
-  await dependencies.persistState?.(dependencies.state);
-}
-
 async function acknowledgeContinuation(dependencies, request, content) {
   if (request.source !== 'reply' || typeof dependencies.sendReply !== 'function') return false;
   await dependencies.sendReply({
@@ -341,46 +392,88 @@ async function acknowledgeContinuation(dependencies, request, content) {
   return true;
 }
 
-async function deliverConfirmedReply(state, item, dependencies, now) {
-  return withContinuationStateLock(state, async () => {
-    const current = state.pendingContinuations[item.queueId];
-    const result = { status: 'started', queueId: item.queueId, turnId: current?.turnId ?? item.turnId };
-    if (current?.status === 'delivered') return result;
-    if (current?.status !== 'confirmed-start' || current?.source !== 'reply') {
-      return {
-        status: 'failed',
-        queueId: item.queueId,
-        reason: current?.status === 'attempting'
-          ? 'attempt-in-progress'
-          : current?.failureReason ?? current?.status ?? 'not-found',
-      };
-    }
-    try {
-      const acknowledged = await acknowledgeContinuation(
-        dependencies,
-        current,
-        `✅ 已送达原 Codex 任务（…${String(current.threadId).slice(-8)}），已开始继续执行。`,
-      );
-      if (!acknowledged) return result;
-    } catch {
-      return { ...result, reason: 'ack-failed' };
-    }
+async function deliverConfirmedReply(state, item, dependencies, now, queuedDelivery = false) {
+  let claim;
+  try {
+    claim = await commitInboxState({
+      state,
+      persistState: dependencies.persistState,
+      entries: { pendingContinuations: [item.queueId] },
+      mutate: () => {
+        const current = state.pendingContinuations[item.queueId];
+        if (current?.status === 'delivered') return { kind: 'delivered', item: structuredClone(current) };
+        if (current?.status !== 'confirmed-start' || current?.source !== 'reply') {
+          return { kind: 'unavailable', item: current ? structuredClone(current) : null };
+        }
+        current.status = 'acknowledging';
+        current.ackClaimedAt = now;
+        return { kind: 'claimed', item: structuredClone(current) };
+      },
+      errorMessage: 'Continuation acknowledgement claim persistence failed',
+    });
+  } catch {
+    return { status: 'started', queueId: item.queueId, turnId: item.turnId, reason: 'state-persist-failed' };
+  }
+  const current = claim?.item;
+  const result = { status: 'started', queueId: item.queueId, turnId: current?.turnId ?? item.turnId };
+  if (claim?.kind === 'delivered') return result;
+  if (claim?.kind !== 'claimed') {
+    return {
+      status: current?.status === 'start-uncertain' ? 'uncertain' : 'failed',
+      queueId: item.queueId,
+      reason: ['resuming', 'submitting', 'attempting', 'start-submitted', 'acknowledging'].includes(current?.status)
+        ? 'attempt-in-progress'
+        : current?.failureReason ?? current?.status ?? 'not-found',
+    };
+  }
 
-    const snapshot = structuredClone(state);
-    markContinuationDelivered(state, current.queueId, now);
-    try {
-      if (typeof dependencies.persistState !== 'function') throw new Error('Persistence adapter is unavailable');
-      await dependencies.persistState(state);
-      return result;
-    } catch {
-      restoreState(state, snapshot);
-      return { ...result, reason: 'state-persist-failed' };
+  let acknowledged = false;
+  try {
+    acknowledged = await acknowledgeContinuation(
+      dependencies,
+      current,
+      `✅ ${queuedDelivery ? '排队回复现已送达' : '已送达'}原 Codex 任务（…${String(current.threadId).slice(-8)}），已开始继续执行。`,
+    );
+  } catch {
+    acknowledged = false;
+  }
+  try {
+    await commitInboxState({
+      state,
+      persistState: dependencies.persistState,
+      entries: { pendingContinuations: [item.queueId] },
+      mutate: () => {
+        const latest = state.pendingContinuations[item.queueId];
+        if (latest?.status !== 'acknowledging') return;
+        if (acknowledged) markContinuationDelivered(state, item.queueId, now);
+        else {
+          latest.status = 'confirmed-start';
+          delete latest.ackClaimedAt;
+        }
+      },
+      errorMessage: 'Continuation acknowledgement persistence failed',
+    });
+  } catch {
+    if (!acknowledged) {
+      await withInboxStateLock(state, () => {
+        const latest = state.pendingContinuations[item.queueId];
+        if (latest?.status === 'acknowledging') {
+          latest.status = 'confirmed-start';
+          delete latest.ackClaimedAt;
+        }
+      });
     }
-  });
+    return { ...result, reason: 'state-persist-failed' };
+  }
+  return acknowledged ? result : { ...result, reason: 'ack-failed' };
 }
 
 export async function dispatchContinuation(request, dependencies = {}) {
-  const state = migrateInboxState(dependencies.state ?? createEmptyInboxState());
+  const candidate = dependencies.state ?? createEmptyInboxState();
+  const state = candidate?.version === 2 && candidate.pendingContinuations &&
+      Array.isArray(candidate.processedInteractions) && candidate.createdTasksByInteraction
+    ? candidate
+    : migrateInboxState(candidate);
   dependencies.state = state;
   const now = String(typeof dependencies.now === 'function' ? dependencies.now() : new Date().toISOString());
   const source = String(request?.source ?? '');
@@ -400,7 +493,7 @@ export async function dispatchContinuation(request, dependencies = {}) {
         return { status: 'started', queueId: existing.queueId, turnId: existing.turnId };
       }
       if (existing.status === 'queued') return { status: 'queued', queueId: existing.queueId };
-      return { status: 'failed', queueId: existing.queueId, reason: existing.status === 'attempting' ? 'attempt-in-progress' : existing.failureReason ?? existing.status };
+      return { status: 'failed', queueId: existing.queueId, reason: ['resuming', 'submitting', 'attempting', 'start-submitted', 'acknowledging'].includes(existing.status) ? 'attempt-in-progress' : existing.failureReason ?? existing.status };
     }
     const processed = source === 'slash' ? processedInteraction(state, requestId) : null;
     if (processed) {
@@ -417,7 +510,7 @@ export async function dispatchContinuation(request, dependencies = {}) {
       status: ['confirmed-start', 'delivered'].includes(existing.status) ? 'started' : 'failed',
       queueId: existing.queueId,
       turnId: existing.turnId,
-      reason: existing.status === 'attempting' ? 'attempt-in-progress' : existing.failureReason ?? existing.status,
+      reason: ['resuming', 'submitting', 'attempting', 'start-submitted', 'acknowledging'].includes(existing.status) ? 'attempt-in-progress' : existing.failureReason ?? existing.status,
     };
   }
 
@@ -440,8 +533,19 @@ export async function dispatchContinuation(request, dependencies = {}) {
     });
   } catch {
     const result = { status: 'failed', reason: 'invalid-request' };
-    if (source === 'slash') recordProcessedInteraction(state, requestId, result, now);
-    await persistContinuationState(dependencies);
+    if (source === 'slash') {
+      try {
+        await commitInboxState({
+          state,
+          persistState: dependencies.persistState,
+          fields: ['processedInteractions'],
+          mutate: () => recordProcessedInteraction(state, requestId, result, now),
+          errorMessage: 'Continuation state persistence failed',
+        });
+      } catch {
+        return { status: 'failed', reason: 'state-persist-failed' };
+      }
+    }
     return result;
   }
 
@@ -460,47 +564,32 @@ export async function dispatchContinuation(request, dependencies = {}) {
         queuedAt: now,
         attempts: 0,
         status: 'queued',
-      }));
+      }), [continuationQueueId(source, requestId)]);
     } catch {
       return { status: 'failed', reason: 'state-persist-failed' };
     }
     existing = listContinuations(state).find((item) => item.source === source && item.requestId === requestId);
   }
 
-  let queuedSnapshot;
-  let claimRollback;
   let claimObservation;
   try {
-    await withContinuationStateLock(state, async () => {
-      const current = state.pendingContinuations[existing.queueId];
-      if (!current || current.status !== 'queued') {
-        claimObservation = current ? structuredClone(current) : null;
-        return;
-      }
-      queuedSnapshot = structuredClone(state);
-      const processedInteractionIndex = state.processedInteractions.findIndex((item) =>
-        String(item?.requestId ?? '') === requestId);
-      claimRollback = {
-        queueId: current.queueId,
-        requestId,
-        item: structuredClone(current),
-        processedInteractionIndex,
-        processedInteraction: processedInteractionIndex >= 0
-          ? structuredClone(state.processedInteractions[processedInteractionIndex])
-          : null,
-      };
-      current.status = 'attempting';
-      current.lastAttemptAt = now;
-      current.attempts = Number(current.attempts ?? 0) + 1;
-      if (source === 'slash') recordProcessedInteraction(state, requestId, { status: 'attempting', queueId: current.queueId }, now);
-      pruneContinuationHistory(state);
-      try {
-        if (typeof dependencies.persistState !== 'function') throw new Error('Persistence adapter is unavailable');
-        await dependencies.persistState(state);
-      } catch {
-        restoreState(state, queuedSnapshot);
-        throw new Error('Continuation state persistence failed');
-      }
+    await commitInboxState({
+      state,
+      persistState: dependencies.persistState,
+      fields: ['processedInteractions'],
+      entries: { pendingContinuations: [existing.queueId] },
+      mutate: () => {
+        const current = state.pendingContinuations[existing.queueId];
+        if (!current || current.status !== 'queued') {
+          claimObservation = current ? structuredClone(current) : null;
+          return;
+        }
+        current.status = 'resuming';
+        current.lastAttemptAt = now;
+        current.attempts = Number(current.attempts ?? 0) + 1;
+        if (source === 'slash') recordProcessedInteraction(state, requestId, { status: 'resuming', queueId: current.queueId }, now);
+      },
+      errorMessage: 'Continuation state persistence failed',
     });
   } catch {
     return { status: 'failed', queueId: existing.queueId, reason: 'state-persist-failed' };
@@ -518,7 +607,7 @@ export async function dispatchContinuation(request, dependencies = {}) {
     return {
       status: 'failed',
       queueId: existing.queueId,
-      reason: claimObservation?.status === 'attempting'
+      reason: ['resuming', 'submitting', 'attempting', 'start-submitted', 'acknowledging'].includes(claimObservation?.status)
         ? 'attempt-in-progress'
         : claimObservation?.failureReason ?? claimObservation?.status ?? 'not-found',
     };
@@ -526,6 +615,38 @@ export async function dispatchContinuation(request, dependencies = {}) {
 
   const resume = dependencies.resumeCodexThread ?? resumeCodexThread;
   let started;
+  const onStartSubmitting = async () => {
+    await commitInboxState({
+      state,
+      persistState: dependencies.persistState,
+      fields: ['processedInteractions'],
+      entries: { pendingContinuations: [existing.queueId] },
+      mutate: () => {
+        const current = state.pendingContinuations[existing.queueId];
+        if (!current || current.status !== 'resuming') throw new Error('Continuation claim was lost');
+        current.status = 'submitting';
+        current.submittingAt = now;
+        if (source === 'slash') recordProcessedInteraction(state, requestId, { status: 'attempting', queueId: current.queueId }, now);
+      },
+      errorMessage: 'Continuation submission intent persistence failed',
+    });
+  };
+  const onStartSubmitted = async () => {
+    await commitInboxState({
+      state,
+      persistState: dependencies.persistState,
+      fields: ['processedInteractions'],
+      entries: { pendingContinuations: [existing.queueId] },
+      mutate: () => {
+        const current = state.pendingContinuations[existing.queueId];
+        if (!current || !['resuming', 'submitting'].includes(current.status)) throw new Error('Continuation claim was lost');
+        current.status = 'start-submitted';
+        current.submittedAt = now;
+        if (source === 'slash') recordProcessedInteraction(state, requestId, { status: 'attempting', queueId: current.queueId }, now);
+      },
+      errorMessage: 'Continuation submission state persistence failed',
+    });
+  };
   try {
     started = await resume({
       threadId: normalized.threadId,
@@ -534,6 +655,8 @@ export async function dispatchContinuation(request, dependencies = {}) {
       text: normalized.text,
       codexPath: dependencies.codexPath,
       clientFactory: dependencies.clientFactory,
+      onStartSubmitting,
+      onStartSubmitted,
     });
   } catch (error) {
     if (isActiveWriterError(error)) {
@@ -542,9 +665,15 @@ export async function dispatchContinuation(request, dependencies = {}) {
           const queued = state.pendingContinuations[existing.queueId];
           queued.status = 'queued';
           if (source === 'slash') recordProcessedInteraction(state, requestId, { status: 'queued', queueId: queued.queueId }, now);
-        });
+        }, [existing.queueId]);
       } catch {
-        await withContinuationStateLock(state, async () => restoreContinuationClaim(state, claimRollback));
+        await withInboxStateLock(state, () => {
+          const current = state.pendingContinuations[existing.queueId];
+          if (current?.status === 'resuming') current.status = 'queued';
+          if (source === 'slash') {
+            recordProcessedInteraction(state, requestId, { status: 'queued', queueId: existing.queueId }, now);
+          }
+        });
         return { status: 'failed', queueId: existing.queueId, reason: 'state-persist-failed' };
       }
       const result = { status: 'queued', queueId: existing.queueId };
@@ -557,6 +686,22 @@ export async function dispatchContinuation(request, dependencies = {}) {
       }
       return result;
     }
+    if (error?.submissionStage === 'post-submit') {
+      try {
+        await persistMutation(state, dependencies.persistState, () => {
+          const uncertain = state.pendingContinuations[existing.queueId];
+          uncertain.status = 'start-uncertain';
+          uncertain.uncertainAt = now;
+          uncertain.failureReason = 'start-outcome-uncertain';
+          if (source === 'slash') recordProcessedInteraction(state, requestId, {
+            status: 'uncertain', queueId: uncertain.queueId, reason: 'start-outcome-uncertain',
+          }, now);
+        }, [existing.queueId]);
+      } catch {
+        return { status: 'uncertain', queueId: existing.queueId, reason: 'state-persist-failed' };
+      }
+      return { status: 'uncertain', queueId: existing.queueId, reason: 'start-outcome-uncertain' };
+    }
     try {
       await persistMutation(state, dependencies.persistState, () => {
         const failed = state.pendingContinuations[existing.queueId];
@@ -564,7 +709,7 @@ export async function dispatchContinuation(request, dependencies = {}) {
         failed.failedAt = now;
         failed.failureReason = 'resume-failed';
         if (source === 'slash') recordProcessedInteraction(state, requestId, { status: 'failed', queueId: failed.queueId, reason: 'resume-failed' }, now);
-      });
+      }, [existing.queueId]);
     } catch {
       return { status: 'failed', queueId: existing.queueId, reason: 'state-persist-failed' };
     }
@@ -573,44 +718,42 @@ export async function dispatchContinuation(request, dependencies = {}) {
 
   const turnId = String(started?.turnId ?? '') || undefined;
   const result = { status: 'started', queueId: existing.queueId, turnId };
-  let confirmationPersistFailed = false;
-  await withContinuationStateLock(state, async () => {
-    const confirmed = state.pendingContinuations[existing.queueId];
-    confirmed.status = 'confirmed-start';
-    confirmed.confirmedAt = now;
-    confirmed.turnId = turnId;
-    if (source === 'slash') recordProcessedInteraction(state, requestId, result, now);
-    pruneContinuationHistory(state);
-    try {
-      await dependencies.persistState?.(state);
-    } catch {
-      confirmationPersistFailed = true;
-    }
-  });
-
-  let acknowledged = false;
   try {
-    acknowledged = await acknowledgeContinuation(
-      dependencies,
-      normalized,
-      `✅ ${wasQueuedRequest ? '排队回复现已送达' : '已送达'}原 Codex 任务（…${normalized.threadId.slice(-8)}），已开始继续执行。`,
-    );
+    await persistMutation(state, dependencies.persistState, () => {
+      const confirmed = state.pendingContinuations[existing.queueId];
+      confirmed.status = 'confirmed-start';
+      confirmed.confirmedAt = now;
+      confirmed.turnId = turnId;
+      if (source === 'slash') recordProcessedInteraction(state, requestId, result, now);
+    }, [existing.queueId]);
   } catch {
-    acknowledged = false;
-  }
-  if (acknowledged && !confirmationPersistFailed) {
+    await withInboxStateLock(state, () => {
+      const current = state.pendingContinuations[existing.queueId];
+      if (!current || ['delivered', 'cancelled'].includes(current.status)) return;
+      current.status = 'start-uncertain';
+      current.uncertainAt = now;
+      current.failureReason = 'start-outcome-uncertain';
+      current.turnId = turnId;
+      if (source === 'slash') recordProcessedInteraction(state, requestId, {
+        status: 'uncertain', queueId: existing.queueId, turnId, reason: 'start-outcome-uncertain',
+      }, now);
+    });
     try {
-      await persistMutation(state, dependencies.persistState, () => markContinuationDelivered(state, existing.queueId, now));
+      await dependencies.trackCompletion?.(started, normalized);
     } catch {
-      confirmationPersistFailed = true;
+      // The external turn remains started even when local tracking cannot attach.
     }
+    return { ...result, reason: 'state-persist-failed' };
   }
   try {
     await dependencies.trackCompletion?.(started, normalized);
   } catch {
     // A confirmed external turn remains started even when local tracking cannot attach.
   }
-  return confirmationPersistFailed ? { ...result, reason: 'state-persist-failed' } : result;
+  if (source === 'reply') {
+    return deliverConfirmedReply(state, state.pendingContinuations[existing.queueId], dependencies, now, wasQueuedRequest);
+  }
+  return result;
 }
 
 export function enqueuePendingReply(state, accepted, attemptedAt = new Date().toISOString(), encryptedText) {
@@ -777,7 +920,10 @@ export async function readJsonFile(filePath, fallback = null) {
 export async function writeJsonAtomic(filePath, value) {
   const directory = path.dirname(filePath);
   await fs.mkdir(directory, { recursive: true });
-  const temporaryPath = path.join(directory, `.${path.basename(filePath)}.${process.pid}.tmp`);
+  const temporaryPath = path.join(
+    directory,
+    `.${path.basename(filePath)}.${process.pid}.${randomBytes(12).toString('hex')}.tmp`,
+  );
   try {
     await fs.writeFile(temporaryPath, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
     await fs.rename(temporaryPath, filePath);
@@ -1004,7 +1150,13 @@ export class AppServerClient {
       if (!pending) return;
       this.pending.delete(String(message.id));
       clearTimeout(pending.timer);
-      if (message.error) pending.reject(new Error(`Codex App Server rejected ${pending.method}: ${message.error.message ?? 'unknown error'}`));
+      if (message.error) {
+        const error = new Error(`Codex App Server rejected ${pending.method}: ${message.error.message ?? 'unknown error'}`);
+        error.appServerRejected = true;
+        error.requestSubmitted = true;
+        error.method = pending.method;
+        pending.reject(error);
+      }
       else pending.resolve(message.result);
       return;
     }
@@ -1044,7 +1196,10 @@ export class AppServerClient {
     this.exitError = error;
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timer);
-      pending.reject(error ?? new Error('Codex App Server connection closed'));
+      const pendingError = error ?? new Error('Codex App Server connection closed');
+      pendingError.requestSubmitted = true;
+      pendingError.method = pending.method;
+      pending.reject(pendingError);
     }
     this.pending.clear();
     for (const completion of this.completedTurns.values()) {
@@ -1060,16 +1215,39 @@ export class AppServerClient {
     this.child.stdin.write(`${JSON.stringify(message)}\n`);
   }
 
-  request(message, timeoutMs = 30_000) {
-    return new Promise((resolve, reject) => {
-      const key = String(message.id);
-      const timer = setTimeout(() => {
+  request(message, timeoutMs = 30_000, { onSubmitted } = {}) {
+    const key = String(message.id);
+    let timer;
+    const response = new Promise((resolve, reject) => {
+      timer = setTimeout(() => {
         this.pending.delete(key);
-        reject(new Error(`Codex App Server timed out waiting for ${message.method}`));
+        const error = new Error(`Codex App Server timed out waiting for ${message.method}`);
+        error.requestSubmitted = true;
+        error.method = message.method;
+        reject(error);
       }, timeoutMs);
       this.pending.set(key, { resolve, reject, timer, method: message.method });
-      this.send(message);
+      try {
+        this.send(message);
+      } catch (error) {
+        clearTimeout(timer);
+        this.pending.delete(key);
+        error.requestSubmitted = false;
+        error.method = message.method;
+        reject(error);
+      }
     });
+    if (typeof onSubmitted !== 'function') return response;
+    return Promise.resolve()
+      .then(() => onSubmitted())
+      .then(() => response)
+      .catch((error) => {
+        clearTimeout(timer);
+        this.pending.delete(key);
+        error.requestSubmitted ??= true;
+        error.method ??= message.method;
+        throw error;
+      });
   }
 
   waitForTurn(turnId, timeoutMs = 24 * 60 * 60 * 1000) {
@@ -1106,7 +1284,16 @@ export async function initializeAppServerClient(client) {
   client.send({ method: 'initialized', params: {} });
 }
 
-export async function resumeCodexThread({ threadId, cwd, processCwd = cwd, text, codexPath, clientFactory }) {
+export async function resumeCodexThread({
+  threadId,
+  cwd,
+  processCwd = cwd,
+  text,
+  codexPath,
+  clientFactory,
+  onStartSubmitting,
+  onStartSubmitted,
+}) {
   const client = clientFactory
     ? clientFactory({ codexPath, cwd: processCwd })
     : new AppServerClient({ codexPath, cwd: processCwd });
@@ -1116,13 +1303,21 @@ export async function resumeCodexThread({ threadId, cwd, processCwd = cwd, text,
     const resumed = await client.request(messages[2]);
     const resumedThreadId = String(resumed?.thread?.id ?? '');
     if (resumedThreadId !== threadId) throw new Error('Codex App Server resumed a different thread');
-    const started = await client.request(messages[3]);
+    await onStartSubmitting?.();
+    let started;
+    try {
+      started = await client.request(messages[3], 30_000, { onSubmitted: onStartSubmitted });
+    } catch (error) {
+      error.submissionStage = error?.appServerRejected ? 'rejected' : (error?.requestSubmitted === false ? 'pre-submit' : 'post-submit');
+      throw error;
+    }
     const turnId = String(started?.turn?.id ?? '');
     if (!turnId) throw new Error('Codex App Server did not return a turn ID');
     const completion = client.waitForTurn(turnId).finally(() => client.close());
     return { turnId, completion };
   } catch (error) {
     client.close();
+    error.submissionStage ??= 'pre-submit';
     throw error;
   }
 }

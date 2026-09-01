@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 
 import {
   classifyReply,
+  commitInboxState,
   createContinuationRequest,
   createEmptyInboxState,
   decryptPendingReplyText,
@@ -110,23 +111,15 @@ function trackContinuationCompletion(started, request, token) {
 }
 
 async function recordInboxMessageDurably(state, channelId, messageId, processed, persistState) {
-  const normalizedChannelId = String(channelId);
-  const normalizedMessageId = String(messageId);
-  const previousCursor = Object.hasOwn(state.cursors, normalizedChannelId)
-    ? String(state.cursors[normalizedChannelId])
-    : undefined;
-  const wasProcessed = state.processedMessageIds.includes(normalizedMessageId);
-  recordInboxMessage(state, normalizedChannelId, normalizedMessageId, processed);
   try {
-    await persistState(state);
+    await commitInboxState({
+      state,
+      persistState,
+      fields: ['cursors', 'processedMessageIds'],
+      mutate: () => recordInboxMessage(state, String(channelId), String(messageId), processed),
+      errorMessage: 'Inbox message persistence failed',
+    });
   } catch {
-    if (String(state.cursors[normalizedChannelId] ?? '') === normalizedMessageId) {
-      if (previousCursor === undefined) delete state.cursors[normalizedChannelId];
-      else state.cursors[normalizedChannelId] = previousCursor;
-    }
-    if (!wasProcessed) {
-      state.processedMessageIds = state.processedMessageIds.filter((item) => String(item) !== normalizedMessageId);
-    }
     throw new Error('Inbox message persistence failed');
   }
 }
@@ -269,7 +262,7 @@ async function main() {
     channelIds,
     getLatest: (channelId) => getLatestDiscordMessageId({ token, channelId }),
   });
-  await saveState(state);
+  await commitInboxState({ state, persistState: saveState });
   await initializeRolloutWatcherState({ sessionsRoot, state: rolloutState });
   await writeRolloutWatcherState(rolloutWatcherStatePath, rolloutState);
   await log(`bridge started channels=${channelIds.map((id) => mask(id)).join(',')} codex=${path.basename(config.discordCodexPath)}`);
