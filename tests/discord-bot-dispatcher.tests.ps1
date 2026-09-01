@@ -84,6 +84,9 @@ try {
     if ([int]$completed.payload.embeds[0].color -ne 3066993) {
         throw 'Completed task Discord embed is not green'
     }
+    if ([string]$completed.payload.embeds[0].title -ne 'Codex 任务已完成') { throw 'completed title contains task name or separator' }
+    $completedJson = $completed.payload | ConvertTo-Json -Depth 12
+    if (-not $completedJson.Contains('Discord Bot 测试任务')) { throw 'task name disappeared from completed body' }
     if (@($completed.payload.allowed_mentions.parse).Count -ne 0) {
         throw 'Discord Bot payload enabled automatic mentions'
     }
@@ -95,6 +98,9 @@ try {
     if ([int]$confirmation.payload.embeds[0].color -ne 15965202) {
         throw 'Confirmation Discord embed is not orange'
     }
+    if ([string]$confirmation.payload.embeds[0].title -ne 'Codex 任务待确认') { throw 'confirmation title contains task name or separator' }
+    $confirmationJson = $confirmation.payload | ConvertTo-Json -Depth 12
+    if (-not $confirmationJson.Contains('Discord Bot 测试任务')) { throw 'task name disappeared from confirmation body' }
 
     Write-Output 'PASS: Discord Bot dispatcher routing and embeds'
 }

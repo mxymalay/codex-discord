@@ -13,7 +13,10 @@ param(
 
     [switch]$FallbackInvocation,
 
-    [switch]$DryRun
+    [switch]$DryRun,
+
+    [ValidateSet('', 'task', 'confirmation', 'quota')]
+    [string]$SystemTestEvent = ''
 )
 
 Set-StrictMode -Version Latest
@@ -590,6 +593,14 @@ function Send-MobileMessage {
     else {
         ''
     }
+    $syntheticTest = $false
+    if ($null -ne $Notification) {
+        $syntheticTest = [bool](Get-OptionalValue -Object $Notification -Name 'synthetic-test' -DefaultValue $false)
+    }
+    $saveTaskMapping = $provider -eq 'discord-bot' -and
+        $EventName -in @('user-task-complete', 'user-task-confirmation-required') -and
+        $null -ne $Notification -and
+        -not $syntheticTest
 
     if ($DryRun) {
         [pscustomobject]@{
@@ -602,6 +613,8 @@ function Send-MobileMessage {
             tags = $Tags
             event = $EventName
             payload = $providerPayload
+            syntheticTest = $syntheticTest
+            saveTaskMapping = $saveTaskMapping
         } | ConvertTo-Json -Depth 6
         return
     }
@@ -677,7 +690,7 @@ function Send-MobileMessage {
         }
         'discord-bot' {
             $response = Send-DiscordBotMessage -Config $Config -ChannelId $channelId -Payload $providerPayload -TimeoutSeconds $timeoutSeconds
-            if ($EventName -in @('user-task-complete', 'user-task-confirmation-required') -and $null -ne $Notification) {
+            if ($saveTaskMapping) {
                 if (-not (Get-Command -Name Save-DiscordTaskMapping -ErrorAction SilentlyContinue)) {
                     throw 'Discord task mapping module is unavailable'
                 }
@@ -861,7 +874,7 @@ function Invoke-ConfirmationNotifier {
 
     $taskMessage = Get-LastUserMessage -Notification $Notification
     $taskName = Get-TaskName -Notification $Notification -TaskMessage $taskMessage
-    $title = "Codex 任务待确认 · $taskName"
+    $title = 'Codex 任务待确认'
     $body = "项目名：$project`n任务名：$taskName`n`n打开 Codex 查看并确认后续操作。"
 
     $includeAssistantMessage = [bool](Get-OptionalValue -Object $Config -Name 'includeAssistantMessage' -DefaultValue $false)
@@ -906,7 +919,7 @@ function Invoke-MobileNotifier {
 
     $taskMessage = Get-LastUserMessage -Notification $Notification
     $taskName = Get-TaskName -Notification $Notification -TaskMessage $taskMessage
-    $title = "Codex 任务已完成 · $taskName"
+    $title = 'Codex 任务已完成'
     $body = "项目名：$project`n任务名：$taskName"
     if ($includeAssistantMessage) {
         if ($taskMessage.Length -gt 400) {
@@ -1738,6 +1751,31 @@ function Invoke-QuotaNotifier {
 }
 
 try {
+    if (-not (Test-Path -LiteralPath $configPath)) {
+        Write-NotifyLog 'Configuration file is missing'
+        return
+    }
+
+    $config = Get-Content -Raw -LiteralPath $configPath -Encoding UTF8 | ConvertFrom-Json
+    if (-not [string]::IsNullOrWhiteSpace($SystemTestEvent)) {
+        $notification = [pscustomobject]@{
+            type = 'agent-turn-complete'
+            'synthetic-test' = $true
+        }
+        switch ($SystemTestEvent) {
+            'task' {
+                Send-MobileMessage -Config $config -Title 'Codex 系统测试：任务完成通知' -Body "系统测试通知：任务完成出站链路。`n此消息不可用于回复续接任务。" -Priority 3 -Tags @('test_tube') -EventName 'user-task-complete' -Notification $notification
+            }
+            'confirmation' {
+                Send-MobileMessage -Config $config -Title 'Codex 系统测试：任务待确认通知' -Body "系统测试通知：任务待确认出站链路。`n此消息不可用于回复续接任务。" -Priority 4 -Tags @('test_tube') -EventName 'user-task-confirmation-required' -Notification $notification
+            }
+            'quota' {
+                Send-MobileMessage -Config $config -Title 'Codex 系统测试：额度变化通知' -Body "系统测试通知：额度变化出站链路。`n此测试不读取或修改额度历史。" -Priority 3 -Tags @('test_tube') -EventName 'quota-changed' -Notification $notification
+            }
+        }
+        return
+    }
+
     if (-not [string]::IsNullOrWhiteSpace($NotificationFile)) {
         $NotificationJson = [System.IO.File]::ReadAllText([System.IO.Path]::GetFullPath($NotificationFile), [System.Text.Encoding]::UTF8)
     }
@@ -1748,12 +1786,6 @@ try {
         throw 'Notification JSON is empty'
     }
 
-    if (-not (Test-Path -LiteralPath $configPath)) {
-        Write-NotifyLog 'Configuration file is missing'
-        return
-    }
-
-    $config = Get-Content -Raw -LiteralPath $configPath -Encoding UTF8 | ConvertFrom-Json
     $notification = $NotificationJson | ConvertFrom-Json
     $eventType = [string](Get-OptionalValue -Object $notification -Name 'type' -DefaultValue '')
 

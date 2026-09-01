@@ -6,7 +6,7 @@ import path from 'node:path';
 import { PassThrough } from 'node:stream';
 import test from 'node:test';
 
-import { commitInboxState, createEmptyInboxState, recordInboxMessage } from '../discord-bridge-lib.mjs';
+import { commitInboxState, createEmptyInboxState, recordInboxMessage, withInboxStateLock } from '../discord-bridge-lib.mjs';
 
 import {
   NO_PROJECT,
@@ -840,6 +840,45 @@ test('persists each creation state before the corresponding external mutation an
   assert.equal(gitCalls.length, 2);
   assert.equal(gitCalls.some(({ args }) => args.includes('add')), false);
   await first.completion;
+});
+
+test('concurrent identical task creation installs its in-flight operation before waiting for the inbox lock', async () => {
+  const state = createEmptyInboxState();
+  let releaseLock;
+  let lockAcquired;
+  const acquired = new Promise((resolve) => { lockAcquired = resolve; });
+  const blocker = withInboxStateLock(state, async () => {
+    lockAcquired();
+    await new Promise((resolve) => { releaseLock = resolve; });
+  });
+  await acquired;
+
+  let clients = 0;
+  const args = {
+    state,
+    interactionId: 'interaction-concurrent-once',
+    selection: { kind: 'projectless', projectId: null, projectName: '无项目', roots: ['C:\\tasks'] },
+    text: 'run once concurrently',
+    fileSystem: { mkdir: async () => {} },
+    persistState: async () => {},
+    clientFactory: () => {
+      clients += 1;
+      return fakeAppServer([], {
+        'thread/start': { thread: { id: 'thread-concurrent-once', name: 'Once' } },
+        'turn/start': { turn: { id: 'turn-concurrent-once' } },
+      });
+    },
+  };
+
+  const first = createNewTaskOnce(args);
+  const duplicate = createNewTaskOnce(args);
+  releaseLock();
+  await blocker;
+  const [firstResult, duplicateResult] = await Promise.all([first, duplicate]);
+
+  assert.equal(clients, 1);
+  assert.equal(firstResult.threadId, 'thread-concurrent-once');
+  await firstResult.completion;
 });
 
 test('awaits durable creation transitions before each following Git or App Server mutation', async () => {

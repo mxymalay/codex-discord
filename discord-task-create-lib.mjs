@@ -780,20 +780,27 @@ export async function createNewTaskOnce({
   if (!state || typeof state !== 'object') throw new TypeError('Task creation state is required');
   if (!interactionId) throw new Error('Interaction ID is required');
   if (typeof persistState !== 'function') throw new TypeError('Task persistence boundary is required');
-  const recorded = state.createdTasksByInteraction?.[interactionId];
-  if (recorded) {
-    const pending = inFlightByState.get(state)?.get(interactionId);
-    if (pending) return pending;
-    return { ...recorded, duplicate: true };
-  }
-
   let stateFlights = inFlightByState.get(state);
   if (!stateFlights) {
     stateFlights = new Map();
     inFlightByState.set(state, stateFlights);
   }
+  const pending = stateFlights.get(interactionId);
+  if (pending) return pending;
 
-  const operation = (async () => {
+  const recorded = state.createdTasksByInteraction?.[interactionId];
+  if (recorded) {
+    return { ...recorded, duplicate: true };
+  }
+
+  let resolveOperation;
+  let rejectOperation;
+  const operation = new Promise((resolve, reject) => {
+    resolveOperation = resolve;
+    rejectOperation = reject;
+  });
+  stateFlights.set(interactionId, operation);
+  (async () => {
     let prepared = null;
     try {
       await persistInteractionRecord({
@@ -895,13 +902,11 @@ export async function createNewTaskOnce({
       });
       throw error;
     }
-  })();
-
-  stateFlights.set(interactionId, operation);
+  })().then(resolveOperation, rejectOperation);
   try {
     return await operation;
   } finally {
-    stateFlights.delete(interactionId);
+    if (stateFlights.get(interactionId) === operation) stateFlights.delete(interactionId);
   }
 }
 

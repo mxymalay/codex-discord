@@ -157,6 +157,8 @@ function makeDependencies(overrides = {}) {
       index.tasks.filter((item) => item.taskName.includes(keyword)).slice(0, limit)),
     getQuotaState: overrides.getQuotaState ?? (async () => null),
     getSystemStatus: overrides.getSystemStatus ?? (() => ({ gateway: { state: 'ready' } })),
+    runQuickHealthChecks: overrides.runQuickHealthChecks ?? (async () => [{ key: 'quick', label: '快速检查', ok: true, latencyMs: 1, detail: '正常' }]),
+    runFullHealthChecks: overrides.runFullHealthChecks ?? (async () => [{ key: 'full', label: '完整检查', ok: true, latencyMs: 1, detail: '正常' }]),
     getQueue: overrides.getQueue ?? (() => []),
     dispatchContinuation: overrides.dispatchContinuation ?? (async () => ({ status: 'started', turnId: 'turn-continued' })),
     cancelContinuation: overrides.cancelContinuation ?? (() => ({ status: 'cancelled' })),
@@ -272,6 +274,50 @@ test('initial command callbacks are always ephemeral and mention-safe', async ()
       assert.deepEqual(response.data.allowed_mentions, { parse: [] });
     }
   }
+});
+
+test('system test defaults to quick mode and never invokes full outbound probes', async () => {
+  let quickCalls = 0;
+  let fullCalls = 0;
+  const { dependencies, responses, edits } = makeDependencies({
+    runQuickHealthChecks: async () => {
+      quickCalls += 1;
+      return [{ key: 'gateway', label: 'Gateway', ok: true, latencyMs: 7, detail: '在线' }];
+    },
+    runFullHealthChecks: async () => { fullCalls += 1; return []; },
+  });
+
+  await createInteractionRouter(dependencies).handle(commandInteraction('系统测试'));
+
+  assert.equal(quickCalls, 1);
+  assert.equal(fullCalls, 0);
+  assert.equal(responses[0].type, 5);
+  assert.equal(responses[0].data.flags & 64, 64);
+  assert.match(edits[0].content, /快速系统测试/u);
+  assert.match(edits[0].content, /Gateway/u);
+});
+
+test('full system test invokes all-probe orchestration and keeps the final report private', async () => {
+  let fullCalls = 0;
+  const { dependencies, responses, edits } = makeDependencies({
+    runFullHealthChecks: async () => {
+      fullCalls += 1;
+      return [
+        { key: 'task-probe', label: '任务通知', ok: true, latencyMs: 11, detail: '已发送' },
+        { key: 'confirmation-probe', label: '确认通知', ok: false, latencyMs: 12, detail: '发送失败' },
+        { key: 'quota-probe', label: '额度通知', ok: true, latencyMs: 13, detail: '已发送' },
+      ];
+    },
+  });
+
+  await createInteractionRouter(dependencies).handle(commandInteraction('系统测试', { 类型: '完整' }));
+
+  assert.equal(fullCalls, 1);
+  assert.equal(responses[0].type, 5);
+  assert.deepEqual(responses[0].data.allowed_mentions, { parse: [] });
+  assert.match(edits[0].content, /完整系统测试/u);
+  assert.match(edits[0].content, /确认通知.*失败/u);
+  assert.deepEqual(edits[0].allowed_mentions, { parse: [] });
 });
 
 test('task list uses an embed-safe body even when indexed display names are oversized', async () => {

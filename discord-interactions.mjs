@@ -3,6 +3,7 @@ import path from 'node:path';
 
 import { COMMAND_NAMES, authorizeInteraction, ephemeral } from './discord-commands-lib.mjs';
 import { cancelContinuationPersisted as cancelPersistedContinuation, createContinuationRequest } from './discord-bridge-lib.mjs';
+import { renderHealthReport, runFullHealthChecks, runQuickHealthChecks } from './discord-health-lib.mjs';
 import { NO_PROJECT, resolveProjectSelection } from './discord-task-create-lib.mjs';
 
 const DISCORD_API = 'https://discord.com/api/v10';
@@ -1015,7 +1016,19 @@ async function handleCommand(dependencies, interaction) {
     }
   }
   if (name === '帮助') return respond(dependencies, interaction, privateResponse(renderHelp()));
-  if (name === '系统测试') return respond(dependencies, interaction, privateResponse('系统测试功能将在健康检查阶段接入。'));
+  if (name === '系统测试') {
+    const mode = optionValue(interaction, '类型') === '完整' ? '完整' : '快速';
+    await defer(dependencies, interaction);
+    try {
+      const runner = mode === '完整'
+        ? (dependencies.runFullHealthChecks ?? runFullHealthChecks)
+        : (dependencies.runQuickHealthChecks ?? runQuickHealthChecks);
+      const checks = await runner(dependencies.healthDependencies ?? dependencies);
+      return editOriginal(dependencies, interaction, { content: renderHealthReport(checks, { mode }) });
+    } catch {
+      return editOriginal(dependencies, interaction, { content: `${mode}系统测试暂不可用，请稍后重试。` });
+    }
+  }
   return respond(dependencies, interaction, privateResponse('未知命令。'));
 }
 

@@ -419,7 +419,7 @@ test('transient reply failure returns a stop contract and rate-limits its Bot er
   assert.equal(state.cursors[config.discordConfirmationChannelId], '777777777777777800');
 });
 
-test('finalize cursor persistence rollback preserves a concurrently confirmed Slash request', async () => {
+test('finalize cursor persistence rollback preserves a concurrently delivered Slash request', async () => {
   const state = createEmptyInboxState();
   state.cursors[config.discordConfirmationChannelId] = '777777777777777800';
   const replyRequest = createContinuationRequest({
@@ -465,7 +465,7 @@ test('finalize cursor persistence rollback preserves a concurrently confirmed Sl
 
   assert.equal(outcome.durable, false);
   const confirmedB = listContinuations(state).find((item) => item.requestId === requestB.requestId);
-  assert.equal(confirmedB.status, 'confirmed-start');
+  assert.equal(confirmedB.status, 'delivered');
   await dispatchContinuation(requestB, {
     state,
     encryptText: async () => 'cipher:b',
@@ -742,6 +742,70 @@ test('a reply remains confirmed-start when no acknowledgement transport is avail
   });
   assert.equal(result.status, 'started');
   assert.equal(listContinuations(state)[0].status, 'confirmed-start');
+});
+
+test('successful Slash continuation is durably delivered while preserving its idempotent result', async () => {
+  const state = createEmptyInboxState();
+  const now = '2026-09-01T12:00:00.000Z';
+  let resumeCount = 0;
+  const request = createContinuationRequest({
+    source: 'slash', requestId: 'slash-terminal-success', threadId: 'root-1', text: 'continue',
+  });
+  const dependencies = {
+    state,
+    now: () => now,
+    encryptText: async () => 'opaque-ciphertext',
+    persistState: async () => {},
+    resumeCodexThread: async () => {
+      resumeCount += 1;
+      return { turnId: 'turn-slash-terminal', completion: Promise.resolve({ turn: { status: 'completed' } }) };
+    },
+  };
+
+  const first = await dispatchContinuation(request, dependencies);
+  const duplicate = await dispatchContinuation(request, dependencies);
+  const item = listContinuations(state)[0];
+
+  assert.equal(first.status, 'started');
+  assert.deepEqual(duplicate, first);
+  assert.equal(resumeCount, 1);
+  assert.equal(item.status, 'delivered');
+  assert.equal(item.deliveredAt, now);
+  assert.equal(state.processedInteractions.find((entry) => entry.requestId === request.requestId)?.turnId, 'turn-slash-terminal');
+});
+
+test('successful reply acknowledgement releases a failed delivered finalize for ack-only retry', async () => {
+  const state = createEmptyInboxState();
+  const request = createContinuationRequest({
+    source: 'reply', requestId: 'reply-finalize-failure', threadId: 'root-1', text: 'continue',
+    channelId: 'channel-1', replyToMessageId: 'reply-finalize-failure',
+  });
+  const queued = enqueueContinuation(state, {
+    ...request, encryptedText: 'opaque-ciphertext', status: 'confirmed-start', turnId: 'turn-already-started',
+  });
+  let persistCount = 0;
+  let acknowledgementCount = 0;
+  let resumeCount = 0;
+  const dependencies = {
+    state,
+    decryptText: async () => 'continue',
+    persistState: async () => {
+      persistCount += 1;
+      if (persistCount === 2) throw new Error('finalize write failed');
+    },
+    sendReply: async () => { acknowledgementCount += 1; },
+    resumeCodexThread: async () => { resumeCount += 1; throw new Error('must not resume'); },
+  };
+
+  const failedFinalize = await dispatchContinuation(queued, dependencies);
+  assert.equal(failedFinalize.reason, 'state-persist-failed');
+  assert.equal(state.pendingContinuations[queued.queueId].status, 'confirmed-start');
+
+  const retry = await dispatchContinuation(request, dependencies);
+  assert.equal(retry.status, 'started');
+  assert.equal(state.pendingContinuations[queued.queueId].status, 'delivered');
+  assert.equal(acknowledgementCount, 2);
+  assert.equal(resumeCount, 0);
 });
 
 test('a confirmed reply retries only its failed acknowledgement on another dispatch', async () => {
@@ -1097,7 +1161,7 @@ test('active-writer queue persistence failure restores a retryable queue for the
   assert.equal(recovered.turnId, 'turn-recovered');
 });
 
-test('active-writer rollback for request A preserves concurrently confirmed request B', async () => {
+test('active-writer rollback for request A preserves concurrently delivered request B', async () => {
   const state = createEmptyInboxState();
   const requestA = enqueueContinuation(state, {
     ...createContinuationRequest({ source: 'slash', requestId: 'active-a', threadId: 'root-a', text: 'A' }),
@@ -1138,7 +1202,7 @@ test('active-writer rollback for request A preserves concurrently confirmed requ
 
   assert.equal(resultA.reason, 'state-persist-failed');
   assert.equal(state.pendingContinuations[requestA.queueId].status, 'queued');
-  assert.equal(state.pendingContinuations[requestB.queueId].status, 'confirmed-start');
+  assert.equal(state.pendingContinuations[requestB.queueId].status, 'delivered');
 
   await dispatchContinuation(requestB, {
     state,
@@ -1199,7 +1263,7 @@ test('a runtime delivery transition prunes the oldest terminal history before pe
   assert.equal(Object.hasOwn(state.pendingContinuations, queued.queueId), true);
 });
 
-test('terminal pruning retains a newly confirmed turn even when it waited in queue longer than history', async () => {
+test('terminal pruning retains a newly delivered turn even when it waited in queue longer than history', async () => {
   const state = createEmptyInboxState();
   for (let index = 0; index < 200; index += 1) {
     state.pendingContinuations[`history-${index}`] = {
@@ -1226,7 +1290,7 @@ test('terminal pruning retains a newly confirmed turn even when it waited in que
   });
 
   assert.equal(result.status, 'started');
-  assert.equal(state.pendingContinuations[queued.queueId].status, 'confirmed-start');
+  assert.equal(state.pendingContinuations[queued.queueId].status, 'delivered');
   assert.equal(state.pendingContinuations[queued.queueId].turnId, 'turn-new-fact');
 });
 

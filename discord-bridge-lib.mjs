@@ -454,7 +454,21 @@ async function deliverConfirmedReply(state, item, dependencies, now, queuedDeliv
       errorMessage: 'Continuation acknowledgement persistence failed',
     });
   } catch {
-    if (!acknowledged) {
+    try {
+      await commitInboxState({
+        state,
+        persistState: dependencies.persistState,
+        entries: { pendingContinuations: [item.queueId] },
+        mutate: () => {
+          const latest = state.pendingContinuations[item.queueId];
+          if (latest?.status === 'acknowledging') {
+            latest.status = 'confirmed-start';
+            delete latest.ackClaimedAt;
+          }
+        },
+        errorMessage: 'Continuation acknowledgement release persistence failed',
+      });
+    } catch {
       await withInboxStateLock(state, () => {
         const latest = state.pendingContinuations[item.queueId];
         if (latest?.status === 'acknowledging') {
@@ -721,8 +735,9 @@ export async function dispatchContinuation(request, dependencies = {}) {
   try {
     await persistMutation(state, dependencies.persistState, () => {
       const confirmed = state.pendingContinuations[existing.queueId];
-      confirmed.status = 'confirmed-start';
+      confirmed.status = source === 'slash' ? 'delivered' : 'confirmed-start';
       confirmed.confirmedAt = now;
+      if (source === 'slash') confirmed.deliveredAt = now;
       confirmed.turnId = turnId;
       if (source === 'slash') recordProcessedInteraction(state, requestId, result, now);
     }, [existing.queueId]);
