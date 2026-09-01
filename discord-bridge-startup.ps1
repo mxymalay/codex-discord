@@ -37,7 +37,7 @@ public static class CodexBridgeJobNative {
 '@
 }
 function Get-BridgeJobName { param([Parameter(Mandatory)][string]$ToolDir) return ('Local\CodexDiscordBridgeJob-' + (Get-ControlPathHash $ToolDir)) }
-function New-BridgeExtendedLimitInformation { Initialize-BridgeJobNative; $info=New-Object CodexBridgeJobNative+Extended; $info.basic.LimitFlags=0x2000; return $info }
+function New-BridgeExtendedLimitInformation { Initialize-BridgeJobNative; $info=New-Object CodexBridgeJobNative+Extended; $basic=$info.basic; $basic.LimitFlags=0x2000; $info.basic=$basic; return $info }
 function New-BridgeSupervisorJob {
  param([Parameter(Mandatory)][string]$ToolDir,[Parameter(Mandatory)][System.Diagnostics.Process]$Process)
  Initialize-BridgeJobNative; $job=[CodexBridgeJobNative]::CreateJobObject([IntPtr]::Zero,(Get-BridgeJobName $ToolDir)); if($job -eq [IntPtr]::Zero){throw 'bridge-job-create-failed'}

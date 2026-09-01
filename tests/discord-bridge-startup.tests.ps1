@@ -13,6 +13,7 @@ $emptyJob = [CodexBridgeJobNative]::CreateJobObject([IntPtr]::Zero, ('Local\Code
 try {
     if ($emptyJob -eq [IntPtr]::Zero) { throw 'could not create safe empty Job Object' }
     $extended = New-BridgeExtendedLimitInformation
+    if ($extended.basic.LimitFlags -ne 0x2000) { throw 'production bridge Job helper did not set kill-on-close' }
     if (-not [CodexBridgeJobNative]::SetInformationJobObject($emptyJob, 9, [ref]$extended, [Runtime.InteropServices.Marshal]::SizeOf($extended))) { throw 'empty Job Object rejected extended limit ABI' }
     $accounting = New-Object CodexBridgeJobNative+Accounting
     if (-not [CodexBridgeJobNative]::QueryInformationJobObject($emptyJob, 1, [ref]$accounting, [Runtime.InteropServices.Marshal]::SizeOf($accounting), [IntPtr]::Zero) -or $accounting.ActiveProcesses -ne 0) { throw 'empty Job Object accounting ABI is invalid' }
