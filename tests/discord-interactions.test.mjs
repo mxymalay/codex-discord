@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
+import * as interactionModule from '../discord-interactions.mjs';
+
 import { COMMAND_NAMES } from '../discord-commands-lib.mjs';
 import {
   cancelContinuationPersisted,
@@ -88,6 +90,7 @@ function componentInteraction(customId, overrides = {}) {
     token: overrides.token ?? 'component-token-must-not-be-stored',
     type: 3,
     ...identity(overrides.userId, overrides.guildId),
+    message: { id: overrides.messageId ?? 'takeover-message-1' },
     data: { custom_id: customId, component_type: 2 },
   };
 }
@@ -160,11 +163,14 @@ function makeDependencies(overrides = {}) {
     runQuickHealthChecks: overrides.runQuickHealthChecks ?? (async () => [{ key: 'quick', label: '快速检查', ok: true, latencyMs: 1, detail: '正常' }]),
     runFullHealthChecks: overrides.runFullHealthChecks ?? (async () => [{ key: 'full', label: '完整检查', ok: true, latencyMs: 1, detail: '正常' }]),
     getQueue: overrides.getQueue ?? (() => []),
+    refreshTaskIndex: overrides.refreshTaskIndex ?? (async () => taskIndex),
+    getCodexControlStatus: overrides.getCodexControlStatus ?? (async () => ({ ok: true, desktop: { running: false } })),
+    stopCodexDesktop: overrides.stopCodexDesktop ?? (async () => ({ ok: true, alreadyStopped: false, stoppedProcessCount: 1 })),
     dispatchContinuation: overrides.dispatchContinuation ?? (async () => ({ status: 'started', turnId: 'turn-continued' })),
     cancelContinuation: overrides.cancelContinuation ?? (() => ({ status: 'cancelled' })),
     persistContinuationState: overrides.persistContinuationState ?? (async () => {}),
     respond: overrides.respond ?? (async (body) => { responses.push(body); }),
-    editOriginal: overrides.editOriginal ?? (async (body) => { edits.push(body); }),
+    editOriginal: overrides.editOriginal ?? (async (body) => { edits.push(body); return { id: 'takeover-message-1' }; }),
     randomBytes: overrides.randomBytes ?? deterministicRandom(),
     now: overrides.now ?? (() => NOW),
     uiState: overrides.uiState ?? new Map(),
@@ -1380,7 +1386,189 @@ test('system status uses a component sanitized error category when no aggregate 
   assert.match(text, /heartbeat-timeout/);
 });
 
-test('help names all ten commands and explains workspace routing and offline limitation', () => {
+test('takeover preview shows only escaped task names and statuses without local identifiers', () => {
+  assert.equal(typeof interactionModule.renderTakeoverPreview, 'function');
+  const payload = interactionModule.renderTakeoverPreview({
+    items: [
+      { threadId: 'secret-thread-id', taskName: '门店_*盘点*_', status: 'running', target: false },
+      { threadId: 'another-secret-id', taskName: '支付确认', status: 'confirmation-required', target: true },
+    ],
+    remaining: 2,
+  }, { desktopRunning: true });
+  const output = JSON.stringify(payload);
+  assert.match(payload.embeds[0].description, /Codex 正在运行/);
+  assert.match(payload.embeds[0].description, /门店\\_\\\*盘点\\\*\\_/);
+  assert.match(payload.embeds[0].description, /支付确认（待确认，目标任务）/);
+  assert.match(payload.embeds[0].description, /另有 2 个任务未列出/);
+  assert.match(payload.embeds[0].description, /可能中断以上桌面任务/);
+  assert.equal(output.includes('secret-thread-id'), false);
+  assert.equal(output.includes('another-secret-id'), false);
+  assert.equal(output.includes('C:\\'), false);
+});
+
+test('/退出Codex defers before inspection and publishes a private five-minute bound preview', async () => {
+  const uiState = new Map();
+  const events = [];
+  const taskIndex = { generatedAt: new Date(NOW).toISOString(), tasks: [
+    task(1, { status: 'running', rolloutPath: 'C:\\private\\root-1.jsonl' }),
+    task(2, { status: 'confirmation-required', rolloutPath: 'C:\\private\\root-2.jsonl' }),
+  ] };
+  const { dependencies, responses, edits } = makeDependencies({
+    uiState,
+    taskIndex,
+    refreshTaskIndex: async () => { events.push('refresh'); return taskIndex; },
+    getCodexControlStatus: async () => {
+      events.push('status');
+      return { ok: true, desktop: { running: true, processCount: 3, path: 'C:\\private\\ChatGPT.exe' } };
+    },
+  });
+  dependencies.respond = async (body) => { events.push(`respond-${body.type}`); responses.push(body); };
+
+  await createInteractionRouter(dependencies).handle(commandInteraction('退出Codex'));
+
+  assert.equal(events[0], 'respond-5');
+  assert.equal(responses[0].type, 5);
+  assert.equal(responses[0].data.flags, 64);
+  assert.match(edits[0].embeds[0].description, /Codex 正在运行/);
+  assert.match(edits[0].embeds[0].description, /门店任务 1（正在执行）/);
+  assert.match(edits[0].embeds[0].description, /门店任务 2（待确认）/);
+  assert.deepEqual(edits[0].components[0].components.map((button) => [button.label, button.style]), [
+    ['确认强制退出', 4], ['取消', 2],
+  ]);
+  assert.equal(uiState.size, 1);
+  const state = [...uiState.values()][0];
+  assert.equal(state.kind, 'takeover-exit');
+  assert.equal(state.userId, '333');
+  assert.equal(state.guildId, '222');
+  assert.equal(state.messageId, 'takeover-message-1');
+  assert.equal(state.expiresAt, NOW + 5 * 60_000);
+  assert.equal(JSON.stringify(edits[0]).includes('root-1'), false);
+  assert.equal(JSON.stringify(edits[0]).includes('private'), false);
+});
+
+test('/退出Codex does not create a confirmation when desktop is stopped or task refresh fails', async () => {
+  {
+    const uiState = new Map();
+    const { dependencies, edits } = makeDependencies({
+      uiState,
+      getCodexControlStatus: async () => ({ ok: true, desktop: { running: false } }),
+    });
+    await createInteractionRouter(dependencies).handle(commandInteraction('退出Codex', {}, { id: 'exit-stopped' }));
+    assert.match(edits[0].content, /未运行/);
+    assert.equal(edits[0].components?.length ?? 0, 0);
+    assert.equal(uiState.size, 0);
+  }
+
+  {
+    const uiState = new Map();
+    const { dependencies, edits } = makeDependencies({
+      uiState,
+      refreshTaskIndex: async () => { throw new Error('C:\\private\\sessions'); },
+      getCodexControlStatus: async () => ({ ok: true, desktop: { running: true } }),
+    });
+    await createInteractionRouter(dependencies).handle(commandInteraction('退出Codex', {}, { id: 'exit-no-index' }));
+    assert.match(edits[0].embeds[0].description, /任务清单不可用/);
+    assert.match(edits[0].embeds[0].description, /不会退出|未提供退出/);
+    assert.equal(edits[0].components?.length ?? 0, 0);
+    assert.equal(uiState.size, 0);
+    assert.equal(JSON.stringify(edits[0]).includes('private'), false);
+  }
+});
+
+test('takeover confirmation is message-bound, tenant-bound, atomically one-use, and stops exactly once', async () => {
+  const uiState = new Map();
+  let stopCalls = 0;
+  const taskIndex = { tasks: [task(1, { status: 'running' })] };
+  const { dependencies, responses, edits } = makeDependencies({
+    uiState,
+    taskIndex,
+    refreshTaskIndex: async () => taskIndex,
+    getCodexControlStatus: async () => ({ ok: true, desktop: { running: true } }),
+    stopCodexDesktop: async () => { stopCalls += 1; return { ok: true, stoppedProcessCount: 2 }; },
+  });
+  const router = createInteractionRouter(dependencies);
+  await router.handle(commandInteraction('退出Codex'));
+  const confirmId = edits[0].components[0].components[0].custom_id;
+
+  await router.handle(componentInteraction(confirmId, { userId: '444' }));
+  await router.handle(componentInteraction(confirmId, { guildId: '999' }));
+  await router.handle(componentInteraction(confirmId, { messageId: 'wrong-message' }));
+  assert.equal(stopCalls, 0);
+  assert.equal(uiState.size, 1);
+
+  await Promise.all([
+    router.handle(componentInteraction(confirmId, { id: 'confirm-valid' })),
+    router.handle(componentInteraction(confirmId, { id: 'confirm-redelivery' })),
+  ]);
+  assert.equal(stopCalls, 1);
+  assert.equal(uiState.size, 0);
+  assert.match(edits.at(-1).content, /已退出/);
+  assert.match(responses.at(-1).data.content, /已使用|过期|无效/);
+});
+
+test('expired takeover and cancellation consume the state without stopping desktop', async () => {
+  let clock = NOW;
+  let stopCalls = 0;
+  const uiState = new Map();
+  const taskIndex = { tasks: [task(1, { status: 'running' })] };
+  const { dependencies, responses, edits } = makeDependencies({
+    now: () => clock,
+    uiState,
+    taskIndex,
+    refreshTaskIndex: async () => taskIndex,
+    getCodexControlStatus: async () => ({ ok: true, desktop: { running: true } }),
+    stopCodexDesktop: async () => { stopCalls += 1; return { ok: true }; },
+  });
+  const router = createInteractionRouter(dependencies);
+  await router.handle(commandInteraction('退出Codex'));
+  const expiredConfirm = edits[0].components[0].components[0].custom_id;
+  clock += 5 * 60_000;
+  await router.handle(componentInteraction(expiredConfirm));
+  assert.match(responses.at(-1).data.content, /过期/);
+  assert.equal(uiState.size, 0);
+
+  clock = NOW;
+  await router.handle(commandInteraction('退出Codex', {}, { id: 'exit-cancel' }));
+  const cancelId = edits.at(-1).components[0].components[1].custom_id;
+  await router.handle(componentInteraction(cancelId, { id: 'cancel-valid' }));
+  assert.equal(stopCalls, 0);
+  assert.equal(uiState.size, 0);
+  assert.match(responses.at(-1).data.content, /已取消/);
+});
+
+test('a newly active main task invalidates the old confirmation and requires a fresh one', async () => {
+  let currentIndex = { tasks: [task(1, { status: 'running' })] };
+  let stopCalls = 0;
+  const uiState = new Map();
+  const { dependencies, edits } = makeDependencies({
+    uiState,
+    taskIndex: currentIndex,
+    refreshTaskIndex: async () => currentIndex,
+    getCodexControlStatus: async () => ({ ok: true, desktop: { running: true } }),
+    stopCodexDesktop: async () => { stopCalls += 1; return { ok: true, stoppedProcessCount: 1 }; },
+  });
+  const router = createInteractionRouter(dependencies);
+  await router.handle(commandInteraction('退出Codex'));
+  const oldConfirmId = edits[0].components[0].components[0].custom_id;
+
+  currentIndex = { tasks: [
+    task(1, { status: 'running' }),
+    task(9, { status: 'confirmation-required', taskName: '新任务' }),
+  ] };
+  await router.handle(componentInteraction(oldConfirmId));
+  assert.equal(stopCalls, 0);
+  assert.equal(uiState.size, 1);
+  assert.match(edits.at(-1).embeds[0].description, /检测到新活动任务/);
+  assert.match(edits.at(-1).embeds[0].description, /新任务（待确认）/);
+  const newConfirmId = edits.at(-1).components[0].components[0].custom_id;
+  assert.notEqual(newConfirmId, oldConfirmId);
+
+  await router.handle(componentInteraction(newConfirmId, { id: 'fresh-confirm' }));
+  assert.equal(stopCalls, 1);
+  assert.match(edits.at(-1).content, /已退出/);
+});
+
+test('help names all eleven commands and explains workspace routing and offline limitation', () => {
   const help = renderHelp();
   for (const commandName of COMMAND_NAMES) assert.match(help, new RegExp(`/${commandName}`));
   assert.match(help, /工作树/);

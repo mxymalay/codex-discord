@@ -5,6 +5,12 @@ import { COMMAND_NAMES, authorizeInteraction, ephemeral } from './discord-comman
 import { cancelContinuationPersisted as cancelPersistedContinuation, createContinuationRequest } from './discord-bridge-lib.mjs';
 import { renderHealthReport, runFullHealthChecks, runQuickHealthChecks } from './discord-health-lib.mjs';
 import { NO_PROJECT, resolveProjectSelection } from './discord-task-create-lib.mjs';
+import {
+  buildTakeoverSnapshot,
+  createTakeoverUiState,
+  hasNewActiveTasks,
+  validateTakeoverUiState,
+} from './codex-takeover-lib.mjs';
 
 const DISCORD_API = 'https://discord.com/api/v10';
 const UI_TTL_MS = 15 * 60_000;
@@ -368,6 +374,39 @@ function statusLabel(value) {
   return STATUS_LABELS[String(value ?? '')] ?? text(value);
 }
 
+/** Render a takeover risk list without exposing thread IDs, PIDs, or paths. */
+export function renderTakeoverPreview(snapshot, {
+  desktopRunning = false,
+  indexAvailable = true,
+  newTasksDetected = false,
+} = {}) {
+  if (!desktopRunning) return { content: 'Codex 桌面端未运行，无需退出。' };
+  if (!indexAvailable) {
+    return {
+      embeds: [{
+        description: '## Codex 正在运行\n\n⚠️ 任务清单不可用。为安全起见，本次不会退出，也未提供退出确认。',
+      }],
+    };
+  }
+  const lines = (Array.isArray(snapshot?.items) ? snapshot.items : []).map((item, index) => {
+    const status = item?.status === 'confirmation-required' ? '待确认' : '正在执行';
+    const target = item?.target ? '，目标任务' : '';
+    return `${index + 1}. ${metadataText(item?.taskName, '未命名任务', 200)}（${status}${target}）`;
+  });
+  const remaining = Math.max(0, Math.floor(Number(snapshot?.remaining) || 0));
+  if (remaining > 0) lines.push(`另有 ${remaining} 个任务未列出。`);
+  return {
+    embeds: [{
+      description: [
+        '## Codex 正在运行',
+        newTasksDetected ? '⚠️ 检测到新活动任务，原确认已失效。请重新核对后再次确认。' : '',
+        lines.length ? lines.join('\n') : '未检测到运行中主任务。',
+        '⚠️ 强制退出可能中断以上桌面任务。',
+      ].filter(Boolean).join('\n\n'),
+    }],
+  };
+}
+
 export function renderTaskList(tasks, { status = '全部' } = {}) {
   const desired = String(status ?? '全部');
   const values = (Array.isArray(tasks) ? tasks : [])
@@ -599,6 +638,7 @@ export function renderHelp() {
     额度: '查看最后一份本机官方周额度快照。',
     系统状态: '查看 Gateway、监听、索引、队列与额度状态。',
     系统测试: '执行快速检查，或执行三路完整通知测试。',
+    退出Codex: '先查看可能中断的主任务，再通过一次性确认安全退出 Codex 桌面端。',
     帮助: '显示本帮助。',
   };
   return [
@@ -882,6 +922,166 @@ async function defer(dependencies, interaction) {
   return respond(dependencies, interaction, privateResponse({}, 5));
 }
 
+function takeoverComponents(stateId) {
+  return [{
+    type: 1,
+    components: [
+      { type: 2, style: 4, label: '确认强制退出', custom_id: `takeover-confirm:${stateId}` },
+      { type: 2, style: 2, label: '取消', custom_id: `takeover-cancel:${stateId}` },
+    ],
+  }];
+}
+
+async function publishTakeoverConfirmation(dependencies, interaction, snapshot, {
+  messageId = null,
+  newTasksDetected = false,
+} = {}) {
+  const stateId = makeStateId(dependencies);
+  const state = {
+    ...createTakeoverUiState({
+      id: stateId,
+      kind: 'takeover-exit',
+      userId: userId(interaction),
+      guildId: guildId(interaction),
+      snapshot,
+      nowMs: nowValue(dependencies),
+    }),
+    messageId: messageId == null ? null : String(messageId),
+  };
+  dependencies.uiState.set(stateId, state);
+  const payload = mentionSafePayload({
+    ...renderTakeoverPreview(snapshot, { desktopRunning: true, newTasksDetected }),
+    components: takeoverComponents(stateId),
+  });
+  try {
+    const reply = await dependencies.editOriginal?.(payload, interaction);
+    const boundMessageId = state.messageId || String(reply?.id ?? '');
+    if (!boundMessageId) {
+      dependencies.uiState.delete(stateId);
+      return editOriginal(dependencies, interaction, {
+        content: '无法创建安全的退出确认，请重新执行 /退出Codex。',
+        components: [],
+      });
+    }
+    state.messageId = boundMessageId;
+    return payload;
+  } catch {
+    dependencies.uiState.delete(stateId);
+    throw new Error('Takeover confirmation response failed');
+  }
+}
+
+async function beginTakeoverExit(dependencies, interaction) {
+  await defer(dependencies, interaction);
+  const [indexResult, statusResult] = await Promise.allSettled([
+    Promise.resolve().then(() => dependencies.refreshTaskIndex()),
+    Promise.resolve().then(() => dependencies.getCodexControlStatus()),
+  ]);
+  const status = statusResult.status === 'fulfilled' ? statusResult.value : null;
+  if (!status?.ok || typeof status?.desktop?.running !== 'boolean') {
+    return editOriginal(dependencies, interaction, { content: 'Codex 桌面端状态暂不可用；本次未执行退出。' });
+  }
+  if (!status.desktop.running) {
+    return editOriginal(dependencies, interaction, renderTakeoverPreview(null, { desktopRunning: false }));
+  }
+  const index = indexResult.status === 'fulfilled' ? indexResult.value : null;
+  if (!Array.isArray(index?.tasks)) {
+    return editOriginal(dependencies, interaction, renderTakeoverPreview(null, {
+      desktopRunning: true,
+      indexAvailable: false,
+    }));
+  }
+  return publishTakeoverConfirmation(dependencies, interaction, buildTakeoverSnapshot(index));
+}
+
+function takeoverStateError(dependencies, interaction, state) {
+  const validated = validateTakeoverUiState(state, {
+    kind: 'takeover-exit',
+    userId: userId(interaction),
+    guildId: guildId(interaction),
+    nowMs: nowValue(dependencies),
+  });
+  if (!validated.ok) {
+    if (validated.reason === 'expired') return '此退出确认已过期，请重新执行 /退出Codex。';
+    if (['wrong-user', 'wrong-guild'].includes(validated.reason)) return '此退出确认不属于当前用户或服务器，无权执行。';
+    return '此退出确认已使用、过期或无效，请重新执行 /退出Codex。';
+  }
+  const componentMessageId = String(interaction?.message?.id ?? '');
+  if (!state.messageId || componentMessageId !== String(state.messageId)) {
+    return '此退出确认不属于当前消息或已失效。';
+  }
+  return null;
+}
+
+async function cancelTakeoverExit(dependencies, interaction, stateId) {
+  const state = dependencies.uiState.get(stateId);
+  const invalid = takeoverStateError(dependencies, interaction, state);
+  if (invalid) {
+    if (state && nowValue(dependencies) >= Number(state.expiresAt)) dependencies.uiState.delete(stateId);
+    return respond(dependencies, interaction, privateResponse(invalid));
+  }
+  dependencies.uiState.delete(stateId);
+  return respond(dependencies, interaction, {
+    type: 7,
+    data: mentionSafePayload({ content: '已取消退出 Codex。', components: [] }),
+  });
+}
+
+async function confirmTakeoverExit(dependencies, routerState, interaction, stateId) {
+  const state = dependencies.uiState.get(stateId);
+  const invalid = takeoverStateError(dependencies, interaction, state);
+  if (invalid) {
+    if (state && nowValue(dependencies) >= Number(state.expiresAt)) dependencies.uiState.delete(stateId);
+    return respond(dependencies, interaction, privateResponse(invalid));
+  }
+
+  dependencies.uiState.delete(stateId);
+  if (routerState.takeoverInProgress) {
+    return respond(dependencies, interaction, privateResponse('另一个退出操作正在执行；本确认未重复执行。'));
+  }
+  routerState.takeoverInProgress = true;
+  await defer(dependencies, interaction);
+  try {
+    const [indexResult, statusResult] = await Promise.allSettled([
+      Promise.resolve().then(() => dependencies.refreshTaskIndex()),
+      Promise.resolve().then(() => dependencies.getCodexControlStatus()),
+    ]);
+    const status = statusResult.status === 'fulfilled' ? statusResult.value : null;
+    if (!status?.ok || typeof status?.desktop?.running !== 'boolean') {
+      return editOriginal(dependencies, interaction, { content: 'Codex 桌面端状态暂不可用；本次未执行退出。', components: [] });
+    }
+    if (!status.desktop.running) {
+      return editOriginal(dependencies, interaction, { content: 'Codex 桌面端已经退出，无需再次操作。', components: [] });
+    }
+    const index = indexResult.status === 'fulfilled' ? indexResult.value : null;
+    if (!Array.isArray(index?.tasks)) {
+      return editOriginal(dependencies, interaction, {
+        ...renderTakeoverPreview(null, { desktopRunning: true, indexAvailable: false }),
+        components: [],
+      });
+    }
+    const currentSnapshot = buildTakeoverSnapshot(index, { targetThreadId: state.targetThreadId });
+    if (hasNewActiveTasks(state.snapshot, currentSnapshot)) {
+      return publishTakeoverConfirmation(dependencies, interaction, currentSnapshot, {
+        messageId: interaction?.message?.id,
+        newTasksDetected: true,
+      });
+    }
+    let result;
+    try {
+      result = await dependencies.stopCodexDesktop();
+    } catch {
+      result = null;
+    }
+    if (!result?.ok) {
+      return editOriginal(dependencies, interaction, { content: '退出 Codex 失败；未确认桌面端已停止，请稍后重试。', components: [] });
+    }
+    return editOriginal(dependencies, interaction, { content: 'Codex 桌面端已退出。', components: [] });
+  } finally {
+    routerState.takeoverInProgress = false;
+  }
+}
+
 async function openContinuationModal(dependencies, interaction, record) {
   const stateId = makeStateId(dependencies);
   dependencies.uiState.set(stateId, {
@@ -1019,6 +1219,7 @@ async function handleCommand(dependencies, interaction) {
       return respond(dependencies, interaction, privateResponse('系统状态暂不可用，请稍后重试。'));
     }
   }
+  if (name === '退出Codex') return beginTakeoverExit(dependencies, interaction);
   if (name === '帮助') return respond(dependencies, interaction, privateResponse(renderHelp()));
   if (name === '系统测试') {
     const mode = optionValue(interaction, '类型') === '完整' ? '完整' : '快速';
@@ -1190,8 +1391,12 @@ function componentStateError(dependencies, interaction, state) {
   return null;
 }
 
-async function handleComponent(dependencies, interaction) {
+async function handleComponent(dependencies, interaction, routerState) {
   const customId = String(interaction?.data?.custom_id ?? '');
+  const takeoverConfirm = customId.match(/^takeover-confirm:([A-Za-z0-9_-]{16})$/u);
+  if (takeoverConfirm) return confirmTakeoverExit(dependencies, routerState, interaction, takeoverConfirm[1]);
+  const takeoverCancel = customId.match(/^takeover-cancel:([A-Za-z0-9_-]{16})$/u);
+  if (takeoverCancel) return cancelTakeoverExit(dependencies, interaction, takeoverCancel[1]);
   const cancelMatch = customId.match(/^cancel:([A-Za-z0-9_-]{16})$/u);
   if (cancelMatch) {
     const state = dependencies.uiState.get(cancelMatch[1]);
@@ -1267,6 +1472,7 @@ function isStateMutationInteraction(interaction) {
 export function createInteractionRouter(dependencies = {}) {
   dependencies.uiState ??= new Map();
   const submissions = new Map();
+  const routerState = { takeoverInProgress: false };
 
   return {
     async handle(interaction) {
@@ -1292,7 +1498,7 @@ export function createInteractionRouter(dependencies = {}) {
       }
       if (Number(interaction?.type) === 2) return handleCommand(dependencies, interaction);
       if (Number(interaction?.type) === 5) return handleModal(dependencies, submissions, interaction);
-      if (Number(interaction?.type) === 3) return handleComponent(dependencies, interaction);
+      if (Number(interaction?.type) === 3) return handleComponent(dependencies, interaction, routerState);
       return respond(dependencies, interaction, privateResponse('不支持的交互类型。'));
     },
     sweepExpiredUiState(at = nowValue(dependencies)) {

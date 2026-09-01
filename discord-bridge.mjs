@@ -57,7 +57,7 @@ import {
   readRolloutWatcherState,
   writeRolloutWatcherState,
 } from './rollout-completion-watcher-lib.mjs';
-import { writeBridgeHealthAtomic } from './discord-control-client.mjs';
+import { runCodexControlAction, writeBridgeHealthAtomic } from './discord-control-client.mjs';
 
 const toolDir = path.dirname(fileURLToPath(import.meta.url));
 const configPath = path.join(toolDir, 'config.json');
@@ -70,6 +70,7 @@ const rolloutWatcherStatePath = path.join(toolDir, 'rollout-watcher-state.json')
 const taskIndexPath = path.join(toolDir, 'discord-task-index.json');
 const quotaStatePath = path.join(toolDir, 'quota-state.json');
 const bridgeHealthPath = path.join(toolDir, 'discord-bridge-health.json');
+const controlPath = path.join(toolDir, 'codex-control.ps1');
 const sessionIndexPath = path.join(codexRoot, 'session_index.jsonl');
 const pollIntervalMs = 4000;
 const pendingRetryIntervalMs = 30_000;
@@ -872,7 +873,14 @@ function replaceIndex(target, source) {
   return target;
 }
 
-function createProductionBridgeDependencies({ runOnce = false } = {}) {
+export function createProductionBridgeDependencies({
+  runOnce = false,
+  buildTaskIndexImpl = buildTaskIndex,
+  writeTaskIndexAtomicImpl = writeTaskIndexAtomic,
+  runCodexControlActionImpl = runCodexControlAction,
+  createInteractionRestClientImpl = createInteractionRestClient,
+  createInteractionRouterImpl = createInteractionRouter,
+} = {}) {
   return {
     async loadConfig() {
       return readJsonFile(configPath);
@@ -902,14 +910,14 @@ function createProductionBridgeDependencies({ runOnce = false } = {}) {
     },
     async loadTaskIndex(context) {
       const previousIndex = await readTaskIndex(taskIndexPath);
-      const index = await buildTaskIndex({
+      const index = await buildTaskIndexImpl({
         sessionsRoot,
         sessionIndexPath,
         messageMapPath: mappingPath,
         previousIndex,
         discordWorktreeRoot: context.config.discordWorktreeRoot,
       });
-      await writeTaskIndexAtomic(taskIndexPath, index);
+      await writeTaskIndexAtomicImpl(taskIndexPath, index);
       return index;
     },
     async loadInboxState(context) {
@@ -945,7 +953,7 @@ function createProductionBridgeDependencies({ runOnce = false } = {}) {
       return catalog;
     },
     async createInteractionHandler(context) {
-      const rest = createInteractionRestClient({ applicationId: context.config.discordApplicationId });
+      const rest = createInteractionRestClientImpl({ applicationId: context.config.discordApplicationId });
       const readQuota = () => readJsonFile(quotaStatePath, { observedAt: null, limits: [] });
       const api = (route) => context.trackDiscordRest(() => discordRequest({ token: context.token, route }));
       const healthDependencies = {
@@ -964,7 +972,21 @@ function createProductionBridgeDependencies({ runOnce = false } = {}) {
         powershellPath: context.executables.powershellPath,
         dispatcherPath: path.join(toolDir, 'dispatcher.ps1'),
       };
-      const router = createInteractionRouter({
+      const refreshTaskIndex = async () => {
+        const rebuilt = await buildTaskIndexImpl({
+          sessionsRoot,
+          sessionIndexPath,
+          messageMapPath: mappingPath,
+          previousIndex: context.taskIndex,
+          discordWorktreeRoot: context.config.discordWorktreeRoot,
+          nowMs: Date.now(),
+        });
+        replaceIndex(context.taskIndex, rebuilt);
+        await writeTaskIndexAtomicImpl(taskIndexPath, context.taskIndex);
+        context.recordActivity('lastIndexUpdateAt', rebuilt.generatedAt);
+        return context.taskIndex;
+      };
+      const router = createInteractionRouterImpl({
         config: context.config,
         taskIndex: context.taskIndex,
         projectCatalog: context.projectCatalog,
@@ -993,6 +1015,17 @@ function createProductionBridgeDependencies({ runOnce = false } = {}) {
           quota: await readQuota(),
         }),
         getQueue: () => listContinuations(context.inboxState),
+        refreshTaskIndex,
+        getCodexControlStatus: () => runCodexControlActionImpl({
+          action: 'status',
+          powershellPath: context.executables.powershellPath,
+          controlPath,
+        }),
+        stopCodexDesktop: () => runCodexControlActionImpl({
+          action: 'stop-codex',
+          powershellPath: context.executables.powershellPath,
+          controlPath,
+        }),
         dispatchContinuation: async (request) => {
           try {
             return await startContinuation({
@@ -1136,7 +1169,7 @@ function createProductionBridgeDependencies({ runOnce = false } = {}) {
           const now = Date.now();
           if (!stopping && now - lastIndexRefresh >= indexRefreshIntervalMs) {
             try {
-              const rebuilt = await buildTaskIndex({
+              const rebuilt = await buildTaskIndexImpl({
                 sessionsRoot,
                 sessionIndexPath,
                 messageMapPath: mappingPath,
@@ -1145,7 +1178,7 @@ function createProductionBridgeDependencies({ runOnce = false } = {}) {
                 nowMs: now,
               });
               replaceIndex(context.taskIndex, rebuilt);
-              await writeTaskIndexAtomic(taskIndexPath, context.taskIndex);
+              await writeTaskIndexAtomicImpl(taskIndexPath, context.taskIndex);
               context.recordActivity('lastIndexUpdateAt', rebuilt.generatedAt);
             } catch {
               context.setLatestErrorCategory('index-refresh-failed');
@@ -1165,7 +1198,7 @@ function createProductionBridgeDependencies({ runOnce = false } = {}) {
         },
       };
     },
-    persistTaskIndex: (context) => writeTaskIndexAtomic(taskIndexPath, context.taskIndex),
+    persistTaskIndex: (context) => writeTaskIndexAtomicImpl(taskIndexPath, context.taskIndex),
     persistInboxState: (context) => context.inboxReadOnly ? undefined : saveState(context.inboxState),
     persistRolloutState: (context) => writeRolloutWatcherState(rolloutWatcherStatePath, context.rolloutState),
     publishHealth: async (context, { signal, shouldCommit, forceFinal } = {}) => {

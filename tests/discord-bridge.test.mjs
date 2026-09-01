@@ -7,6 +7,7 @@ import path from 'node:path';
 import { PassThrough } from 'node:stream';
 import test from 'node:test';
 
+import * as bridgeModule from '../discord-bridge.mjs';
 import { startNewCodexTask } from '../discord-task-create-lib.mjs';
 import { createBridgeApplication, finalizeContinuationOutcome, getDiscordBotMember, pollChannel } from '../discord-bridge.mjs';
 import { createInteractionRouter } from '../discord-interactions.mjs';
@@ -61,6 +62,65 @@ const mapping = {
     },
   },
 };
+
+test('production interaction wiring refreshes the shared index and uses only bounded control actions', async () => {
+  assert.equal(typeof bridgeModule.createProductionBridgeDependencies, 'function');
+  const events = [];
+  const controlCalls = [];
+  let interactionDependencies;
+  const rebuilt = { version: 1, generatedAt: '2026-09-01T08:00:00.000Z', tasks: [{ threadId: 'fresh-root' }] };
+  const production = bridgeModule.createProductionBridgeDependencies({
+    runOnce: true,
+    buildTaskIndexImpl: async (options) => { events.push(['build', options.previousIndex]); return rebuilt; },
+    writeTaskIndexAtomicImpl: async (_targetPath, index) => { events.push(['write', structuredClone(index)]); },
+    runCodexControlActionImpl: async (options) => {
+      controlCalls.push(options);
+      return options.action === 'status'
+        ? { ok: true, desktop: { running: true } }
+        : { ok: true, stoppedProcessCount: 1 };
+    },
+    createInteractionRestClientImpl: () => ({ callback: async () => {}, editOriginal: async () => ({ id: 'message-1' }) }),
+    createInteractionRouterImpl: (dependencies) => {
+      interactionDependencies = dependencies;
+      return { handle: async () => {} };
+    },
+  });
+  const originalIndex = { version: 1, generatedAt: '2026-09-01T07:00:00.000Z', tasks: [] };
+  const context = {
+    config: {
+      ...config,
+      discordApplicationId: '111111111111111111',
+      discordWorktreeRoot: 'C:\\safe\\worktrees',
+      discordProjectlessRoot: 'C:\\safe\\projectless',
+    },
+    token: 'test-token',
+    executables: { codexPath: 'codex.exe', powershellPath: 'pwsh.exe' },
+    taskIndex: originalIndex,
+    inboxState: createEmptyInboxState(),
+    inboxReadOnly: false,
+    projectCatalog: {},
+    trackDiscordRest: (operation) => operation(),
+    trackActiveResource: (resource) => resource,
+    getSystemStatus: () => ({}),
+    recordActivity: (field, at) => events.push(['activity', field, at]),
+  };
+
+  await production.createInteractionHandler(context);
+  const refreshed = await interactionDependencies.refreshTaskIndex();
+  assert.equal(refreshed, originalIndex);
+  assert.deepEqual(originalIndex, rebuilt);
+  assert.deepEqual(events.map((event) => event[0]), ['build', 'write', 'activity']);
+  assert.equal(events[0][1], originalIndex);
+
+  assert.deepEqual(await interactionDependencies.getCodexControlStatus(), { ok: true, desktop: { running: true } });
+  assert.deepEqual(await interactionDependencies.stopCodexDesktop(), { ok: true, stoppedProcessCount: 1 });
+  assert.deepEqual(controlCalls.map((call) => call.action), ['status', 'stop-codex']);
+  for (const call of controlCalls) {
+    assert.equal(call.powershellPath, 'pwsh.exe');
+    assert.match(call.controlPath, /codex-control\.ps1$/u);
+    assert.deepEqual(Object.keys(call).sort(), ['action', 'controlPath', 'powershellPath']);
+  }
+});
 
 function makeBridgeDependencies(events, overrides = {}) {
   const timestamps = [
