@@ -314,6 +314,80 @@ test('partial startup cleanup detaches resources so entrypoint shutdown preserve
   await app.stop();
 });
 
+test('partial startup cleanup bounds hung resources before preserving its startup error', async () => {
+  const events = [];
+  const terminalSnapshots = [];
+  let failStart = true;
+  let hangStops = true;
+  let gatewayStops = 0;
+  let legacyStops = 0;
+  let persistCalls = 0;
+  const unhandled = [];
+  const onUnhandled = (reason) => unhandled.push(reason);
+  process.on('unhandledRejection', onUnhandled);
+  const app = createBridgeApplication(makeBridgeDependencies(events, {
+    shutdownTimeoutMs: 5,
+    healthPublishTimeoutMs: 5,
+    async startGateway() {
+      return {
+        getStatus: () => ({ state: 'ready' }),
+        stop() {
+          gatewayStops += 1;
+          return hangStops ? new Promise(() => {}) : Promise.resolve();
+        },
+      };
+    },
+    async startLegacyPollers() {
+      return {
+        stop() {
+          legacyStops += 1;
+          return hangStops ? new Promise(() => {}) : Promise.resolve();
+        },
+      };
+    },
+    publishHealth: async (context, { forceFinal } = {}) => {
+      if (forceFinal) terminalSnapshots.push(structuredClone(context.getSystemStatus()));
+    },
+    setInterval() {
+      if (failStart) throw new Error('startup root cause');
+      return 1;
+    },
+    clearInterval() {},
+    async persistTaskIndex() { persistCalls += 1; },
+    async persistInboxState() { persistCalls += 1; },
+    async persistRolloutState() { persistCalls += 1; },
+  }));
+  const mainShape = async () => {
+    try {
+      await app.start();
+    } finally {
+      await app.stop();
+    }
+  };
+
+  try {
+    const outcome = await Promise.race([
+      mainShape().then(() => 'started', (error) => error),
+      new Promise((resolve) => setTimeout(() => resolve('timed-out'), 40)),
+    ]);
+    assert.ok(outcome instanceof Error);
+    assert.match(outcome.message, /startup root cause/);
+    assert.equal(gatewayStops, 1);
+    assert.equal(legacyStops, 1);
+    assert.equal(persistCalls, 0);
+    assert.equal(terminalSnapshots.length, 1);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(unhandled, []);
+
+    failStart = false;
+    hangStops = false;
+    await app.start();
+    await app.stop();
+  } finally {
+    process.off('unhandledRejection', onUnhandled);
+  }
+});
+
 test('REST tracker publishes failed then recovered state without raw failures', async () => {
   const events = [];
   const published = [];

@@ -270,12 +270,29 @@ export function createBridgeApplication(dependencies = {}) {
   const reportStartupCleanupFailure = () => {
     try { Promise.resolve(dependencies.logHealthFailure?.('startup-cleanup-failed')).catch(() => {}); } catch {}
   };
-  const stopPartialResource = async (resource) => {
-    try { await Promise.resolve().then(() => resource?.stop?.()); } catch { reportStartupCleanupFailure(); }
+  const stopPartialResources = async (resources) => {
+    const stops = resources.map((resource) => {
+      const stop = Promise.resolve().then(() => resource?.stop?.());
+      stop.catch(() => { reportStartupCleanupFailure(); });
+      return stop;
+    });
+    let timeoutId;
+    const completed = await Promise.race([
+      Promise.allSettled(stops).then(() => true),
+      new Promise((resolve) => {
+        timeoutId = setTimeout(() => resolve(false), boundedShutdownTimeout(dependencies.shutdownTimeoutMs ?? 10_000));
+      }),
+    ]);
+    clearTimeout(timeoutId);
+    if (!completed) reportStartupCleanupFailure();
   };
   const cleanupFailedStart = async () => {
     if (startupCleanupComplete) return;
     startupCleanupComplete = true;
+    const gateway = context.gateway;
+    const legacyPollers = context.legacyPollers;
+    context.gateway = null;
+    context.legacyPollers = null;
     acceptingResources = false;
     started = false;
     context.isStopping = true;
@@ -286,10 +303,7 @@ export function createBridgeApplication(dependencies = {}) {
       try { clearHealthInterval(healthTimer); } catch { reportStartupCleanupFailure(); }
       healthTimer = null;
     }
-    const gateway = context.gateway;
-    const legacyPollers = context.legacyPollers;
-    try { await stopPartialResource(gateway); } finally { context.gateway = null; }
-    try { await stopPartialResource(legacyPollers); } finally { context.legacyPollers = null; }
+    await stopPartialResources([gateway, legacyPollers]);
     healthController?.abort();
     healthGeneration++;
     healthController = new AbortController();
