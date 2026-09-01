@@ -922,6 +922,10 @@ async function defer(dependencies, interaction) {
   return respond(dependencies, interaction, privateResponse({}, 5));
 }
 
+async function deferMessageUpdate(dependencies, interaction) {
+  return respond(dependencies, interaction, { type: 6 });
+}
+
 function takeoverComponents(stateId) {
   return [{
     type: 1,
@@ -1040,8 +1044,8 @@ async function confirmTakeoverExit(dependencies, routerState, interaction, state
     return respond(dependencies, interaction, privateResponse('另一个退出操作正在执行；本确认未重复执行。'));
   }
   routerState.takeoverInProgress = true;
-  await defer(dependencies, interaction);
   try {
+    await deferMessageUpdate(dependencies, interaction);
     const [indexResult, statusResult] = await Promise.allSettled([
       Promise.resolve().then(() => dependencies.refreshTaskIndex()),
       Promise.resolve().then(() => dependencies.getCodexControlStatus()),

@@ -1506,6 +1506,43 @@ test('takeover confirmation is message-bound, tenant-bound, atomically one-use, 
   assert.match(responses.at(-1).data.content, /已使用|过期|无效/);
 });
 
+test('a failed component defer consumes only that confirmation and always releases the takeover lock', async () => {
+  const uiState = new Map();
+  let stopCalls = 0;
+  let failNextUpdate = true;
+  const taskIndex = { tasks: [task(1, { status: 'running' })] };
+  const { dependencies, responses, edits } = makeDependencies({
+    uiState,
+    taskIndex,
+    refreshTaskIndex: async () => taskIndex,
+    getCodexControlStatus: async () => ({ ok: true, desktop: { running: true } }),
+    stopCodexDesktop: async () => { stopCalls += 1; return { ok: true, stoppedProcessCount: 1 }; },
+  });
+  dependencies.respond = async (body) => {
+    responses.push(body);
+    if (body.type === 6 && failNextUpdate) {
+      failNextUpdate = false;
+      throw new Error('offline callback failure');
+    }
+  };
+  const router = createInteractionRouter(dependencies);
+  await router.handle(commandInteraction('退出Codex', {}, { id: 'exit-before-callback-failure' }));
+  const failedConfirmId = edits[0].components[0].components[0].custom_id;
+
+  await assert.rejects(
+    router.handle(componentInteraction(failedConfirmId, { id: 'failed-component-defer' })),
+    /offline callback failure/u,
+  );
+  assert.equal(stopCalls, 0);
+  assert.equal(uiState.size, 0);
+
+  await router.handle(commandInteraction('退出Codex', {}, { id: 'exit-after-callback-failure' }));
+  const validConfirmId = edits.at(-1).components[0].components[0].custom_id;
+  await router.handle(componentInteraction(validConfirmId, { id: 'valid-after-callback-failure' }));
+  assert.equal(stopCalls, 1);
+  assert.match(edits.at(-1).content, /已退出/);
+});
+
 test('expired takeover and cancellation consume the state without stopping desktop', async () => {
   let clock = NOW;
   let stopCalls = 0;
@@ -1540,13 +1577,18 @@ test('a newly active main task invalidates the old confirmation and requires a f
   let currentIndex = { tasks: [task(1, { status: 'running' })] };
   let stopCalls = 0;
   const uiState = new Map();
-  const { dependencies, edits } = makeDependencies({
+  const { dependencies, responses, edits } = makeDependencies({
     uiState,
     taskIndex: currentIndex,
     refreshTaskIndex: async () => currentIndex,
     getCodexControlStatus: async () => ({ ok: true, desktop: { running: true } }),
     stopCodexDesktop: async () => { stopCalls += 1; return { ok: true, stoppedProcessCount: 1 }; },
   });
+  const editMessageIds = ['original-risk-message', 'type5-would-create-a-different-message', 'original-risk-message'];
+  dependencies.editOriginal = async (body) => {
+    edits.push(body);
+    return { id: editMessageIds.shift() };
+  };
   const router = createInteractionRouter(dependencies);
   await router.handle(commandInteraction('退出Codex'));
   const oldConfirmId = edits[0].components[0].components[0].custom_id;
@@ -1555,15 +1597,19 @@ test('a newly active main task invalidates the old confirmation and requires a f
     task(1, { status: 'running' }),
     task(9, { status: 'confirmation-required', taskName: '新任务' }),
   ] };
-  await router.handle(componentInteraction(oldConfirmId));
+  await router.handle(componentInteraction(oldConfirmId, { messageId: 'original-risk-message' }));
   assert.equal(stopCalls, 0);
+  assert.equal(responses[1].type, 6);
+  assert.equal(Object.hasOwn(responses[1], 'data'), false);
   assert.equal(uiState.size, 1);
   assert.match(edits.at(-1).embeds[0].description, /检测到新活动任务/);
   assert.match(edits.at(-1).embeds[0].description, /新任务（待确认）/);
   const newConfirmId = edits.at(-1).components[0].components[0].custom_id;
   assert.notEqual(newConfirmId, oldConfirmId);
+  assert.equal([...uiState.values()][0].messageId, 'original-risk-message');
 
-  await router.handle(componentInteraction(newConfirmId, { id: 'fresh-confirm' }));
+  await router.handle(componentInteraction(newConfirmId, { id: 'fresh-confirm', messageId: 'original-risk-message' }));
+  assert.equal(responses[2].type, 6);
   assert.equal(stopCalls, 1);
   assert.match(edits.at(-1).content, /已退出/);
 });

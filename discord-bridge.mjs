@@ -881,7 +881,40 @@ export function createProductionBridgeDependencies({
   createInteractionRestClientImpl = createInteractionRestClient,
   createInteractionRouterImpl = createInteractionRouter,
 } = {}) {
+  let taskIndexCommitTail = Promise.resolve();
+  const enqueueTaskIndexOperation = (operation) => {
+    const current = taskIndexCommitTail.then(operation);
+    taskIndexCommitTail = current.then(() => undefined, () => undefined);
+    return current;
+  };
+  const rebuildTaskIndex = (context, {
+    previousIndex = context.taskIndex,
+    nowMs = Date.now(),
+    installShared = true,
+    recordActivity = true,
+  } = {}) => enqueueTaskIndexOperation(async () => {
+    const rebuilt = await buildTaskIndexImpl({
+      sessionsRoot,
+      sessionIndexPath,
+      messageMapPath: mappingPath,
+      previousIndex,
+      discordWorktreeRoot: context.config.discordWorktreeRoot,
+      nowMs,
+    });
+    const stableSnapshot = structuredClone(rebuilt);
+    if (installShared) replaceIndex(context.taskIndex, structuredClone(stableSnapshot));
+    await writeTaskIndexAtomicImpl(taskIndexPath, stableSnapshot);
+    if (recordActivity) context.recordActivity('lastIndexUpdateAt', stableSnapshot.generatedAt);
+    return stableSnapshot;
+  });
+  const refreshTaskIndex = (context, options = {}) => rebuildTaskIndex(context, options);
+  const persistCurrentTaskIndex = (context) => enqueueTaskIndexOperation(async () => {
+    const stableSnapshot = structuredClone(context.taskIndex);
+    await writeTaskIndexAtomicImpl(taskIndexPath, stableSnapshot);
+    return stableSnapshot;
+  });
   return {
+    refreshTaskIndex,
     async loadConfig() {
       return readJsonFile(configPath);
     },
@@ -910,15 +943,11 @@ export function createProductionBridgeDependencies({
     },
     async loadTaskIndex(context) {
       const previousIndex = await readTaskIndex(taskIndexPath);
-      const index = await buildTaskIndexImpl({
-        sessionsRoot,
-        sessionIndexPath,
-        messageMapPath: mappingPath,
+      return rebuildTaskIndex(context, {
         previousIndex,
-        discordWorktreeRoot: context.config.discordWorktreeRoot,
+        installShared: false,
+        recordActivity: false,
       });
-      await writeTaskIndexAtomicImpl(taskIndexPath, index);
-      return index;
     },
     async loadInboxState(context) {
       const loaded = await loadInboxStateWithRecovery({
@@ -972,20 +1001,6 @@ export function createProductionBridgeDependencies({
         powershellPath: context.executables.powershellPath,
         dispatcherPath: path.join(toolDir, 'dispatcher.ps1'),
       };
-      const refreshTaskIndex = async () => {
-        const rebuilt = await buildTaskIndexImpl({
-          sessionsRoot,
-          sessionIndexPath,
-          messageMapPath: mappingPath,
-          previousIndex: context.taskIndex,
-          discordWorktreeRoot: context.config.discordWorktreeRoot,
-          nowMs: Date.now(),
-        });
-        replaceIndex(context.taskIndex, rebuilt);
-        await writeTaskIndexAtomicImpl(taskIndexPath, context.taskIndex);
-        context.recordActivity('lastIndexUpdateAt', rebuilt.generatedAt);
-        return context.taskIndex;
-      };
       const router = createInteractionRouterImpl({
         config: context.config,
         taskIndex: context.taskIndex,
@@ -1015,7 +1030,7 @@ export function createProductionBridgeDependencies({
           quota: await readQuota(),
         }),
         getQueue: () => listContinuations(context.inboxState),
-        refreshTaskIndex,
+        refreshTaskIndex: () => refreshTaskIndex(context),
         getCodexControlStatus: () => runCodexControlActionImpl({
           action: 'status',
           powershellPath: context.executables.powershellPath,
@@ -1169,17 +1184,7 @@ export function createProductionBridgeDependencies({
           const now = Date.now();
           if (!stopping && now - lastIndexRefresh >= indexRefreshIntervalMs) {
             try {
-              const rebuilt = await buildTaskIndexImpl({
-                sessionsRoot,
-                sessionIndexPath,
-                messageMapPath: mappingPath,
-                previousIndex: context.taskIndex,
-                discordWorktreeRoot: config.discordWorktreeRoot,
-                nowMs: now,
-              });
-              replaceIndex(context.taskIndex, rebuilt);
-              await writeTaskIndexAtomicImpl(taskIndexPath, context.taskIndex);
-              context.recordActivity('lastIndexUpdateAt', rebuilt.generatedAt);
+              await refreshTaskIndex(context, { nowMs: now });
             } catch {
               context.setLatestErrorCategory('index-refresh-failed');
               await log('index-refresh-failed');
@@ -1198,7 +1203,7 @@ export function createProductionBridgeDependencies({
         },
       };
     },
-    persistTaskIndex: (context) => writeTaskIndexAtomicImpl(taskIndexPath, context.taskIndex),
+    persistTaskIndex: persistCurrentTaskIndex,
     persistInboxState: (context) => context.inboxReadOnly ? undefined : saveState(context.inboxState),
     persistRolloutState: (context) => writeRolloutWatcherState(rolloutWatcherStatePath, context.rolloutState),
     publishHealth: async (context, { signal, shouldCommit, forceFinal } = {}) => {

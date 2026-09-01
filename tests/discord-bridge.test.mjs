@@ -63,6 +63,16 @@ const mapping = {
   },
 };
 
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
 test('production interaction wiring refreshes the shared index and uses only bounded control actions', async () => {
   assert.equal(typeof bridgeModule.createProductionBridgeDependencies, 'function');
   const events = [];
@@ -107,8 +117,11 @@ test('production interaction wiring refreshes the shared index and uses only bou
 
   await production.createInteractionHandler(context);
   const refreshed = await interactionDependencies.refreshTaskIndex();
-  assert.equal(refreshed, originalIndex);
+  assert.notEqual(refreshed, originalIndex);
   assert.deepEqual(originalIndex, rebuilt);
+  assert.notEqual(refreshed.tasks, originalIndex.tasks);
+  originalIndex.tasks.push({ threadId: 'later-shared-mutation' });
+  assert.deepEqual(refreshed.tasks, [{ threadId: 'fresh-root' }]);
   assert.deepEqual(events.map((event) => event[0]), ['build', 'write', 'activity']);
   assert.equal(events[0][1], originalIndex);
 
@@ -120,6 +133,119 @@ test('production interaction wiring refreshes the shared index and uses only bou
     assert.match(call.controlPath, /codex-control\.ps1$/u);
     assert.deepEqual(Object.keys(call).sort(), ['action', 'controlPath', 'powershellPath']);
   }
+});
+
+test('production index refreshes serialize an older scan before a fresh takeover snapshot without stopping on a new task', async () => {
+  const oldBuild = deferred();
+  const callbacks = [];
+  const edits = [];
+  let buildCalls = 0;
+  let stopCalls = 0;
+  const taskA = {
+    threadId: 'root-a', taskName: '任务 A', status: 'running',
+    lastActivityAt: '2026-09-01T07:00:00.000Z',
+  };
+  const taskB = {
+    threadId: 'root-b', taskName: '新活动任务 B', status: 'running',
+    lastActivityAt: '2026-09-01T08:00:00.000Z',
+  };
+  const initial = { version: 1, generatedAt: '2026-09-01T07:00:00.000Z', tasks: [taskA] };
+  const older = { version: 1, generatedAt: '2026-09-01T07:30:00.000Z', tasks: [taskA] };
+  const fresh = { version: 1, generatedAt: '2026-09-01T08:00:00.000Z', tasks: [taskA, taskB] };
+  const production = bridgeModule.createProductionBridgeDependencies({
+    runOnce: true,
+    buildTaskIndexImpl: async () => {
+      buildCalls += 1;
+      if (buildCalls === 1) return structuredClone(initial);
+      if (buildCalls === 2) return oldBuild.promise;
+      return structuredClone(fresh);
+    },
+    writeTaskIndexAtomicImpl: async () => {},
+    runCodexControlActionImpl: async ({ action }) => {
+      if (action === 'stop-codex') stopCalls += 1;
+      return action === 'status'
+        ? { ok: true, desktop: { running: true } }
+        : { ok: true, stoppedProcessCount: 1 };
+    },
+    createInteractionRestClientImpl: () => ({
+      async callback(interaction, body) { callbacks.push({ interaction, body }); },
+      async editOriginal(interaction, body) { edits.push({ interaction, body }); return { id: 'risk-message' }; },
+    }),
+  });
+  const context = {
+    config: {
+      ...config,
+      discordApplicationId: '111111111111111111',
+      discordWorktreeRoot: 'C:\\safe\\worktrees',
+      discordProjectlessRoot: 'C:\\safe\\projectless',
+    },
+    token: 'test-token',
+    executables: { codexPath: 'codex.exe', powershellPath: 'pwsh.exe' },
+    taskIndex: { version: 1, generatedAt: null, tasks: [] },
+    inboxState: createEmptyInboxState(),
+    inboxReadOnly: false,
+    projectCatalog: {},
+    gatewayStatus: { state: 'ready' },
+    trackDiscordRest: (operation) => operation(),
+    trackActiveResource: (resource) => resource,
+    getSystemStatus: () => ({}),
+    recordActivity: () => {},
+  };
+  const handle = await production.createInteractionHandler(context);
+  const identity = { guild_id: config.discordGuildId, member: { user: { id: config.discordAllowedUserId } } };
+  await handle({
+    id: 'initial-exit', token: 'initial-token', type: 2, ...identity,
+    data: { name: '退出Codex', options: [] },
+  });
+  const confirmId = edits[0].body.components[0].components[0].custom_id;
+
+  assert.equal(typeof production.refreshTaskIndex, 'function');
+  const olderRefresh = production.refreshTaskIndex(context, { nowMs: Date.parse(older.generatedAt) });
+  await Promise.resolve();
+  assert.equal(buildCalls, 2);
+  const confirmation = handle({
+    id: 'confirm-exit', token: 'confirm-token', type: 3, ...identity,
+    message: { id: 'risk-message' },
+    data: { custom_id: confirmId, component_type: 2 },
+  });
+  await Promise.resolve();
+  assert.equal(buildCalls, 2);
+
+  oldBuild.resolve(structuredClone(older));
+  await olderRefresh;
+  await confirmation;
+
+  assert.equal(buildCalls, 3);
+  assert.equal(stopCalls, 0);
+  assert.deepEqual(context.taskIndex.tasks.map((item) => item.threadId), ['root-a', 'root-b']);
+  assert.deepEqual(callbacks.map((item) => item.body.type), [5, 6]);
+  assert.match(edits.at(-1).body.embeds[0].description, /检测到新活动任务/);
+  assert.match(edits.at(-1).body.embeds[0].description, /新活动任务 B/);
+});
+
+test('a rejected production index refresh propagates but does not poison the serial coordinator', async () => {
+  let buildCalls = 0;
+  const activities = [];
+  const production = bridgeModule.createProductionBridgeDependencies({
+    buildTaskIndexImpl: async () => {
+      buildCalls += 1;
+      if (buildCalls === 1) throw new Error('offline index failure');
+      return { version: 1, generatedAt: '2026-09-01T09:00:00.000Z', tasks: [] };
+    },
+    writeTaskIndexAtomicImpl: async () => {},
+  });
+  const context = {
+    config: { discordWorktreeRoot: 'C:\\safe\\worktrees' },
+    taskIndex: { version: 1, generatedAt: null, tasks: [] },
+    recordActivity: (field, at) => activities.push([field, at]),
+  };
+
+  assert.equal(typeof production.refreshTaskIndex, 'function');
+  await assert.rejects(production.refreshTaskIndex(context), /offline index failure/u);
+  const recovered = await production.refreshTaskIndex(context);
+  assert.equal(buildCalls, 2);
+  assert.equal(recovered.generatedAt, '2026-09-01T09:00:00.000Z');
+  assert.deepEqual(activities, [['lastIndexUpdateAt', '2026-09-01T09:00:00.000Z']]);
 });
 
 function makeBridgeDependencies(events, overrides = {}) {
