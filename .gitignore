@@ -12,3 +12,4 @@ task-delivery-state.json
 *.tmp
 node_modules/
 coverage/
+.worktrees/
