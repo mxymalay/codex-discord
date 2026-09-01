@@ -110,6 +110,18 @@ export function createProjectCatalog({ loader, ttlMs = 60_000, now = Date.now } 
     if (expired) startRefresh({ background: true });
   };
 
+  const snapshotChoices = (focused = '') => {
+    const query = String(focused ?? '').trim().toLocaleLowerCase();
+    const saved = projects
+      .filter((item) => !query || String(item?.name ?? '').toLocaleLowerCase().includes(query))
+      .slice(0, 24)
+      .map((item) => ({ name: String(item.name), value: String(item.id) }));
+    saved.push({ name: '无项目', value: NO_PROJECT });
+    return saved;
+  };
+
+  const snapshotGetById = (id) => projects.find((item) => String(item?.id ?? '') === id) ?? null;
+
   return {
     warm() {
       if (warmed) return Promise.resolve(projects.slice());
@@ -117,21 +129,17 @@ export function createProjectCatalog({ loader, ttlMs = 60_000, now = Date.now } 
     },
     choices(focused = '') {
       refreshIfExpired();
-      const query = String(focused ?? '').trim().toLocaleLowerCase();
-      const saved = projects
-        .filter((item) => !query || String(item?.name ?? '').toLocaleLowerCase().includes(query))
-        .slice(0, 24)
-        .map((item) => ({ name: String(item.name), value: String(item.id) }));
-      saved.push({ name: '无项目', value: NO_PROJECT });
-      return saved;
+      return snapshotChoices(focused);
     },
+    snapshotChoices,
     refresh() {
       return startRefresh();
     },
     getById(id) {
       refreshIfExpired();
-      return projects.find((item) => String(item?.id ?? '') === id) ?? null;
+      return snapshotGetById(id);
     },
+    snapshotGetById,
     status() {
       return {
         warmed,

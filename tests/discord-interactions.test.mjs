@@ -10,6 +10,7 @@ import {
   renderQuota,
   renderSearchResults,
   renderSystemStatus,
+  renderTaskList,
   renderTaskDetail,
 } from '../discord-interactions.mjs';
 
@@ -85,8 +86,8 @@ function componentInteraction(customId, overrides = {}) {
 
 function projectCatalog(projects, events = []) {
   return {
-    choices(focused = '') {
-      events.push('cached-choices');
+    snapshotChoices(focused = '') {
+      events.push('snapshot-choices');
       const query = String(focused).toLocaleLowerCase();
       const saved = projects
         .filter((project) => !query || project.name.toLocaleLowerCase().includes(query))
@@ -94,10 +95,12 @@ function projectCatalog(projects, events = []) {
         .map((project) => ({ name: project.name, value: project.id }));
       return [...saved, { name: '无项目', value: '__projectless__' }];
     },
-    getById(id) {
-      events.push('cached-get');
+    snapshotGetById(id) {
+      events.push('snapshot-get');
       return projects.find((project) => project.id === id) ?? null;
     },
+    choices() { throw new Error('refreshing choices must not run during an Interaction'); },
+    getById() { throw new Error('refreshing lookup must not run during an Interaction'); },
     async refresh() {
       events.push('refresh');
       return projects.map((project) => structuredClone(project));
@@ -133,7 +136,7 @@ function makeDependencies(overrides = {}) {
       threadId: 'thread-created-1',
       turnId: 'turn-1',
       taskName: '生成中',
-      workspace: { mode: 'worktree', cwd: 'C:\\safe\\worktrees\\operation-1', branch: 'codex/discord-test' },
+      workspace: { mode: 'worktree', cwd: 'C:\\safe\\worktrees\\operation-1', branchName: 'codex/discord-test' },
     })),
     readTaskDetail: overrides.readTaskDetail ?? (async (record) => ({
       ...record,
@@ -201,14 +204,14 @@ test('project autocomplete is cache-only, includes no-project, and stays within 
   assert.equal(responses[0].type, 8);
   assert.equal(responses[0].data.choices.length, 25);
   assert.equal(responses[0].data.choices.at(-1).value, '__projectless__');
-  assert.deepEqual(events, ['cached-choices']);
+  assert.deepEqual(events, ['snapshot-choices']);
 });
 
 test('project autocomplete converts a broken cache read into immediate zero choices', async () => {
   const { dependencies, responses } = makeDependencies({
     projectCatalog: {
-      choices() { throw new Error('Token secret C:\\private\\catalog'); },
-      getById() { return null; },
+      snapshotChoices() { throw new Error('Token secret C:\\private\\catalog'); },
+      snapshotGetById() { return null; },
       async refresh() { throw new Error('not called'); },
     },
   });
@@ -232,7 +235,7 @@ test('autocomplete rejects unsupported commands and clamps every Discord choice 
   assert.equal(responses[1].data.choices.every((choice) => choice.name.length <= 100 && choice.value.length <= 100), true);
 });
 
-test('message command responses and errors are always ephemeral and mention-safe', async () => {
+test('initial command callbacks are always ephemeral and mention-safe', async () => {
   const invocations = [
     commandInteraction('任务列表'),
     commandInteraction('任务详情', { 任务: 'root-1' }),
@@ -252,7 +255,7 @@ test('message command responses and errors are always ephemeral and mention-safe
 
   assert.equal(responses.length, invocations.length);
   for (const response of responses) {
-    assert.equal([4, 5, 7].includes(response.type), true);
+    assert.equal([4, 5].includes(response.type), true);
     assert.equal(response.data.flags & 64, 64);
     assert.deepEqual(response.data.allowed_mentions, { parse: [] });
   }
@@ -280,6 +283,44 @@ test('search result renderer bounds untrusted query and display names for an emb
   assert.equal(rendered.length <= 3_800, true);
 });
 
+test('list, search, receipts, and detail metadata cannot inject structural Markdown or new lines', async () => {
+  const hostile = task(1, {
+    projectName: 'Project\n# injected **bold**',
+    taskName: 'Task\n```js\nsecret',
+    status: 'running\n> quote',
+    contentAvailable: true,
+    taskText: '# full task Markdown\n```js\nconst ok = true;\n```',
+    resultText: '**full result Markdown**',
+  });
+  const rendered = renderSearchResults([hostile], 'query\n# heading');
+  assert.equal(rendered.includes('\n# injected'), false);
+  assert.equal(rendered.includes('\n```js'), false);
+  assert.equal(rendered.includes('**bold**'), false);
+  const list = renderTaskList([hostile]);
+  assert.equal(list.includes('\n# injected'), false);
+  assert.equal(list.includes('\n```js'), false);
+  assert.equal(list.includes('**bold**'), false);
+  const detail = renderTaskDetail(hostile);
+  assert.match(detail, /# full task Markdown\n```js\nconst ok = true;/);
+  assert.match(detail, /\*\*full result Markdown\*\*/);
+  assert.equal(detail.includes('\n# injected'), false);
+
+  const huge = 'X\n# injected **bold**'.repeat(1_000);
+  const { dependencies, responses, edits } = makeDependencies({
+    projects: [{ id: 'project-1', name: huge, roots: ['C:\\saved\\POS'] }],
+    createNewTaskOnce: async () => ({
+      status: 'started', threadId: 'created-12345678', taskName: huge,
+      workspace: { mode: 'worktree', worktreePath: `C:\\safe\\${huge}`, branchName: 'codex/discord-test' },
+    }),
+  });
+  const router = createInteractionRouter(dependencies);
+  await router.handle(commandInteraction('新建任务', { 项目: 'project-1' }));
+  await router.handle(modalSubmit(responses.shift().data.custom_id, 'create'));
+  assert.equal(edits[0].content.length <= 2_000, true);
+  assert.equal(edits[0].content.includes('\n# injected'), false);
+  assert.equal(edits[0].content.includes('**bold**'), false);
+});
+
 test('Discord REST client posts callbacks and private follow-ups and patches the original route', async () => {
   const calls = [];
   const client = createInteractionRestClient({
@@ -300,11 +341,80 @@ test('Discord REST client posts callbacks and private follow-ups and patches the
     ['https://discord.com/api/v10/webhooks/111/token%2Fvalue/messages/@original', 'PATCH'],
     ['https://discord.com/api/v10/webhooks/111/token%2Fvalue?wait=true', 'POST'],
   ]);
-  for (const call of calls.slice(1)) {
-    const payload = JSON.parse(call.options.body);
-    assert.equal(payload.flags & 64, 64);
-    assert.deepEqual(payload.allowed_mentions, { parse: [] });
-  }
+  const callback = JSON.parse(calls[0].options.body);
+  const edit = JSON.parse(calls[1].options.body);
+  const followup = JSON.parse(calls[2].options.body);
+  assert.equal(callback.data.flags & 64, 64);
+  assert.equal(followup.flags & 64, 64);
+  assert.equal(Object.hasOwn(edit, 'flags'), false);
+  for (const payload of [callback.data, edit, followup]) assert.deepEqual(payload.allowed_mentions, { parse: [] });
+});
+
+test('Discord REST retries 429s within distinct callback and webhook budgets', async () => {
+  let clock = 1_000;
+  const sleeps = [];
+  const responses = [
+    new Response(JSON.stringify({ retry_after: 0.25 }), { status: 429, headers: { 'Content-Type': 'application/json' } }),
+    new Response(null, { status: 204 }),
+    new Response('', { status: 429, headers: { 'Retry-After': '1.5' } }),
+    new Response('{}', { status: 200 }),
+  ];
+  const client = createInteractionRestClient({
+    applicationId: '111',
+    now: () => clock,
+    sleepImpl: async (milliseconds) => { sleeps.push(milliseconds); clock += milliseconds; },
+    fetchImpl: async () => responses.shift(),
+  });
+  const interaction = { id: '1', token: 'token-must-not-leak' };
+
+  await client.callback(interaction, { type: 5, data: {} });
+  await client.editOriginal(interaction, { content: 'done' });
+
+  assert.deepEqual(sleeps, [250, 1_500]);
+  assert.equal(responses.length, 0);
+});
+
+test('callback 429 retry never exceeds the acknowledgement deadline and failures are sanitized', async () => {
+  let calls = 0;
+  const client = createInteractionRestClient({
+    applicationId: '111',
+    now: () => 10_000,
+    sleepImpl: async () => { throw new Error('must not sleep'); },
+    fetchImpl: async () => {
+      calls += 1;
+      return new Response('token-must-not-leak C:\\private', {
+        status: 429,
+        headers: { 'Content-Type': 'application/json', 'Retry-After': '999' },
+      });
+    },
+  });
+  await assert.rejects(
+    () => client.callback({ id: '1', token: 'token-must-not-leak' }, { type: 4, data: { content: 'x' } }),
+    (error) => error.message === 'Discord interaction request failed: 429'
+      && !/token|private/iu.test(error.message),
+  );
+  assert.equal(calls, 1);
+});
+
+test('webhook 429 retries are attempt-bounded and accept HTTP-date Retry-After', async () => {
+  let clock = Date.parse('2026-09-01T00:00:00Z');
+  const sleeps = [];
+  let calls = 0;
+  const client = createInteractionRestClient({
+    applicationId: '111',
+    now: () => clock,
+    sleepImpl: async (milliseconds) => { sleeps.push(milliseconds); clock += milliseconds; },
+    fetchImpl: async () => {
+      calls += 1;
+      return new Response('', { status: 429, headers: { 'Retry-After': new Date(clock + 1_000).toUTCString() } });
+    },
+  });
+  await assert.rejects(
+    () => client.followup({ token: 'secret' }, { content: 'x' }),
+    /Discord interaction request failed: 429/,
+  );
+  assert.equal(calls, 3);
+  assert.deepEqual(sleeps, [1_000, 1_000]);
 });
 
 test('Discord REST errors expose only a sanitized category', async () => {
@@ -330,7 +440,7 @@ test('deferred query failures are edited into private sanitized errors', async (
     await router.handle(commandInteraction(command, options));
 
     assert.equal(responses[0].type, 5);
-    assert.equal(edits[0].flags & 64, 64);
+    assert.equal(Object.hasOwn(edits[0], 'flags'), false);
     assert.deepEqual(edits[0].allowed_mentions, { parse: [] });
     assert.match(edits[0].content, /失败|不可用|稍后/);
     assert.equal(/secret|private|Token/u.test(edits[0].content), false);
@@ -374,6 +484,20 @@ test('new-task modal uses a random 96-bit state id and stores no token or path',
   assert.equal([...uiState.values()][0].expiresAt, NOW + 15 * 60_000);
 });
 
+test('initial new-task modal reads only the non-refreshing project snapshot', async () => {
+  const calls = [];
+  const { dependencies, responses } = makeDependencies({
+    projectCatalog: {
+      snapshotGetById(id) { calls.push(`snapshot:${id}`); return { id, name: 'Cached', roots: ['C:\\saved\\Cached'] }; },
+      getById() { calls.push('refreshing-get'); throw new Error('must not run'); },
+      refresh() { calls.push('refresh'); throw new Error('must not run'); },
+    },
+  });
+  await createInteractionRouter(dependencies).handle(commandInteraction('新建任务', { 项目: 'project-1' }));
+  assert.equal(responses[0].type, 9);
+  assert.deepEqual(calls, ['snapshot:project-1']);
+});
+
 test('modal submission defers before authoritative refresh and creation, passes persistence, and inserts immediately', async () => {
   const events = [];
   let creationInput;
@@ -393,7 +517,7 @@ test('modal submission defers before authoritative refresh and creation, passes 
         taskName: '生成中',
         workspace: {
           mode: 'worktree', cwd: 'C:\\Users\\private-user',
-          worktreePath: 'C:\\Users\\private-user', worktreeBranch: 'codex/discord-test',
+          worktreePath: 'C:\\Users\\private-user', branchName: 'codex/discord-test',
         },
       };
     },
@@ -413,11 +537,12 @@ test('modal submission defers before authoritative refresh and creation, passes 
   assert.equal(responses[0].type, 5);
   assert.equal(responses[0].data.flags & 64, 64);
   assert.deepEqual(responses[0].data.allowed_mentions, { parse: [] });
-  assert.equal(edits[0].flags & 64, 64);
+  assert.equal(Object.hasOwn(edits[0], 'flags'), false);
   assert.deepEqual(edits[0].allowed_mentions, { parse: [] });
   assert.equal(edits[0].content.includes('private-user'), false);
   assert.equal(taskIndex.tasks.length, 1);
   assert.equal(taskIndex.tasks[0].threadId, 'thread-created-1');
+  assert.equal(taskIndex.tasks[0].worktreeBranch, 'codex/discord-test');
 });
 
 test('duplicate modal delivery creates and inserts exactly once', async () => {
@@ -468,7 +593,7 @@ test('modal reauthorization and authoritative project deletion or change reject 
     assert.equal(responses[0].type, 5);
     assert.equal(created, false);
     assert.match(edits[0].content, /项目.*变化|项目.*删除|重新执行/);
-    assert.equal(edits[0].flags & 64, 64);
+    assert.equal(Object.hasOwn(edits[0], 'flags'), false);
   }
 
   const { dependencies, responses } = makeDependencies();
@@ -524,7 +649,10 @@ test('detail pagination buttons use random state and reject random, expired, and
   assert.equal(Buffer.from(stateId, 'base64url').length, 12);
 
   await router.handle(componentInteraction(nextId));
-  assert.equal(responses.shift().type, 7);
+  const update = responses.shift();
+  assert.equal(update.type, 7);
+  assert.equal(Object.hasOwn(update.data, 'flags'), false);
+  assert.deepEqual(update.data.allowed_mentions, { parse: [] });
 
   await router.handle(componentInteraction('page:AAAAAAAAAAAAAAAA:next'));
   assert.match(responses.shift().data.content, /过期|无效/);
@@ -587,6 +715,29 @@ test('quota renderer uses the persisted acceleration when no previous rate sampl
     }],
   }, { nowMs: NOW });
   assert.match(text, /更快/);
+});
+
+test('/额度 renders the production quota snapshot without mutating or persisting it', async () => {
+  const quota = {
+    observedAt: new Date(NOW).toISOString(),
+    limits: [{
+      key: 'codex|primary|10080', windowMinutes: 10080,
+      remainingPercent: 42, previousRemainingPercent: 45, usedPercent: 58,
+      resetsAt: Math.floor((NOW + 24 * 60 * 60_000) / 1_000),
+      lastUsageRatePerHour: 2,
+    }],
+  };
+  const before = structuredClone(quota);
+  let persistCalls = 0;
+  const { dependencies, responses, edits } = makeDependencies({
+    getQuotaState: async () => quota,
+    persistQuotaState: async () => { persistCalls += 1; },
+  });
+  await createInteractionRouter(dependencies).handle(commandInteraction('额度'));
+  assert.equal(responses[0].type, 5);
+  assert.match(edits[0].content, /45%.*42%/s);
+  assert.deepEqual(quota, before);
+  assert.equal(persistCalls, 0);
 });
 
 test('system status exposes sanitized categories without paths, tokens, or user text', () => {

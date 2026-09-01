@@ -293,6 +293,30 @@ test('project catalog autocomplete is cache-only and deduplicates an expired bac
   assert.equal(catalog.status().refreshing, false);
 });
 
+test('project catalog snapshot methods never start I/O after the cache expires', async () => {
+  let clock = 0;
+  let calls = 0;
+  const catalog = createProjectCatalog({
+    ttlMs: 10,
+    now: () => clock,
+    loader: async () => {
+      calls += 1;
+      return [project({ id: 'cached', name: 'Cached Project' })];
+    },
+  });
+  await catalog.warm();
+  clock = 11;
+
+  assert.deepEqual(catalog.snapshotChoices('cached'), [
+    { name: 'Cached Project', value: 'cached' },
+    { name: '无项目', value: NO_PROJECT },
+  ]);
+  assert.equal(catalog.snapshotGetById('cached').name, 'Cached Project');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(calls, 1);
+  assert.equal(catalog.status().refreshing, false);
+});
+
 test('project catalog keeps last good data and exposes only a sanitized refresh error category', async () => {
   let clock = 0;
   let fail = false;

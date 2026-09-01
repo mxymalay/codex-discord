@@ -69,6 +69,7 @@ function Invoke-QuotaCase {
         windowMinutes = 10080
         usedPercent = $previousUsed
         remainingPercent = $PreviousRemaining
+        previousRemainingPercent = $PreviousRemaining
         resetsAt = $previousResetUnix
         lastChangeAt = $PreviousChangeAt
         lastAcceptedObservedAt = $PreviousChangeAt

@@ -48,7 +48,8 @@ function Set-BaselineState {
         [string]$ObservedAt,
         [int64]$ResetsAt,
         [string]$LastChangeAt = $ObservedAt,
-        [object]$LastRate = 1.0
+        [object]$LastRate = 1.0,
+        [object]$PreviousRemaining = $Remaining
     )
 
     $limit = [ordered]@{
@@ -58,6 +59,7 @@ function Set-BaselineState {
         windowMinutes = 10080
         usedPercent = [Math]::Round(100 - $Remaining, 2)
         remainingPercent = $Remaining
+        previousRemainingPercent = $PreviousRemaining
         resetsAt = $ResetsAt
         lastChangeAt = $LastChangeAt
         lastAcceptedObservedAt = $ObservedAt
@@ -204,19 +206,28 @@ try {
 
     $stableReset = [DateTimeOffset]::Parse('2026-09-05T00:00:00Z').ToUnixTimeSeconds()
 
+    # A brand-new production snapshot persists a current-to-current trend baseline.
+    $baselineThread = [guid]::NewGuid().ToString()
+    Add-SnapshotFixture -ThreadId $baselineThread -Remaining 64 -ObservedAt '2026-08-31T09:00:00Z' -ResetsAt $stableReset -MainTask
+    $baselineOutput = Invoke-Snapshot -ThreadId $baselineThread
+    Assert-Equal -Name 'baseline output' -Expected '' -Actual $baselineOutput
+    $initializedState = Get-StateLimit
+    Assert-Equal -Name 'baseline previous remaining' -Expected 64 -Actual $initializedState.previousRemainingPercent
+
     # A one-second reset jitter must not create a new cycle or alter the stable reset.
-    Set-BaselineState -Remaining 51 -ObservedAt '2026-08-31T10:00:00Z' -ResetsAt $stableReset -LastChangeAt '2026-08-31T09:50:00Z' -LastRate 2.0
+    Set-BaselineState -Remaining 51 -PreviousRemaining 55 -ObservedAt '2026-08-31T10:00:00Z' -ResetsAt $stableReset -LastChangeAt '2026-08-31T09:50:00Z' -LastRate 2.0
     $jitterThread = [guid]::NewGuid().ToString()
     Add-SnapshotFixture -ThreadId $jitterThread -Remaining 51 -ObservedAt '2026-08-31T10:01:00Z' -ResetsAt ($stableReset + 1) -MainTask
-    $jitterOutput = Invoke-Snapshot -ThreadId $jitterThread -Dry
+    $jitterOutput = Invoke-Snapshot -ThreadId $jitterThread
     Assert-Equal -Name 'reset jitter output' -Expected '' -Actual $jitterOutput
     $jitterState = Get-StateLimit
     Assert-Equal -Name 'stable reset after jitter' -Expected $stableReset -Actual $jitterState.resetsAt
     Assert-Equal -Name 'last change preserved after jitter' -Expected '2026-08-31T09:50:00Z' -Actual $jitterState.lastChangeAt
     Assert-Equal -Name 'rate preserved after jitter' -Expected 2 -Actual $jitterState.lastUsageRatePerHour
+    Assert-Equal -Name 'previous remaining preserved after unchanged observation' -Expected 55 -Actual $jitterState.previousRemainingPercent
 
     # A child-only rollback becomes a pending increase, then disappears without a notification.
-    Set-BaselineState -Remaining 51 -ObservedAt '2026-08-31T10:01:32Z' -ResetsAt $stableReset -LastChangeAt '2026-08-31T10:01:32Z' -LastRate 6.143
+    Set-BaselineState -Remaining 51 -PreviousRemaining 55 -ObservedAt '2026-08-31T10:01:32Z' -ResetsAt $stableReset -LastChangeAt '2026-08-31T10:01:32Z' -LastRate 6.143
     $rollbackChild = [guid]::NewGuid().ToString()
     Add-SnapshotFixture -ThreadId $rollbackChild -Remaining 52 -ObservedAt '2026-08-31T10:01:46Z' -ResetsAt $stableReset
     $candidateOutput = Invoke-Snapshot -ThreadId $rollbackChild
@@ -226,6 +237,7 @@ try {
     Assert-Equal -Name 'candidate remaining stored separately' -Expected 52 -Actual $candidateState.pendingIncreaseRemainingPercent
     Assert-Equal -Name 'candidate confirmation count' -Expected 1 -Actual $candidateState.pendingIncreaseConfirmations
     Assert-Equal -Name 'child candidate has no main confirmation' -Expected False -Actual $candidateState.pendingIncreaseSawMainTask
+    Assert-Equal -Name 'candidate preserves prior accepted percentage' -Expected 55 -Actual $candidateState.previousRemainingPercent
 
     $rollbackMain = [guid]::NewGuid().ToString()
     Add-SnapshotFixture -ThreadId $rollbackMain -Remaining 51 -ObservedAt '2026-08-31T10:02:20Z' -ResetsAt $stableReset -MainTask
@@ -235,6 +247,7 @@ try {
     Assert-Equal -Name 'rollback accepted remaining' -Expected 51 -Actual $rollbackState.remainingPercent
     Assert-Equal -Name 'rollback clears pending remaining' -Expected '' -Actual (Get-Value -Object $rollbackState -Name 'pendingIncreaseRemainingPercent' -DefaultValue '')
     Assert-Equal -Name 'rollback preserves rate' -Expected 6.143 -Actual $rollbackState.lastUsageRatePerHour
+    Assert-Equal -Name 'rollback preserves prior accepted percentage' -Expected 55 -Actual $rollbackState.previousRemainingPercent
 
     # A sidebar main task confirms an increase immediately; no later task is required.
     Set-BaselineState -Remaining 51 -ObservedAt '2026-08-31T10:30:00Z' -ResetsAt $stableReset -LastChangeAt '2026-08-31T10:00:00Z' -LastRate 1.0

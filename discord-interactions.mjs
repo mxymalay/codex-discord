@@ -7,7 +7,7 @@ import { NO_PROJECT, resolveProjectSelection } from './discord-task-create-lib.m
 const DISCORD_API = 'https://discord.com/api/v10';
 const UI_TTL_MS = 15 * 60_000;
 const EMBED_MARKDOWN_LIMIT = 3_800;
-const MESSAGE_RESPONSE_TYPES = new Set([4, 5, 7]);
+const INITIAL_MESSAGE_RESPONSE_TYPES = new Set([4, 5]);
 const STATUS_LABELS = Object.freeze({
   pending: '等待中',
   running: '运行中',
@@ -30,32 +30,84 @@ function privateResponse(payload, type = 4) {
   return { type, data: privatePayload(payload) };
 }
 
-function normalizeCallback(body) {
-  if (!MESSAGE_RESPONSE_TYPES.has(Number(body?.type))) return body;
-  return { ...body, data: privatePayload(body?.data) };
+function mentionSafePayload(payload) {
+  const data = typeof payload === 'string' ? { content: payload } : { ...(payload ?? {}) };
+  delete data.flags;
+  return { ...data, allowed_mentions: { parse: [] } };
 }
 
-async function discordRequest(fetchImpl, url, method, body) {
-  let response;
+function normalizeCallback(body) {
+  const type = Number(body?.type);
+  if (INITIAL_MESSAGE_RESPONSE_TYPES.has(type)) return { ...body, data: privatePayload(body?.data) };
+  if (type === 7) return { ...body, data: mentionSafePayload(body?.data) };
+  return body;
+}
+
+function defaultSleep(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function boundedInteger(value, fallback, minimum, maximum) {
+  const number = Number(value);
+  return Number.isInteger(number) ? Math.min(maximum, Math.max(minimum, number)) : fallback;
+}
+
+function retryPolicy(policy, defaults) {
+  return {
+    maxAttempts: boundedInteger(policy?.maxAttempts, defaults.maxAttempts, 1, defaults.maxAttempts),
+    maxElapsedMs: Math.min(defaults.maxElapsedMs, Math.max(0, Number(policy?.maxElapsedMs) || defaults.maxElapsedMs)),
+  };
+}
+
+async function retryAfterMilliseconds(response, nowMs) {
   try {
-    response = await fetchImpl(url, {
-      method,
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
+    const details = typeof response?.json === 'function' ? await response.json() : null;
+    const seconds = Number(details?.retry_after);
+    if (Number.isFinite(seconds) && seconds >= 0) return seconds * 1_000;
   } catch {
-    throw new Error('Discord interaction request failed: network');
+    // Retry-After remains available when Discord does not return JSON.
   }
-  if (!isSuccessful(response)) {
-    throw new Error(`Discord interaction request failed: ${Number(response?.status) || 'unknown'}`);
-  }
-  if (Number(response?.status) === 204) return null;
-  try {
-    if (typeof response?.json === 'function') return await response.json();
-  } catch {
+  const header = response?.headers?.get?.('Retry-After');
+  const seconds = Number(header);
+  if (String(header ?? '').trim() && Number.isFinite(seconds) && seconds >= 0) return seconds * 1_000;
+  const date = Date.parse(String(header ?? ''));
+  return Number.isFinite(date) ? Math.max(0, date - nowMs) : null;
+}
+
+async function discordRequest(fetchImpl, url, method, body, { now, sleepImpl, policy }) {
+  const startedAt = Number(now());
+  for (let attempt = 1; attempt <= policy.maxAttempts; attempt += 1) {
+    let response;
+    try {
+      response = await fetchImpl(url, {
+        method,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+    } catch {
+      throw new Error('Discord interaction request failed: network');
+    }
+    if (Number(response?.status) === 429 && attempt < policy.maxAttempts) {
+      const current = Number(now());
+      const delay = await retryAfterMilliseconds(response, current);
+      const elapsed = Math.max(0, current - startedAt);
+      if (delay !== null && Number.isFinite(delay) && delay >= 0 && elapsed + delay <= policy.maxElapsedMs) {
+        await sleepImpl(delay);
+        continue;
+      }
+    }
+    if (!isSuccessful(response)) {
+      throw new Error(`Discord interaction request failed: ${Number(response?.status) || 'unknown'}`);
+    }
+    if (Number(response?.status) === 204) return null;
+    try {
+      if (typeof response?.json === 'function') return await response.json();
+    } catch {
+      return null;
+    }
     return null;
   }
-  return null;
+  throw new Error('Discord interaction request failed: retry-limit');
 }
 
 /**
@@ -63,21 +115,36 @@ async function discordRequest(fetchImpl, url, method, body) {
  * accepted only as call arguments and are never retained by the returned
  * client.
  */
-export function createInteractionRestClient({ applicationId, fetchImpl = fetch } = {}) {
+export function createInteractionRestClient({
+  applicationId,
+  fetchImpl = fetch,
+  now = Date.now,
+  sleepImpl = defaultSleep,
+  callbackRetry,
+  webhookRetry,
+} = {}) {
   const appId = encodeURIComponent(String(applicationId ?? ''));
+  const callbackPolicy = retryPolicy(callbackRetry, { maxAttempts: 2, maxElapsedMs: 2_800 });
+  const webhookPolicy = retryPolicy(webhookRetry, { maxAttempts: 3, maxElapsedMs: 30_000 });
   return {
     callback(interaction, body) {
       const id = encodeURIComponent(String(interaction?.id ?? ''));
       const token = encodeURIComponent(String(interaction?.token ?? ''));
-      return discordRequest(fetchImpl, `${DISCORD_API}/interactions/${id}/${token}/callback`, 'POST', normalizeCallback(body));
+      return discordRequest(fetchImpl, `${DISCORD_API}/interactions/${id}/${token}/callback`, 'POST', normalizeCallback(body), {
+        now, sleepImpl, policy: callbackPolicy,
+      });
     },
     editOriginal(interaction, payload) {
       const token = encodeURIComponent(String(interaction?.token ?? ''));
-      return discordRequest(fetchImpl, `${DISCORD_API}/webhooks/${appId}/${token}/messages/@original`, 'PATCH', privatePayload(payload));
+      return discordRequest(fetchImpl, `${DISCORD_API}/webhooks/${appId}/${token}/messages/@original`, 'PATCH', mentionSafePayload(payload), {
+        now, sleepImpl, policy: webhookPolicy,
+      });
     },
     followup(interaction, payload) {
       const token = encodeURIComponent(String(interaction?.token ?? ''));
-      return discordRequest(fetchImpl, `${DISCORD_API}/webhooks/${appId}/${token}?wait=true`, 'POST', privatePayload(payload));
+      return discordRequest(fetchImpl, `${DISCORD_API}/webhooks/${appId}/${token}?wait=true`, 'POST', privatePayload(payload), {
+        now, sleepImpl, policy: webhookPolicy,
+      });
     },
   };
 }
@@ -179,6 +246,16 @@ function displayText(value, fallback, maximum = 80) {
   return valueText.length <= maximum ? valueText : `${valueText.slice(0, maximum - 1)}…`;
 }
 
+function metadataText(value, fallback = '未知', maximum = 80) {
+  const singleLine = text(value, fallback).replace(/\s+/gu, ' ');
+  const escaped = singleLine.replace(/([\\`*_{}\[\]()#+.!|>~-])/gu, '\\$1');
+  return escaped.length <= maximum ? escaped : `${escaped.slice(0, Math.max(0, maximum - 1))}…`;
+}
+
+function plainLabel(value, fallback = '未知', maximum = 80) {
+  return displayText(text(value, fallback).replace(/\s+/gu, ' '), fallback, maximum);
+}
+
 function formatTimestamp(value) {
   const milliseconds = Date.parse(String(value ?? ''));
   if (!Number.isFinite(milliseconds)) return '未知';
@@ -205,12 +282,12 @@ export function renderTaskList(tasks, { status = '全部' } = {}) {
   const values = (Array.isArray(tasks) ? tasks : [])
     .filter((item) => desired === '全部' || statusLabel(item?.status) === desired)
     .slice(0, 10);
-  if (!values.length) return `## 最近任务\n没有符合“${desired}”条件的主任务。`;
+  if (!values.length) return `## 最近任务\n没有符合“${metadataText(desired, '全部')}”条件的主任务。`;
   return [
-    `## 最近任务（${desired}）`,
+    `## 最近任务（${metadataText(desired, '全部')}）`,
     ...values.map((item, index) => [
-      `${index + 1}. **${displayText(item?.projectName, '无项目')} / ${displayText(item?.taskName, '未命名任务')}**`,
-      `   状态：${statusLabel(item?.status)}｜最后活动：${formatTimestamp(item?.lastActivityAt)}｜运行时间：${formatDuration(item?.runtimeMs)}`,
+      `${index + 1}. **${metadataText(item?.projectName, '无项目')} / ${metadataText(item?.taskName, '未命名任务')}**`,
+      `   状态：${metadataText(statusLabel(item?.status))}｜最后活动：${formatTimestamp(item?.lastActivityAt)}｜运行时间：${formatDuration(item?.runtimeMs)}`,
     ].join('\n')),
   ].join('\n');
 }
@@ -220,10 +297,10 @@ export function renderTaskDetail(detail) {
   const taskText = text(detail.taskText, detail.contentAvailable === false ? '内容暂不可用，请稍后重试。' : '（无可用内容）');
   const resultText = text(detail.resultText, detail.contentAvailable === false ? '内容暂不可用，请稍后重试。' : '（暂无结果）');
   return [
-    `# ${text(detail.taskName, '未命名任务')}`,
-    `项目：${text(detail.projectName, '无项目')}`,
-    `状态：${statusLabel(detail.status)}`,
-    `任务 ID：…${text(detail.threadId).slice(-8)}`,
+    `# ${metadataText(detail.taskName, '未命名任务', 200)}`,
+    `项目：${metadataText(detail.projectName, '无项目', 200)}`,
+    `状态：${metadataText(statusLabel(detail.status), '未知', 100)}`,
+    `任务 ID：…${metadataText(text(detail.threadId).slice(-8), '未知', 16)}`,
     `开始时间：${formatTimestamp(detail.startedAt ?? detail.createdAt)}`,
     `最后活动：${formatTimestamp(detail.lastActivityAt)}`,
     `运行时间：${formatDuration(detail.runtimeMs)}`,
@@ -238,11 +315,11 @@ export function renderTaskDetail(detail) {
 
 export function renderSearchResults(results, keyword) {
   const values = (Array.isArray(results) ? results : []).slice(0, 10);
-  if (!values.length) return `没有找到与“${text(keyword, '')}”匹配的主任务。`;
+  if (!values.length) return `没有找到与“${metadataText(keyword, '', 100)}”匹配的主任务。`;
   return [
-    `## 搜索结果：${displayText(keyword, '', 100)}`,
+    `## 搜索结果：${metadataText(keyword, '', 100)}`,
     ...values.map((item, index) =>
-      `${index + 1}. **${displayText(item?.projectName, '无项目')} / ${displayText(item?.taskName, '未命名任务')}**｜${statusLabel(item?.status)}｜${formatTimestamp(item?.lastActivityAt)}`),
+      `${index + 1}. **${metadataText(item?.projectName, '无项目')} / ${metadataText(item?.taskName, '未命名任务')}**｜${metadataText(statusLabel(item?.status))}｜${formatTimestamp(item?.lastActivityAt)}`),
   ].join('\n');
 }
 
@@ -286,7 +363,7 @@ export function renderQuota(state, { nowMs = Date.now() } = {}) {
   if (!weekly || !Number.isFinite(observedMs)) return '暂无可用的 Codex 周额度快照。';
 
   const remaining = finiteNumber(weekly.remainingPercent);
-  const previous = finiteNumber(weekly.previousRemainingPercent ?? weekly.lastRemainingPercent);
+  const previous = finiteNumber(weekly.previousRemainingPercent);
   const lastChangeMs = Date.parse(String(weekly.lastChangeAt ?? state.observedAt));
   const currentRate = finiteNumber(weekly.currentUsageRatePerHour ?? weekly.lastUsageRatePerHour);
   const previousRate = finiteNumber(weekly.previousUsageRatePerHour);
@@ -414,7 +491,7 @@ function projectFingerprint(project) {
 
 function cachedProject(dependencies, selectionId) {
   if (selectionId === NO_PROJECT) return { id: NO_PROJECT, name: '无项目', roots: [] };
-  if (typeof dependencies.projectCatalog?.getById === 'function') return dependencies.projectCatalog.getById(selectionId);
+  if (typeof dependencies.projectCatalog?.snapshotGetById === 'function') return dependencies.projectCatalog.snapshotGetById(selectionId);
   return (dependencies.cachedProjects ?? []).find((project) => String(project?.id ?? '') === selectionId) ?? null;
 }
 
@@ -434,9 +511,9 @@ function taskChoices(dependencies, focused) {
 }
 
 function projectChoices(dependencies, focused) {
-  if (typeof dependencies.projectCatalog?.choices === 'function') {
+  if (typeof dependencies.projectCatalog?.snapshotChoices === 'function') {
     try {
-      const choices = dependencies.projectCatalog.choices(focused);
+      const choices = dependencies.projectCatalog.snapshotChoices(focused);
       return (Array.isArray(choices) ? choices : []).slice(0, 25);
     } catch {
       return [];
@@ -477,7 +554,7 @@ function pageComponents(stateId, page, total) {
 }
 
 function pagePayload(stateId, state) {
-  return privatePayload({
+  return mentionSafePayload({
     embeds: [{ description: state.pages[state.page] }],
     components: pageComponents(stateId, state.page, state.pages.length),
   });
@@ -505,7 +582,7 @@ function detailButtons(dependencies, tasks, interaction) {
       threadId: String(task.threadId),
       expiresAt: nowValue(dependencies) + UI_TTL_MS,
     });
-    buttons.push({ type: 2, style: 2, label: `查看：${text(task.taskName, '未命名任务')}`.slice(0, 80), custom_id: `detail:${stateId}` });
+    buttons.push({ type: 2, style: 2, label: `查看：${plainLabel(task.taskName, '未命名任务', 77)}`, custom_id: `detail:${stateId}` });
   }
   const rows = [];
   for (let index = 0; index < buttons.length; index += 5) rows.push({ type: 1, components: buttons.slice(index, index + 5) });
@@ -521,17 +598,21 @@ function safeWorkspaceName(workspace) {
   const win = path.win32.basename(candidate);
   const posix = path.posix.basename(candidate);
   const base = win.length <= posix.length ? win : posix;
-  return `…/${base.replace(/[<>@]/gu, '') || '工作目录'}`;
+  return `…/${metadataText(base.replace(/[<>@]/gu, ''), '工作目录', 120)}`;
 }
 
 function creationReceipt(result, selection) {
-  const suffix = text(result?.threadId).slice(-8);
-  const projectName = text(selection?.projectName, '无项目');
+  const suffix = metadataText(text(result?.threadId).slice(-8), '未知', 16);
+  const projectName = metadataText(selection?.projectName, '无项目', 240);
+  const taskName = metadataText(result?.taskName, '生成中', 500);
   const mode = result?.workspace?.mode === 'worktree' ? 'Git 隔离工作树' : '保存目录';
+  let receipt;
   if (result?.status === 'first-turn-failed') {
-    return `任务线程已保留，但首轮启动失败。\n项目：${projectName}\n任务：${text(result?.taskName, '生成中')}\n任务 ID：…${suffix}\n运行方式：${mode}\n工作目录：${safeWorkspaceName(result?.workspace)}`;
+    receipt = `任务线程已保留，但首轮启动失败。\n项目：${projectName}\n任务：${taskName}\n任务 ID：…${suffix}\n运行方式：${mode}\n工作目录：${safeWorkspaceName(result?.workspace)}`;
+  } else {
+    receipt = `任务创建成功。\n项目：${projectName}\n任务：${taskName}\n任务 ID：…${suffix}\n运行方式：${mode}\n工作目录：${safeWorkspaceName(result?.workspace)}`;
   }
-  return `任务创建成功。\n项目：${projectName}\n任务：${text(result?.taskName, '生成中')}\n任务 ID：…${suffix}\n运行方式：${mode}\n工作目录：${safeWorkspaceName(result?.workspace)}`;
+  return receipt.length <= 2_000 ? receipt : `${receipt.slice(0, 1_999)}…`;
 }
 
 function insertCreatedTask(dependencies, result, selection) {
@@ -559,7 +640,7 @@ function insertCreatedTask(dependencies, result, selection) {
     rolloutPath: null,
     offset: 0,
     worktreePath: result.workspace?.worktreePath ?? null,
-    worktreeBranch: result.workspace?.worktreeBranch ?? result.workspace?.branch ?? null,
+    worktreeBranch: result.workspace?.branchName ?? null,
   });
 }
 
@@ -578,7 +659,7 @@ async function respond(dependencies, interaction, body) {
 }
 
 async function editOriginal(dependencies, interaction, payload) {
-  const body = privatePayload(payload);
+  const body = mentionSafePayload(payload);
   await dependencies.editOriginal?.(body, interaction);
   return body;
 }

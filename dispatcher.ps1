@@ -1379,6 +1379,7 @@ function Copy-QuotaTrackingProperties {
     )
 
     foreach ($propertyName in @(
+        'previousRemainingPercent',
         'lastChangeAt',
         'lastAcceptedObservedAt',
         'lastUsageRatePerHour',
@@ -1393,6 +1394,11 @@ function Copy-QuotaTrackingProperties {
         if ($null -ne $property) {
             Set-QuotaStateProperty -Object $Destination -Name $propertyName -Value $property.Value
         }
+    }
+    if ($null -eq $Source.PSObject.Properties['previousRemainingPercent'] -or
+            $null -eq $Source.PSObject.Properties['previousRemainingPercent'].Value) {
+        $currentRemaining = Get-OptionalValue -Object $Destination -Name 'remainingPercent' -DefaultValue $null
+        Set-QuotaStateProperty -Object $Destination -Name 'previousRemainingPercent' -Value $currentRemaining
     }
 }
 
@@ -1422,6 +1428,8 @@ function Initialize-QuotaTracking {
         [string]$ObservedAt
     )
 
+    $currentRemaining = Get-OptionalValue -Object $Limit -Name 'remainingPercent' -DefaultValue $null
+    Set-QuotaStateProperty -Object $Limit -Name 'previousRemainingPercent' -Value $currentRemaining
     Set-QuotaStateProperty -Object $Limit -Name 'lastChangeAt' -Value $ObservedAt
     Set-QuotaStateProperty -Object $Limit -Name 'lastAcceptedObservedAt' -Value $ObservedAt
     Set-QuotaStateProperty -Object $Limit -Name 'lastUsageRatePerHour' -Value $null
@@ -1593,6 +1601,7 @@ function Invoke-QuotaNotifier {
                     continue
                 }
                 $hasIncrease = $true
+                Set-QuotaStateProperty -Object $currentLimit -Name 'previousRemainingPercent' -Value $previousRemaining
                 Set-QuotaStateProperty -Object $currentLimit -Name 'lastChangeAt' -Value $snapshot.observedAt
                 Set-QuotaStateProperty -Object $currentLimit -Name 'lastUsageRatePerHour' -Value $null
                 Set-QuotaStateProperty -Object $currentLimit -Name 'lastAccelerationPerHourSquared' -Value $null
@@ -1620,6 +1629,7 @@ function Invoke-QuotaNotifier {
                 $acceptIncreaseImmediately = $isSidebarMainTask -or $currentRemaining -ge 99.999
                 if ($acceptIncreaseImmediately) {
                     $hasIncrease = $true
+                    Set-QuotaStateProperty -Object $currentLimit -Name 'previousRemainingPercent' -Value $previousRemaining
                     Set-QuotaStateProperty -Object $currentLimit -Name 'lastChangeAt' -Value $snapshot.observedAt
                     Set-QuotaStateProperty -Object $currentLimit -Name 'lastUsageRatePerHour' -Value $null
                     Set-QuotaStateProperty -Object $currentLimit -Name 'lastAccelerationPerHourSquared' -Value $null
@@ -1682,6 +1692,7 @@ function Invoke-QuotaNotifier {
                 continue
             }
 
+            Set-QuotaStateProperty -Object $currentLimit -Name 'previousRemainingPercent' -Value $previousRemaining
             Set-QuotaStateProperty -Object $currentLimit -Name 'lastChangeAt' -Value $snapshot.observedAt
             Set-QuotaAcceptedObservation -Limit $currentLimit -ObservedAt $snapshot.observedAt
             $stateWasUpdated = $true
