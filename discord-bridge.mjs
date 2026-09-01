@@ -109,9 +109,26 @@ function trackContinuationCompletion(started, request, token) {
   activeTurns.add(tracked);
 }
 
-function restoreInboxState(state, snapshot) {
-  for (const key of Object.keys(state)) delete state[key];
-  Object.assign(state, structuredClone(snapshot));
+async function recordInboxMessageDurably(state, channelId, messageId, processed, persistState) {
+  const normalizedChannelId = String(channelId);
+  const normalizedMessageId = String(messageId);
+  const previousCursor = Object.hasOwn(state.cursors, normalizedChannelId)
+    ? String(state.cursors[normalizedChannelId])
+    : undefined;
+  const wasProcessed = state.processedMessageIds.includes(normalizedMessageId);
+  recordInboxMessage(state, normalizedChannelId, normalizedMessageId, processed);
+  try {
+    await persistState(state);
+  } catch {
+    if (String(state.cursors[normalizedChannelId] ?? '') === normalizedMessageId) {
+      if (previousCursor === undefined) delete state.cursors[normalizedChannelId];
+      else state.cursors[normalizedChannelId] = previousCursor;
+    }
+    if (!wasProcessed) {
+      state.processedMessageIds = state.processedMessageIds.filter((item) => String(item) !== normalizedMessageId);
+    }
+    throw new Error('Inbox message persistence failed');
+  }
 }
 
 export async function finalizeContinuationOutcome({
@@ -127,12 +144,9 @@ export async function finalizeContinuationOutcome({
   let durable = result?.status === 'started' || result?.status === 'queued' || result?.status === 'uncertain' ||
     !['state-persist-failed', 'encryption-unavailable'].includes(String(result?.reason ?? ''));
   if (request.source === 'reply' && durable) {
-    const snapshot = structuredClone(state);
-    recordInboxMessage(state, request.channelId, request.requestId, true);
     try {
-      await persistState(state);
+      await recordInboxMessageDurably(state, request.channelId, request.requestId, true, persistState);
     } catch {
-      restoreInboxState(state, snapshot);
       durable = false;
       result = { ...result, reason: 'state-persist-failed' };
     }
@@ -227,8 +241,7 @@ export async function pollChannel({
           return { status: 'stopped', requestId: request.requestId, reason: outcome.reason };
         }
       } else {
-        recordInboxMessage(state, channelId, String(message.id), false);
-        await persistState(state);
+        await recordInboxMessageDurably(state, channelId, String(message.id), false, persistState);
         await writeLog(`message ignored message=${mask(message.id)} channel=${mask(channelId)} reason=${accepted.reason}`);
       }
       cursor = String(state.cursors[channelId]);

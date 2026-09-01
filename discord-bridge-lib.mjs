@@ -50,6 +50,20 @@ function restoreState(state, snapshot) {
   Object.assign(state, structuredClone(snapshot));
 }
 
+function restoreContinuationClaim(state, rollback) {
+  state.pendingContinuations[rollback.queueId] = structuredClone(rollback.item);
+  const otherInteractions = state.processedInteractions.filter((item) =>
+    String(item?.requestId ?? '') !== rollback.requestId);
+  if (rollback.processedInteraction) {
+    otherInteractions.splice(
+      Math.min(rollback.processedInteractionIndex, otherInteractions.length),
+      0,
+      structuredClone(rollback.processedInteraction),
+    );
+  }
+  state.processedInteractions = otherInteractions;
+}
+
 async function withContinuationStateLock(state, operation) {
   const previous = continuationStateLocks.get(state) ?? Promise.resolve();
   let release;
@@ -454,6 +468,7 @@ export async function dispatchContinuation(request, dependencies = {}) {
   }
 
   let queuedSnapshot;
+  let claimRollback;
   let claimObservation;
   try {
     await withContinuationStateLock(state, async () => {
@@ -463,6 +478,17 @@ export async function dispatchContinuation(request, dependencies = {}) {
         return;
       }
       queuedSnapshot = structuredClone(state);
+      const processedInteractionIndex = state.processedInteractions.findIndex((item) =>
+        String(item?.requestId ?? '') === requestId);
+      claimRollback = {
+        queueId: current.queueId,
+        requestId,
+        item: structuredClone(current),
+        processedInteractionIndex,
+        processedInteraction: processedInteractionIndex >= 0
+          ? structuredClone(state.processedInteractions[processedInteractionIndex])
+          : null,
+      };
       current.status = 'attempting';
       current.lastAttemptAt = now;
       current.attempts = Number(current.attempts ?? 0) + 1;
@@ -518,7 +544,7 @@ export async function dispatchContinuation(request, dependencies = {}) {
           if (source === 'slash') recordProcessedInteraction(state, requestId, { status: 'queued', queueId: queued.queueId }, now);
         });
       } catch {
-        restoreState(state, queuedSnapshot);
+        await withContinuationStateLock(state, async () => restoreContinuationClaim(state, claimRollback));
         return { status: 'failed', queueId: existing.queueId, reason: 'state-persist-failed' };
       }
       const result = { status: 'queued', queueId: existing.queueId };

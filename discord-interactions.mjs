@@ -408,9 +408,11 @@ function continuationQueueView(items, taskIndex = null) {
   const values = Array.isArray(items) ? items : [];
   if (!values.length) return { description: '## 继续队列\n当前没有继续请求。', displayed: [] };
   const tasks = Array.isArray(taskIndex?.tasks) ? taskIndex.tasks : [];
+  const priorityStatuses = ['queued', 'attempting', 'start-uncertain', 'confirmed-start'];
+  const priorityStatusSet = new Set(priorityStatuses);
   const ordered = [
-    ...values.filter((item) => item?.status === 'queued'),
-    ...values.filter((item) => item?.status !== 'queued'),
+    ...priorityStatuses.flatMap((status) => values.filter((item) => item?.status === status)),
+    ...values.filter((item) => !priorityStatusSet.has(item?.status)),
   ];
   const candidates = ordered.slice(0, 20);
   const entryText = (item, index) => {

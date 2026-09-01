@@ -417,6 +417,58 @@ test('transient reply failure returns a stop contract and rate-limits its Bot er
   assert.equal(state.cursors[config.discordConfirmationChannelId], '777777777777777800');
 });
 
+test('finalize cursor persistence rollback preserves a concurrently confirmed Slash request', async () => {
+  const state = createEmptyInboxState();
+  state.cursors[config.discordConfirmationChannelId] = '777777777777777800';
+  const replyRequest = createContinuationRequest({
+    source: 'reply', requestId: '777777777777777801', threadId: 'root-a', text: 'A',
+    channelId: config.discordConfirmationChannelId, replyToMessageId: '777777777777777801',
+  });
+  let signalFinalizePersist;
+  const finalizePersistStarted = new Promise((resolve) => { signalFinalizePersist = resolve; });
+  let releaseFinalizePersist;
+  const finalizePersistGate = new Promise((resolve) => { releaseFinalizePersist = resolve; });
+  const finalize = finalizeContinuationOutcome({
+    result: { status: 'failed', reason: 'resume-failed' },
+    state,
+    request: replyRequest,
+    persistState: async () => {
+      signalFinalizePersist();
+      await finalizePersistGate;
+      throw new Error('cursor persistence failed');
+    },
+    sendReply: async () => {},
+  });
+  await finalizePersistStarted;
+
+  const requestB = createContinuationRequest({
+    source: 'slash', requestId: 'finalize-concurrent-b', threadId: 'root-b', text: 'B',
+  });
+  let resumeB = 0;
+  await dispatchContinuation(requestB, {
+    state,
+    encryptText: async () => 'cipher:b',
+    persistState: async () => {},
+    resumeCodexThread: async () => {
+      resumeB += 1;
+      return { turnId: 'turn-b', completion: Promise.resolve({ turn: { status: 'completed' } }) };
+    },
+  });
+  releaseFinalizePersist();
+  const outcome = await finalize;
+
+  assert.equal(outcome.durable, false);
+  const confirmedB = listContinuations(state).find((item) => item.requestId === requestB.requestId);
+  assert.equal(confirmedB.status, 'confirmed-start');
+  await dispatchContinuation(requestB, {
+    state,
+    encryptText: async () => 'cipher:b',
+    persistState: async () => {},
+    resumeCodexThread: async () => { resumeB += 1; return { turnId: 'duplicate-b' }; },
+  });
+  assert.equal(resumeB, 1);
+});
+
 test('Discord REST requests always send the required Bot user agent', async () => {
   let observedHeaders;
   const result = await discordRequest({
@@ -1036,6 +1088,61 @@ test('active-writer queue persistence failure restores a retryable queue for the
   const recovered = await dispatchContinuation(listContinuations(state)[0], dependencies);
   assert.equal(recovered.status, 'started');
   assert.equal(recovered.turnId, 'turn-recovered');
+});
+
+test('active-writer rollback for request A preserves concurrently confirmed request B', async () => {
+  const state = createEmptyInboxState();
+  const requestA = enqueueContinuation(state, {
+    ...createContinuationRequest({ source: 'slash', requestId: 'active-a', threadId: 'root-a', text: 'A' }),
+    encryptedText: 'cipher:a',
+  });
+  const requestB = enqueueContinuation(state, {
+    ...createContinuationRequest({ source: 'slash', requestId: 'active-b', threadId: 'root-b', text: 'B' }),
+    encryptedText: 'cipher:b',
+  });
+  let signalAResume;
+  const aResumeStarted = new Promise((resolve) => { signalAResume = resolve; });
+  let rejectAResume;
+  const aResume = new Promise((_resolve, reject) => { rejectAResume = reject; });
+  let resumeB = 0;
+
+  const dispatchA = dispatchContinuation(requestA, {
+    state,
+    decryptText: async () => 'A',
+    persistState: async () => {
+      if (state.pendingContinuations[requestA.queueId]?.status === 'queued') {
+        throw new Error('A downgrade persistence failed');
+      }
+    },
+    resumeCodexThread: async () => { signalAResume(); return aResume; },
+  });
+  await aResumeStarted;
+  await dispatchContinuation(requestB, {
+    state,
+    decryptText: async () => 'B',
+    persistState: async () => {},
+    resumeCodexThread: async () => {
+      resumeB += 1;
+      return { turnId: 'turn-b', completion: Promise.resolve({ turn: { status: 'completed' } }) };
+    },
+  });
+  rejectAResume(new Error('thread already has an active writer'));
+  const resultA = await dispatchA;
+
+  assert.equal(resultA.reason, 'state-persist-failed');
+  assert.equal(state.pendingContinuations[requestA.queueId].status, 'queued');
+  assert.equal(state.pendingContinuations[requestB.queueId].status, 'confirmed-start');
+
+  await dispatchContinuation(requestB, {
+    state,
+    decryptText: async () => 'B',
+    persistState: async () => {},
+    resumeCodexThread: async () => {
+      resumeB += 1;
+      return { turnId: 'duplicate-b' };
+    },
+  });
+  assert.equal(resumeB, 1);
 });
 
 test('persisted cancellation rolls back both queue and processed interaction on failure', async () => {

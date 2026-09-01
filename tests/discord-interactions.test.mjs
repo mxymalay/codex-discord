@@ -900,6 +900,43 @@ test('queue body and cancel buttons use the same queued-first displayed collecti
   assert.match(description, /另有 3 项未显示/);
 });
 
+test('continue queue truncation prioritizes every active and uncertain state over terminal history', async () => {
+  const queue = [
+    ...Array.from({ length: 20 }, (_, index) => ({
+      queueId: `terminal-${String(index).padStart(8, '0')}`, source: 'slash', threadId: 'root-1',
+      summary: `terminal ${index}`, status: 'delivered', createdAt: '2026-09-01T00:00:00Z',
+    })),
+    {
+      queueId: 'risk-uncertain99', source: 'reply', threadId: 'root-1', summary: 'uncertain',
+      status: 'start-uncertain', createdAt: '2026-09-01T01:00:00Z',
+    },
+    {
+      queueId: 'live-attempting88', source: 'slash', threadId: 'root-1', summary: 'attempting',
+      status: 'attempting', createdAt: '2026-09-01T01:01:00Z',
+    },
+    {
+      queueId: 'live-queued7777', source: 'slash', threadId: 'root-1', summary: 'queued',
+      status: 'queued', createdAt: '2026-09-01T01:02:00Z',
+    },
+  ];
+  const uiState = new Map();
+  const { dependencies, responses } = makeDependencies({ uiState, getQueue: () => queue });
+
+  await createInteractionRouter(dependencies).handle(commandInteraction('继续队列'));
+
+  const payload = responses[0].data;
+  const description = payload.embeds[0].description;
+  assert.equal(description.includes('risk-uncertain99'.slice(-8)), true);
+  assert.match(description, /启动结果不确定/);
+  assert.equal(description.includes('live-attempting88'.slice(-8)), true);
+  assert.match(description, /正在尝试/);
+  assert.equal(description.includes('live-queued7777'.slice(-8)), true);
+  assert.match(description, /另有 3 项未显示/);
+  const cancelStates = [...uiState.values()].filter((state) => state.kind === 'cancel-continuation');
+  assert.deepEqual(cancelStates.map((state) => state.queueId), ['live-queued7777']);
+  assert.equal(description.includes(cancelStates[0].queueId.slice(-8)), true);
+});
+
 test('continuation queue renderer labels reply sources and omits full unsafe text', () => {
   const rendered = renderContinuationQueue([{
     queueId: 'queue-0000feedface', source: 'reply', threadId: 'root-9', projectName: 'POS', taskName: '支付',
