@@ -898,6 +898,11 @@ export function createProductionBridgeDependencies({
   startContinuationImpl = startContinuation,
   sendDiscordReplyImpl = sendDiscordReply,
   persistInboxStateImpl = saveState,
+  readRolloutWatcherStateImpl = readRolloutWatcherState,
+  initializeRolloutWatcherStateImpl = initializeRolloutWatcherState,
+  writeRolloutWatcherStateImpl = writeRolloutWatcherState,
+  pollRolloutCompletionsImpl = pollRolloutCompletions,
+  logImpl = log,
 } = {}) {
   let taskIndexCommitTail = Promise.resolve();
   const enqueueTaskIndexOperation = (operation) => {
@@ -1164,7 +1169,7 @@ export function createProductionBridgeDependencies({
       const state = context.inboxState;
       const trackedReply = (payload) => context.trackDiscordRest(() => sendDiscordReply({ token, ...payload }));
       const channelIds = [String(config.discordTaskChannelId), String(config.discordConfirmationChannelId)];
-      const rolloutState = await readRolloutWatcherState(rolloutWatcherStatePath, { sessionsRoot });
+      const rolloutState = await readRolloutWatcherStateImpl(rolloutWatcherStatePath, { sessionsRoot });
       context.rolloutState = rolloutState;
       if (!context.inboxReadOnly) {
         await initializeInboxCursors({
@@ -1174,10 +1179,10 @@ export function createProductionBridgeDependencies({
         });
         await commitInboxState({ state, persistState: persistInboxStateImpl });
       }
-      await initializeRolloutWatcherState({ sessionsRoot, state: rolloutState });
-      await writeRolloutWatcherState(rolloutWatcherStatePath, rolloutState);
-      await log('bridge-started');
-      await log('completion-watcher-started');
+      await initializeRolloutWatcherStateImpl({ sessionsRoot, state: rolloutState, inboxState: state });
+      await writeRolloutWatcherStateImpl(rolloutWatcherStatePath, rolloutState);
+      await logImpl('bridge-started');
+      await logImpl('completion-watcher-started');
 
       let stopping = false;
       let wake = null;
@@ -1203,7 +1208,7 @@ export function createProductionBridgeDependencies({
                 await log('origin-progress-failed');
               }
             }
-            await pollRolloutCompletions({
+            await pollRolloutCompletionsImpl({
               sessionsRoot,
               state: rolloutState,
               inboxState: context.inboxReadOnly ? undefined : state,
@@ -1223,10 +1228,10 @@ export function createProductionBridgeDependencies({
             }
           } catch {
               context.setLatestErrorCategory('rollout-poll-failed');
-            await log('rollout-poll-failed');
+            await logImpl('rollout-poll-failed');
           } finally {
-            await writeRolloutWatcherState(rolloutWatcherStatePath, rolloutState).catch(async () => {
-              await log('rollout-state-save-failed');
+            await writeRolloutWatcherStateImpl(rolloutWatcherStatePath, rolloutState).catch(async () => {
+              await logImpl('rollout-state-save-failed');
             });
           }
           if (!context.inboxReadOnly) {

@@ -6,6 +6,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import {
   advanceDiscordTurnOrigin,
   enrichDiscordOriginNotification,
+  prepareDiscordOriginProgressDelivery,
   prepareDiscordOriginTerminalDelivery,
   resolveDiscordOrigin,
 } from './discord-bridge-lib.mjs';
@@ -159,16 +160,16 @@ function sanitizeProgressText(value) {
   const suspicious = [
     /```|`/u,
     /https?:\/\/|\[[^\]\r\n]+\]\([^\r\n)]+\)|<https?:/iu,
-    /(?:^|[\s"'`(])[A-Za-z]:[\\/]/mu,
+    /[A-Za-z]:[\\/]/u,
     /\\\\[^\s\\]+\\/u,
-    /(?:^|[\s"'`(])\/(?!\/)[^\s]/mu,
+    /\/(?!\/)[A-Za-z0-9._~-]/u,
     /\b(?:authorization|bearer|api[_ -]?key|access[_ -]?token|password|passwd|secret)\b/iu,
     /--(?:password|passwd|token|secret|api[-_]?key)\b/iu,
     /\bAKIA[A-Z0-9]{16}\b/u,
     /\b(?:gh[pousr]_[A-Za-z0-9]{16,}|xox[baprs]-[A-Za-z0-9-]{10,})\b/iu,
     /\b[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{20,}\b/u,
-    /(?:^|\n)\s*(?:curl|wget|node|python|git|npm|pnpm|yarn|pwsh|powershell|cmd|bash|sh|rm|cp|mv|Get-[A-Za-z]+)\b/imu,
-    /(?:^|\n)\s*(?:const|let|var|function|class|import|export|def)\b|=>|\bprocess\.env\b/imu,
+    /\b(?:curl|wget|node|python|git|npm|pnpm|yarn|pwsh|powershell|cmd|bash|sh|rm|cp|mv|Get-[A-Za-z]+)\b/iu,
+    /\b(?:const|let|var|function|class|import|export|def)\b|=>|\bprocess\.env\b/iu,
   ];
   if (suspicious.some((pattern) => pattern.test(text))) {
     return '正在处理任务（详细进度包含本机或敏感内容，已隐藏）。';
@@ -314,10 +315,40 @@ async function pollDiscordOriginEventsUnlocked({ sessionsRoot, inboxState, persi
       const rollout = await exactOriginRollout(sessionsRoot, origin);
       if (!rollout || (origin.rolloutFingerprint && origin.rolloutFingerprint !== rollout.fingerprint) ||
           Number(origin.rolloutCursor ?? 0) > rollout.bytes.length) continue;
+      const pendingDispatch = storedOrigin.progressDispatch;
+      if (pendingDispatch) {
+        if (pendingDispatch.rolloutFingerprint !== rollout.fingerprint || pendingDispatch.end > rollout.parsed.completeEnd) continue;
+        const boundedEntries = rollout.parsed.entries.filter((item) => item.end <= pendingDispatch.end);
+        const pendingEvent = extractOriginProgress(boundedEntries, origin, rollout.fingerprint)
+          .find((event) => event.eventId === pendingDispatch.eventId && event.end === pendingDispatch.end);
+        if (!pendingEvent) continue;
+        const response = await dispatchMessage({
+          channelId: storedOrigin.channelId,
+          content: pendingEvent.content,
+          kind: pendingEvent.kind,
+          nonce: pendingDispatch.nonce,
+          enforceNonce: true,
+        });
+        await advanceDiscordTurnOrigin({
+          state: inboxState, persistState: persistInboxState, turnId,
+          rolloutCursor: pendingDispatch.end, eventId: pendingDispatch.eventId,
+          lastMessageId: response?.id, rolloutFingerprint: rollout.fingerprint,
+        });
+        continue;
+      }
       const events = extractOriginProgress(rollout.parsed.entries, origin, rollout.fingerprint);
       for (const event of events) {
         const current = inboxState.discordTurnOrigins[turnId];
         if (current.deliveredEventIds.includes(event.eventId)) continue;
+        await prepareDiscordOriginProgressDelivery({
+          state: inboxState,
+          persistState: persistInboxState,
+          turnId,
+          dispatch: {
+            eventId: event.eventId, nonce: event.nonce, start: event.start, end: event.end,
+            kind: event.kind, rolloutFingerprint: rollout.fingerprint,
+          },
+        });
         const response = await dispatchMessage({
           channelId: current.channelId,
           content: event.content,

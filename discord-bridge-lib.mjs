@@ -139,6 +139,16 @@ function validCreationOriginIntent(value) {
     isOptionalString(value.projectName) && Number.isFinite(Date.parse(value.createdAt));
 }
 
+function validProgressDispatch(value) {
+  if (value === undefined) return true;
+  const allowed = new Set(['eventId', 'nonce', 'start', 'end', 'kind', 'rolloutFingerprint']);
+  return isRecord(value) && hasOnlyKeys(value, allowed) && /^[a-f0-9]{64}$/u.test(value.eventId) &&
+    /^\d{1,25}$/u.test(value.nonce) && Number.isInteger(value.start) && value.start >= 0 &&
+    Number.isInteger(value.end) && value.end > value.start &&
+    ['started', 'commentary', 'tool-start', 'tool-complete', 'tool-failed'].includes(value.kind) &&
+    /^[a-f0-9]{64}$/u.test(value.rolloutFingerprint);
+}
+
 function validTaskCreationRecord(value) {
   if (!isRecord(value)) return false;
   const allowed = new Set([
@@ -165,6 +175,7 @@ function validDiscordTurnOrigin(_turnId, value) {
     'rolloutCursor', 'deliveredEventIds', 'deliveryState', 'deliveredAt', 'lastMessageId',
     'rolloutFingerprint',
     'terminalEventId',
+    'progressDispatch',
   ]);
   return hasOnlyKeys(value, allowed) && isNonEmptyString(value.threadId) &&
     /^\d{17,20}$/u.test(String(value.guildId ?? '')) && /^\d{17,20}$/u.test(String(value.channelId ?? '')) &&
@@ -176,7 +187,7 @@ function validDiscordTurnOrigin(_turnId, value) {
     Array.isArray(value.deliveredEventIds) && value.deliveredEventIds.length <= MAX_ORIGIN_EVENT_IDS &&
     value.deliveredEventIds.every(isNonEmptyString) &&
     DISCORD_ORIGIN_DELIVERY_STATES.has(String(value.deliveryState ?? '')) &&
-    isOptionalTimestamp(value.deliveredAt);
+    isOptionalTimestamp(value.deliveredAt) && validProgressDispatch(value.progressDispatch);
 }
 
 function validLegacyPendingReply(key, value) {
@@ -653,6 +664,27 @@ export async function prepareDiscordOriginTerminalDelivery({ state, persistState
   });
 }
 
+export async function prepareDiscordOriginProgressDelivery({ state, persistState, turnId, dispatch }) {
+  const key = String(turnId ?? '').trim();
+  if (!key || !state?.discordTurnOrigins?.[key] || !validProgressDispatch(dispatch)) {
+    throw new Error('Discord progress delivery intent is invalid');
+  }
+  return commitInboxState({
+    state,
+    persistState,
+    entries: { discordTurnOrigins: [key] },
+    mutate: () => {
+      const current = state.discordTurnOrigins[key];
+      if (current.progressDispatch && current.progressDispatch.eventId !== dispatch.eventId) {
+        throw new Error('Discord progress delivery intent conflicts');
+      }
+      current.progressDispatch ??= structuredClone(dispatch);
+      return structuredClone(current.progressDispatch);
+    },
+    errorMessage: 'Discord progress delivery intent persistence failed',
+  });
+}
+
 /** Advance a durable rollout cursor only after its corresponding Discord send succeeds. */
 export async function advanceDiscordTurnOrigin({
   state,
@@ -677,6 +709,7 @@ export async function advanceDiscordTurnOrigin({
         current.deliveredEventIds.push(String(eventId));
         current.deliveredEventIds = current.deliveredEventIds.slice(-MAX_ORIGIN_EVENT_IDS);
       }
+      if (current.progressDispatch?.eventId === String(eventId ?? '').trim()) delete current.progressDispatch;
       if (String(lastMessageId ?? '').trim()) current.lastMessageId = String(lastMessageId);
       if (String(rolloutFingerprint ?? '').trim()) {
         const fingerprint = String(rolloutFingerprint).trim().toLocaleLowerCase();

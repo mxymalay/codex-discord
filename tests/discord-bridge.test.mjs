@@ -144,6 +144,39 @@ test('production interaction wiring refreshes the shared index and uses only bou
   }
 });
 
+test('production legacy watcher initialization receives the validated inbox origins', async () => {
+  const inboxState = createEmptyInboxState();
+  inboxState.discordTurnOrigins['turn-existing-complete'] = {
+    threadId: 'thread-existing-complete', guildId: '222222222222222222', channelId: '777777777777777777',
+    source: 'new-task', createdAt: '2026-09-01T00:00:00.000Z', rolloutCursor: 0,
+    deliveredEventIds: [], deliveryState: 'pending',
+  };
+  const rolloutState = { version: 2, initialized: false, files: {}, pending: {} };
+  let initializedWith = null;
+  const production = bridgeModule.createProductionBridgeDependencies({
+    runOnce: true,
+    readRolloutWatcherStateImpl: async () => rolloutState,
+    initializeRolloutWatcherStateImpl: async (options) => {
+      initializedWith = options.inboxState;
+      options.state.initialized = true;
+      options.state.pending['turn-existing-complete'] = { threadId: 'thread-existing-complete' };
+    },
+    writeRolloutWatcherStateImpl: async () => {},
+    pollRolloutCompletionsImpl: async () => {},
+    logImpl: async () => {},
+  });
+  const context = {
+    config, token: 'test-token', inboxState, inboxReadOnly: true,
+    trackDiscordRest: (operation) => operation(), executables: { powershellPath: 'pwsh.exe' },
+    setLatestErrorCategory: () => {}, recordActivity: () => {}, timestamps: {},
+  };
+  const pollers = await production.startLegacyPollers(context);
+  await pollers.completion;
+
+  assert.strictEqual(initializedWith, inboxState);
+  assert.equal(context.rolloutState.pending['turn-existing-complete'].threadId, 'thread-existing-complete');
+});
+
 test('production takeover retry reloads only the exact queued record through tracked resources and replies', async () => {
   let interactionDependencies;
   const starts = [];

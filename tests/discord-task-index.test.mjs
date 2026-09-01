@@ -466,6 +466,30 @@ test('an unchanged historic null project is re-inferred from the latest ygf cata
   }
 });
 
+test('an unchanged stale explicit project is re-inferred to the current longest saved root', async () => {
+  const paths = await fixture();
+  const threadId = '019cdef0-4321-7890-abcd-1234567890ad';
+  const rolloutPath = paths.rollout(`2026-09-01T00-00-00-${threadId}`);
+  try {
+    await writeJsonl(paths.sessionIndexPath, [{ id: threadId, thread_name: '迁移项目任务' }]);
+    await writeJsonl(rolloutPath, [meta(threadId, { cwd: 'C:\\work\\current\\nested\\app' })]);
+    const size = (await fs.stat(rolloutPath)).size;
+    const index = await buildTaskIndex({
+      ...paths,
+      previousIndex: { version: 1, generatedAt: null, tasks: [{
+        threadId, projectId: 'deleted-project', projectName: 'Deleted', taskName: '旧任务', status: 'completed',
+        rolloutPath, offset: size, worktreePath: null, worktreeBranch: null,
+      }] },
+      projects: [
+        { id: 'broad', name: 'Broad', roots: ['C:\\work\\current'] },
+        { id: 'nested', name: 'Nested', roots: ['C:\\work\\current\\nested'] },
+      ],
+    });
+    assert.equal(index.tasks[0].projectId, 'nested');
+    assert.equal(index.tasks[0].projectName, 'Nested');
+  } finally { await fs.rm(paths.root, { recursive: true, force: true }); }
+});
+
 test('streams sidebar lines and skips standard-filename rollouts absent from the current sidebar before body reads', async () => {
   const paths = await fixture();
   const sidebarId = '019cdef0-aaaa-7890-abcd-1234567890ab';

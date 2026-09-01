@@ -540,8 +540,10 @@ export async function buildTaskIndex({
         if (!sidebarEntry && !createdRecord) continue;
         previous = previousById.get(key) ?? (identityKey(previous?.threadId) === key ? previous : undefined);
       }
-      const hasStableProjectProvenance = previous?.projectId != null || previous?.projectName != null ||
-        createdRecord?.projectId != null || createdRecord?.projectName != null || projects.length === 0;
+      const stableProject = (record) => (record?.projectId == null && record?.projectName === '无项目') ||
+        projects.some((project) => (record?.projectId != null && String(project?.id ?? '') === String(record.projectId)) ||
+          (record?.projectId == null && record?.projectName != null && String(project?.name ?? '') === String(record.projectName)));
+      const hasStableProjectProvenance = projects.length === 0 || stableProject(previous) || stableProject(createdRecord);
       if (previous && sidebarEntry && hasStableProjectProvenance &&
           path.resolve(String(previous.rolloutPath ?? '')) === path.resolve(rolloutPath) && Number(previous.offset) === offset) {
         recordsById.set(key, refreshedPreviousRecord(previous, sidebarEntry, mappings.get(key)));

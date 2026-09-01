@@ -640,7 +640,7 @@ function Test-DiscordTurnOriginRecord {
     $allowed = @(
         'threadId', 'guildId', 'channelId', 'source', 'createdAt', 'projectId', 'projectName',
         'rolloutCursor', 'deliveredEventIds', 'deliveryState', 'deliveredAt', 'lastMessageId',
-        'rolloutFingerprint', 'terminalEventId'
+        'rolloutFingerprint', 'terminalEventId', 'progressDispatch'
     )
     $required = @(
         'threadId', 'guildId', 'channelId', 'source', 'createdAt',
@@ -679,6 +679,21 @@ function Test-DiscordTurnOriginRecord {
     $deliveredAt = $Value.PSObject.Properties | Where-Object { $_.Name -ceq 'deliveredAt' } | Select-Object -First 1
     if ($null -ne $deliveredAt -and -not (Test-JsonTimestamp -Value $deliveredAt.Value)) {
         return $false
+    }
+    $progress = $Value.PSObject.Properties | Where-Object { $_.Name -ceq 'progressDispatch' } | Select-Object -First 1
+    if ($null -ne $progress) {
+        $dispatch = $progress.Value
+        if (-not (Test-JsonObjectProperties -Value $dispatch `
+            -Allowed @('eventId', 'nonce', 'start', 'end', 'kind', 'rolloutFingerprint') `
+            -Required @('eventId', 'nonce', 'start', 'end', 'kind', 'rolloutFingerprint')) -or
+            $dispatch.eventId -isnot [string] -or $dispatch.eventId -cnotmatch '\A[a-f0-9]{64}\z' -or
+            $dispatch.nonce -isnot [string] -or $dispatch.nonce -cnotmatch '\A[0-9]{1,25}\z' -or
+            -not (Test-IsIntegralJsonNumber -Value $dispatch.start) -or [int64]$dispatch.start -lt 0 -or
+            -not (Test-IsIntegralJsonNumber -Value $dispatch.end) -or [int64]$dispatch.end -le [int64]$dispatch.start -or
+            $dispatch.kind -isnot [string] -or $dispatch.kind -cnotin @('started', 'commentary', 'tool-start', 'tool-complete', 'tool-failed') -or
+            $dispatch.rolloutFingerprint -isnot [string] -or $dispatch.rolloutFingerprint -cnotmatch '\A[a-f0-9]{64}\z') {
+            return $false
+        }
     }
     return $true
 }

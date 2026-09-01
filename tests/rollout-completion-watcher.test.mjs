@@ -319,6 +319,9 @@ test('suspicious commentary is default-denied to one fixed coarse progress messa
     'AKIAABCDEFGHIJKLMNOP', 'ghp_abcdefghijklmnopqrstuvwxyz123456', 'xoxb-1234567890-secretvalue',
     '[点此](https://private.example/path)', '```js\nconst secret = 1;', 'const secret = process.env.KEY;',
     'powershell -File tool.ps1 -Token private-value',
+    '源码 const total = 1;', '正在运行 npm test -- --runInBand',
+    '路径：C:/Users/Jane Doe/notes.txt', '路径 [C:\\Users\\Jane Doe\\notes.txt]',
+    '路径：/home/alice/private notes.txt',
   ];
   for (const [index, sample] of samples.entries()) {
     const paths = await fixture();
@@ -382,7 +385,7 @@ test('failed source-channel send advances only through prior successes and retri
   }
 });
 
-test('a sent commentary keeps its nonce when state commit fails and a later commentary is appended', async () => {
+test('a durable progress intent preserves A and later sends B after A state commit fails', async () => {
   const paths = await fixture();
   const state = createEmptyInboxState();
   state.discordTurnOrigins[turnId] = {
@@ -390,6 +393,7 @@ test('a sent commentary keeps its nonce when state commit fails and a later comm
     createdAt: '2026-09-01T00:00:01.000Z', rolloutCursor: 0, deliveredEventIds: [], deliveryState: 'pending',
   };
   const calls = [];
+  const discordMessages = new Map();
   let failCommentaryCommit = true;
   try {
     await fs.writeFile(paths.rolloutPath, [sessionMeta(), taskStarted(), {
@@ -403,22 +407,29 @@ test('a sent commentary keeps its nonce when state commit fails and a later comm
     };
     const dispatchMessage = async (message) => {
       calls.push(structuredClone(message));
-      return { id: `message-${calls.length}` };
+      if (!discordMessages.has(message.nonce)) discordMessages.set(message.nonce, structuredClone(message));
+      return { id: `message-${message.nonce}` };
     };
     await assert.rejects(() => pollDiscordOriginEvents({
       sessionsRoot: paths.sessionsRoot, inboxState: state, persistInboxState, dispatchMessage,
     }), /progress persistence failed/u);
-    const firstAttempt = calls.find((item) => item.kind === 'commentary');
-
     await fs.appendFile(paths.rolloutPath, jsonLine({
       type: 'event_msg', payload: { type: 'agent_message', phase: 'commentary', message: '第二段安全进度' },
     }), 'utf8');
     await pollDiscordOriginEvents({ sessionsRoot: paths.sessionsRoot, inboxState: state, persistInboxState, dispatchMessage });
+    await pollDiscordOriginEvents({ sessionsRoot: paths.sessionsRoot, inboxState: state, persistInboxState, dispatchMessage });
     const attempts = calls.filter((item) => item.kind === 'commentary');
-    assert.equal(attempts.length, 2);
-    assert.equal(attempts[1].nonce, firstAttempt.nonce);
-    assert.equal(attempts[1].enforceNonce, true);
-    assert.match(attempts[1].content, /第二段安全进度/u);
+    assert.equal(attempts.length, 3);
+    assert.equal(attempts[1].nonce, attempts[0].nonce);
+    assert.notEqual(attempts[2].nonce, attempts[0].nonce);
+    assert.equal(attempts.every((item) => item.enforceNonce === true), true);
+    const uniqueCommentary = [...discordMessages.values()].filter((item) => item.kind === 'commentary');
+    assert.equal(uniqueCommentary.length, 2);
+    assert.match(uniqueCommentary[0].content, /第一段安全进度/u);
+    assert.doesNotMatch(uniqueCommentary[0].content, /第二段安全进度/u);
+    assert.match(uniqueCommentary[1].content, /第二段安全进度/u);
+    assert.equal(state.discordTurnOrigins[turnId].rolloutCursor, (await fs.stat(paths.rolloutPath)).size);
+    assert.equal(state.discordTurnOrigins[turnId].progressDispatch, undefined);
   } finally {
     await fs.rm(paths.root, { recursive: true, force: true });
   }
