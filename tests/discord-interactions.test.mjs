@@ -427,6 +427,50 @@ test('callback retry budget includes slow retry_after response parsing', async (
   assert.deepEqual(sleeps, []);
 });
 
+test('callback rejects a successful JSON response completed beyond the elapsed budget', async () => {
+  let clock = 0;
+  let timerCleared = false;
+  const client = createInteractionRestClient({
+    applicationId: '111',
+    now: () => clock,
+    callbackRetry: { maxElapsedMs: 100 },
+    setTimeoutImpl: () => 'blocked-timer',
+    clearTimeoutImpl: (timer) => { assert.equal(timer, 'blocked-timer'); timerCleared = true; },
+    fetchImpl: async () => ({
+      ok: true,
+      status: 200,
+      headers: new Headers(),
+      async json() {
+        clock = 101;
+        return { token: 'success-parse-secret' };
+      },
+    }),
+  });
+
+  await assert.rejects(
+    () => client.callback({ id: '1', token: 'success-parse-secret' }, { type: 5, data: {} }),
+    (error) => error.message === 'Discord interaction request failed: timeout'
+      && !error.message.includes('success-parse-secret'),
+  );
+  assert.equal(timerCleared, true);
+});
+
+test('a zero elapsed budget still accepts an immediate synchronous success', async () => {
+  const client = createInteractionRestClient({
+    applicationId: '111',
+    now: () => 0,
+    callbackRetry: { maxElapsedMs: 0 },
+    setTimeoutImpl: () => 'blocked-timer',
+    clearTimeoutImpl: () => {},
+    fetchImpl: async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
+  });
+
+  assert.deepEqual(
+    await client.callback({ id: '1', token: 'zero-success' }, { type: 5, data: {} }),
+    { ok: true },
+  );
+});
+
 test('callback rechecks elapsed time after an oversleep before sending a retry', async () => {
   let clock = 0;
   let calls = 0;

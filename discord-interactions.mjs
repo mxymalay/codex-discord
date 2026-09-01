@@ -147,6 +147,9 @@ async function discordRequest(fetchImpl, url, method, body, {
       setTimeoutImpl,
       clearTimeoutImpl,
     });
+    if (Math.max(0, Number(now()) - startedAt) > policy.maxElapsedMs) {
+      throw new Error('Discord interaction request failed: timeout');
+    }
     const status = Number(result.response?.status);
     if (status === 429 && attempt < policy.maxAttempts) {
       const delay = result.retryAfterMs;
