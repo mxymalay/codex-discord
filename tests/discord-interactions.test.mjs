@@ -3,6 +3,13 @@ import test from 'node:test';
 
 import { COMMAND_NAMES } from '../discord-commands-lib.mjs';
 import {
+  cancelContinuationPersisted,
+  createContinuationRequest,
+  createEmptyInboxState,
+  enqueueContinuation,
+  listContinuations,
+} from '../discord-bridge-lib.mjs';
+import {
   createInteractionRestClient,
   createInteractionRouter,
   paginateMarkdown,
@@ -762,12 +769,12 @@ test('continue queue renders safe summaries and atomically cancels then refreshe
   const events = [];
   const { dependencies, responses } = makeDependencies({
     getQueue: () => queue,
-    cancelContinuation: (_queueId, now) => {
+    cancelContinuationPersisted: async (_queueId, now) => {
       events.push(`cancel:${now}`);
       queue[0].status = 'cancelled';
+      events.push('persist');
       return { status: 'cancelled' };
     },
-    persistContinuationState: async () => { events.push('persist'); },
   });
   const router = createInteractionRouter(dependencies);
 
@@ -791,6 +798,87 @@ test('continue queue renders safe summaries and atomically cancels then refreshe
   assert.equal(refreshed.data.components.length, 0);
 });
 
+test('cancel refuses to mutate through the legacy split update path', async () => {
+  const queue = [{
+    queueId: 'queue-unsafe-cancel', source: 'slash', threadId: 'root-1',
+    summary: 'cancel me', status: 'queued', createdAt: '2026-09-01T00:00:00.000Z',
+  }];
+  let mutated = false;
+  const { dependencies, responses } = makeDependencies({
+    getQueue: () => queue,
+    cancelContinuationPersisted: undefined,
+    cancelContinuation: () => { mutated = true; queue[0].status = 'cancelled'; return { status: 'cancelled' }; },
+    persistContinuationState: async () => {},
+  });
+  const router = createInteractionRouter(dependencies);
+  await router.handle(commandInteraction('继续队列'));
+  const cancelId = responses.shift().data.components[0].components[0].custom_id;
+
+  await router.handle(componentInteraction(cancelId));
+
+  assert.equal(mutated, false);
+  assert.equal(queue[0].status, 'queued');
+  const error = responses.shift();
+  assert.equal(error.type, 4);
+  assert.match(error.data.content, /取消失败|稍后重试/);
+});
+
+test('cancel persistence failure restores state and returns only a sanitized ephemeral error', async () => {
+  const continuationState = createEmptyInboxState();
+  enqueueContinuation(continuationState, {
+    ...createContinuationRequest({ source: 'slash', requestId: 'cancel-error', threadId: 'root-1', text: 'cancel me' }),
+    encryptedText: 'opaque-ciphertext',
+  });
+  const before = structuredClone(continuationState);
+  const { dependencies, responses } = makeDependencies({
+    continuationState,
+    getQueue: () => listContinuations(continuationState),
+    cancelContinuationPersisted: (queueId, now) => cancelContinuationPersisted({
+      state: continuationState,
+      queueId,
+      now,
+      persistState: async () => { throw new Error('C:\\private-user\\discord-inbox-state.json'); },
+    }),
+  });
+  const router = createInteractionRouter(dependencies);
+  await router.handle(commandInteraction('继续队列'));
+  const cancelId = responses.shift().data.components[0].components[0].custom_id;
+
+  await router.handle(componentInteraction(cancelId));
+
+  assert.deepEqual(continuationState, before);
+  const error = responses.shift();
+  assert.equal(error.type, 4);
+  assert.equal(error.data.flags & 64, 64);
+  assert.match(error.data.content, /取消失败|稍后重试/);
+  assert.equal(error.data.content.includes('private-user'), false);
+  assert.equal(error.data.content.includes('discord-inbox-state'), false);
+});
+
+test('queue body and cancel buttons use the same queued-first displayed collection', async () => {
+  const queue = [
+    ...Array.from({ length: 20 }, (_, index) => ({
+      queueId: `terminal-${String(index).padStart(8, '0')}`, source: 'slash', threadId: 'root-1',
+      summary: `terminal ${index}`, status: 'delivered', createdAt: '2026-09-01T00:00:00Z',
+    })),
+    ...Array.from({ length: 3 }, (_, index) => ({
+      queueId: `queued-${String(index).padStart(8, '0')}`, source: 'slash', threadId: 'root-1',
+      summary: `queued ${index}`, status: 'queued', createdAt: '2026-09-01T01:00:00Z',
+    })),
+  ];
+  const uiState = new Map();
+  const { dependencies, responses } = makeDependencies({ uiState, getQueue: () => queue });
+
+  await createInteractionRouter(dependencies).handle(commandInteraction('继续队列'));
+
+  const payload = responses[0].data;
+  const description = payload.embeds[0].description;
+  const cancelStates = [...uiState.values()].filter((state) => state.kind === 'cancel-continuation');
+  assert.equal(cancelStates.length, 3);
+  for (const state of cancelStates) assert.equal(description.includes(state.queueId.slice(-8)), true);
+  assert.match(description, /另有 3 项未显示/);
+});
+
 test('continuation queue renderer labels reply sources and omits full unsafe text', () => {
   const rendered = renderContinuationQueue([{
     queueId: 'queue-0000feedface', source: 'reply', threadId: 'root-9', projectName: 'POS', taskName: '支付',
@@ -800,6 +888,14 @@ test('continuation queue renderer labels reply sources and omits full unsafe tex
   assert.match(rendered, /feedface/);
   assert.equal(rendered.includes('# heading'), false);
   assert.equal(rendered.length < 1_000, true);
+});
+
+test('continuation queue renderer does not mark a short summary as truncated', () => {
+  const rendered = renderContinuationQueue([{
+    queueId: 'queue-short123', source: 'slash', threadId: 'root-1', summary: '短摘要', status: 'queued',
+  }]);
+  assert.match(rendered, /内容：短摘要\n/);
+  assert.equal(rendered.includes('短摘…'), false);
 });
 
 test('continuation queue renderer stays within the Discord embed description limit', () => {
@@ -998,6 +1094,35 @@ test('detail pagination buttons use random state and reject random, expired, and
   dependencies.now = () => NOW + 15 * 60_000;
   await router.handle(componentInteraction(nextId));
   assert.match(responses.shift().data.content, /过期/);
+});
+
+test('task detail continue button is protected and opens the shared continuation modal route', async () => {
+  const uiState = new Map();
+  const requests = [];
+  const { dependencies, responses, edits } = makeDependencies({
+    uiState,
+    dispatchContinuation: async (request) => { requests.push(request); return { status: 'started', turnId: 'turn-detail' }; },
+  });
+  const router = createInteractionRouter(dependencies);
+  await router.handle(commandInteraction('任务详情', { 任务: 'root-1' }));
+  assert.equal(responses.shift().type, 5);
+  const detail = edits.shift();
+  const continueButton = detail.components.flatMap((row) => row.components).find((button) => button.label === '继续任务');
+  assert.ok(continueButton);
+  const buttonStateId = continueButton.custom_id.split(':')[1];
+  assert.deepEqual(Object.keys(uiState.get(buttonStateId)).sort(), ['expiresAt', 'guildId', 'kind', 'threadId', 'userId']);
+
+  await router.handle(componentInteraction(continueButton.custom_id, { userId: '444' }));
+  assert.match(responses.shift().data.content, /不属于|无权/);
+
+  await router.handle(componentInteraction(continueButton.custom_id));
+  const modal = responses.shift();
+  assert.equal(modal.type, 9);
+  assert.match(modal.data.custom_id, /^continue:[A-Za-z0-9_-]{16}$/u);
+  await router.handle(modalSubmit(modal.data.custom_id, '从详情继续', { fieldId: '继续内容', id: 'detail-continue-submit' }));
+  assert.equal(responses.shift().type, 5);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].threadId, 'root-1');
 });
 
 test('sweep removes UI state at the exact fifteen-minute boundary', async () => {

@@ -18,6 +18,7 @@ import {
   migrateInboxState,
   readJsonFile,
   recordInboxMessage,
+  recoverContinuationAttempts,
   resolveCodexExecutable,
   resolvePowerShellExecutable,
   sendDiscordReply,
@@ -120,7 +121,9 @@ async function startContinuation({ token, config, state, request }) {
     sendReply: (payload) => sendDiscordReply({ token, ...payload }),
     trackCompletion: (started, normalized) => trackContinuationCompletion(started, normalized, token),
   });
-  if (request.source === 'reply') {
+  const durableResult = result.status === 'started' || result.status === 'queued' ||
+    !['state-persist-failed', 'encryption-unavailable'].includes(String(result.reason ?? ''));
+  if (request.source === 'reply' && durableResult) {
     recordInboxMessage(state, request.channelId, request.requestId, true);
     await saveState(state);
   }
@@ -187,6 +190,7 @@ async function main() {
   const state = await readJsonFile(inboxStatePath, createEmptyInboxState());
   await migrateLegacyPendingReplies({ state, encryptText: (text) => encryptPendingReplyText({ toolDir, text }) });
   migrateInboxState(state);
+  recoverContinuationAttempts(state);
   const rolloutState = await readRolloutWatcherState(rolloutWatcherStatePath, { sessionsRoot });
 
   await initializeInboxCursors({

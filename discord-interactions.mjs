@@ -2,7 +2,7 @@ import { createHash, randomBytes as cryptoRandomBytes } from 'node:crypto';
 import path from 'node:path';
 
 import { COMMAND_NAMES, authorizeInteraction, ephemeral } from './discord-commands-lib.mjs';
-import { createContinuationRequest } from './discord-bridge-lib.mjs';
+import { cancelContinuationPersisted as cancelPersistedContinuation, createContinuationRequest } from './discord-bridge-lib.mjs';
 import { NO_PROJECT, resolveProjectSelection } from './discord-task-create-lib.mjs';
 
 const DISCORD_API = 'https://discord.com/api/v10';
@@ -385,7 +385,8 @@ export function renderTaskList(tasks, { status = '全部' } = {}) {
 function continuationStatusLabel(status) {
   return ({
     queued: '等待发送',
-    started: '已开始',
+    attempting: '正在尝试',
+    'confirmed-start': '已开始',
     delivered: '已送达',
     cancelled: '已取消',
     failed: '失败',
@@ -402,11 +403,16 @@ function continuationSummaryText(value) {
   return displayText(safe, '（无可用摘要）', 120);
 }
 
-export function renderContinuationQueue(items, taskIndex = null) {
+function continuationQueueView(items, taskIndex = null) {
   const values = Array.isArray(items) ? items : [];
-  if (!values.length) return '## 继续队列\n当前没有继续请求。';
+  if (!values.length) return { description: '## 继续队列\n当前没有继续请求。', displayed: [] };
   const tasks = Array.isArray(taskIndex?.tasks) ? taskIndex.tasks : [];
-  const entries = values.slice(0, 20).map((item, index) => {
+  const ordered = [
+    ...values.filter((item) => item?.status === 'queued'),
+    ...values.filter((item) => item?.status !== 'queued'),
+  ];
+  const candidates = ordered.slice(0, 20);
+  const entryText = (item, index) => {
       const task = tasks.find((candidate) => String(candidate?.threadId ?? '').toLocaleLowerCase() === String(item?.threadId ?? '').toLocaleLowerCase());
       const projectName = item?.projectName ?? task?.projectName ?? '无项目';
       const taskName = item?.taskName ?? task?.taskName ?? `任务 …${String(item?.threadId ?? '').slice(-8)}`;
@@ -416,18 +422,24 @@ export function renderContinuationQueue(items, taskIndex = null) {
         `   内容：${metadataText(continuationSummaryText(item?.summary), '（无可用摘要）', 140)}`,
         `   来源：${source}｜加入：${formatTimestamp(item?.createdAt ?? item?.queuedAt)}｜最后尝试：${formatTimestamp(item?.lastAttemptAt)}｜状态：${continuationStatusLabel(item?.status)}`,
       ].join('\n');
-    });
-  let rendered = '## 继续队列';
-  for (let index = 0; index < entries.length; index += 1) {
-    const candidate = `${rendered}\n${entries[index]}`;
-    if (candidate.length > EMBED_MARKDOWN_LIMIT) {
-      const omitted = `\n…另有 ${entries.length - index} 项未显示。`;
-      if (rendered.length + omitted.length <= EMBED_MARKDOWN_LIMIT) rendered += omitted;
-      break;
-    }
-    rendered = candidate;
+    };
+  const displayed = [];
+  let description = '## 继续队列';
+  for (let index = 0; index < candidates.length; index += 1) {
+    const entry = entryText(candidates[index], index);
+    const omittedAfter = values.length - displayed.length - 1;
+    const omittedText = omittedAfter > 0 ? `\n…另有 ${omittedAfter} 项未显示。` : '';
+    if (`${description}\n${entry}${omittedText}`.length > EMBED_MARKDOWN_LIMIT) break;
+    description += `\n${entry}`;
+    displayed.push(candidates[index]);
   }
-  return rendered;
+  const omitted = values.length - displayed.length;
+  if (omitted > 0) description += `\n…另有 ${omitted} 项未显示。`;
+  return { description, displayed };
+}
+
+export function renderContinuationQueue(items, taskIndex = null) {
+  return continuationQueueView(items, taskIndex).description;
 }
 
 export function renderTaskDetail(detail) {
@@ -679,34 +691,55 @@ function findTask(dependencies, threadId) {
   return (dependencies.taskIndex?.tasks ?? []).find((task) => String(task?.threadId ?? '').toLocaleLowerCase() === wanted) ?? null;
 }
 
-function pageComponents(stateId, page, total) {
-  if (total <= 1) return [];
-  return [{
-    type: 1,
-    components: [
-      { type: 2, style: 2, label: '上一页', custom_id: `page:${stateId}:prev`, disabled: page <= 0 },
-      { type: 2, style: 2, label: `${page + 1}/${total}`, custom_id: `page:${stateId}:noop`, disabled: true },
-      { type: 2, style: 2, label: '下一页', custom_id: `page:${stateId}:next`, disabled: page >= total - 1 },
-    ],
-  }];
+function pageComponents(stateId, page, total, extraComponents = []) {
+  const rows = [];
+  if (total > 1) {
+    rows.push({
+      type: 1,
+      components: [
+        { type: 2, style: 2, label: '上一页', custom_id: `page:${stateId}:prev`, disabled: page <= 0 },
+        { type: 2, style: 2, label: `${page + 1}/${total}`, custom_id: `page:${stateId}:noop`, disabled: true },
+        { type: 2, style: 2, label: '下一页', custom_id: `page:${stateId}:next`, disabled: page >= total - 1 },
+      ],
+    });
+  }
+  return [...rows, ...extraComponents];
 }
 
 function pagePayload(stateId, state) {
   return mentionSafePayload({
     embeds: [{ description: state.pages[state.page] }],
-    components: pageComponents(stateId, state.page, state.pages.length),
+    components: pageComponents(stateId, state.page, state.pages.length, state.extraComponents),
   });
 }
 
-function createPageState(dependencies, pages, interaction) {
-  if (pages.length <= 1) return { stateId: null, payload: privatePayload({ embeds: [{ description: pages[0] }] }) };
+function createPageState(dependencies, pages, interaction, extraComponents = []) {
+  if (pages.length <= 1) {
+    return { stateId: null, payload: privatePayload({ embeds: [{ description: pages[0] }], components: extraComponents }) };
+  }
   const stateId = makeStateId(dependencies);
   const state = {
     kind: 'page', userId: userId(interaction), guildId: guildId(interaction), pages, page: 0,
+    extraComponents,
     expiresAt: nowValue(dependencies) + UI_TTL_MS,
   };
   dependencies.uiState.set(stateId, state);
   return { stateId, payload: pagePayload(stateId, state) };
+}
+
+function createContinueTargetButton(dependencies, interaction, threadId) {
+  const stateId = makeStateId(dependencies);
+  dependencies.uiState.set(stateId, {
+    kind: 'continue-target',
+    userId: userId(interaction),
+    guildId: guildId(interaction),
+    threadId: String(threadId),
+    expiresAt: nowValue(dependencies) + UI_TTL_MS,
+  });
+  return {
+    type: 1,
+    components: [{ type: 2, style: 1, label: '继续任务', custom_id: `continue-open:${stateId}` }],
+  };
 }
 
 function detailButtons(dependencies, tasks, interaction) {
@@ -730,8 +763,9 @@ function detailButtons(dependencies, tasks, interaction) {
 function continuationQueuePayload(dependencies, interaction) {
   const queue = dependencies.getQueue?.();
   const values = Array.isArray(queue) ? queue : [];
+  const view = continuationQueueView(values, dependencies.taskIndex);
   const buttons = [];
-  for (const item of values.filter((candidate) => candidate?.status === 'queued').slice(0, 20)) {
+  for (const item of view.displayed.filter((candidate) => candidate?.status === 'queued')) {
     const stateId = makeStateId(dependencies);
     dependencies.uiState.set(stateId, {
       kind: 'cancel-continuation',
@@ -752,7 +786,7 @@ function continuationQueuePayload(dependencies, interaction) {
     components.push({ type: 1, components: buttons.slice(index, index + 5) });
   }
   return mentionSafePayload({
-    embeds: [{ description: renderContinuationQueue(values, dependencies.taskIndex) }],
+    embeds: [{ description: view.description }],
     components,
   });
 }
@@ -836,12 +870,43 @@ async function defer(dependencies, interaction) {
   return respond(dependencies, interaction, privateResponse({}, 5));
 }
 
+async function openContinuationModal(dependencies, interaction, record) {
+  const stateId = makeStateId(dependencies);
+  dependencies.uiState.set(stateId, {
+    kind: 'continue-task',
+    userId: userId(interaction),
+    guildId: guildId(interaction),
+    threadId: String(record.threadId),
+    expiresAt: nowValue(dependencies) + UI_TTL_MS,
+  });
+  return respond(dependencies, interaction, {
+    type: 9,
+    data: {
+      custom_id: `continue:${stateId}`,
+      title: '继续 Codex 任务',
+      components: [{
+        type: 1,
+        components: [{
+          type: 4,
+          custom_id: '继续内容',
+          label: '继续内容',
+          style: 2,
+          min_length: 1,
+          max_length: 4_000,
+          required: true,
+        }],
+      }],
+    },
+  });
+}
+
 async function renderDetailInteraction(dependencies, interaction, record) {
   await defer(dependencies, interaction);
   try {
     const detail = await dependencies.readTaskDetail(record);
     const pages = paginateMarkdown(renderTaskDetail(detail));
-    const { payload } = createPageState(dependencies, pages, interaction);
+    const continueRow = createContinueTargetButton(dependencies, interaction, record.threadId);
+    const { payload } = createPageState(dependencies, pages, interaction, [continueRow]);
     return editOriginal(dependencies, interaction, payload);
   } catch {
     return editOriginal(dependencies, interaction, { content: '任务详情暂不可用，请稍后重试。' });
@@ -913,33 +978,7 @@ async function handleCommand(dependencies, interaction) {
   if (name === '继续任务') {
     const record = findTask(dependencies, optionValue(interaction, '任务'));
     if (!record) return respond(dependencies, interaction, privateResponse('任务不存在或已不再是侧边栏主任务。'));
-    const stateId = makeStateId(dependencies);
-    dependencies.uiState.set(stateId, {
-      kind: 'continue-task',
-      userId: userId(interaction),
-      guildId: guildId(interaction),
-      threadId: String(record.threadId),
-      expiresAt: nowValue(dependencies) + UI_TTL_MS,
-    });
-    return respond(dependencies, interaction, {
-      type: 9,
-      data: {
-        custom_id: `continue:${stateId}`,
-        title: '继续 Codex 任务',
-        components: [{
-          type: 1,
-          components: [{
-            type: 4,
-            custom_id: '继续内容',
-            label: '继续内容',
-            style: 2,
-            min_length: 1,
-            max_length: 4_000,
-            required: true,
-          }],
-        }],
-      },
-    });
+    return openContinuationModal(dependencies, interaction, record);
   }
   if (name === '继续队列') {
     return respond(dependencies, interaction, { type: 4, data: privatePayload(continuationQueuePayload(dependencies, interaction)) });
@@ -1133,12 +1172,39 @@ async function handleComponent(dependencies, interaction) {
     if (invalid || state?.kind !== 'cancel-continuation') {
       return respond(dependencies, interaction, privateResponse(invalid ?? '内容已过期或按钮无效，请重新执行命令。'));
     }
-    const result = await dependencies.cancelContinuation(state.queueId, new Date(nowValue(dependencies)).toISOString());
-    if (result?.status === 'cancelled') await dependencies.persistContinuationState?.();
+    let result;
+    try {
+      const cancelledAt = new Date(nowValue(dependencies)).toISOString();
+      if (typeof dependencies.cancelContinuationPersisted === 'function') {
+        result = await dependencies.cancelContinuationPersisted(state.queueId, cancelledAt);
+      } else if (dependencies.continuationState) {
+        result = await cancelPersistedContinuation({
+          state: dependencies.continuationState,
+          queueId: state.queueId,
+          now: cancelledAt,
+          persistState: dependencies.persistContinuationState,
+        });
+      } else {
+        throw new Error('Atomic continuation cancellation is unavailable');
+      }
+    } catch {
+      return respond(dependencies, interaction, privateResponse('取消失败，队列状态未更改；请稍后重试。'));
+    }
     return respond(dependencies, interaction, {
       type: 7,
       data: continuationQueuePayload(dependencies, interaction),
     });
+  }
+  const continueMatch = customId.match(/^continue-open:([A-Za-z0-9_-]{16})$/u);
+  if (continueMatch) {
+    const state = dependencies.uiState.get(continueMatch[1]);
+    const invalid = componentStateError(dependencies, interaction, state);
+    if (invalid || state?.kind !== 'continue-target') {
+      return respond(dependencies, interaction, privateResponse(invalid ?? '内容已过期或按钮无效，请重新执行命令。'));
+    }
+    const record = findTask(dependencies, state.threadId);
+    if (!record) return respond(dependencies, interaction, privateResponse('任务不存在或已不再是侧边栏主任务。'));
+    return openContinuationModal(dependencies, interaction, record);
   }
   const pageMatch = customId.match(/^page:([A-Za-z0-9_-]{16}):(prev|next|noop)$/u);
   if (pageMatch) {

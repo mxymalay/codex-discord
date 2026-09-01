@@ -12,6 +12,7 @@ import {
   AppServerClient,
   buildCodexAppServerMessages,
   cancelContinuation,
+  cancelContinuationPersisted,
   classifyReply,
   compareSnowflakes,
   createContinuationRequest,
@@ -29,6 +30,7 @@ import {
   migrateInboxState,
   migrateLegacyPendingReplies,
   recordInboxMessage,
+  recoverContinuationAttempts,
   removePendingReply,
   resolveCodexExecutable,
   resumeCodexThread,
@@ -389,7 +391,7 @@ test('queues an active-writer reply with encrypted text and no plaintext at rest
   assert.equal(pending[0].messageId, accepted.messageId);
   assert.equal(pending[0].encryptedText, 'dpapi-ciphertext');
   assert.equal(Object.hasOwn(pending[0], 'text'), false);
-  assert.equal(JSON.stringify(state).includes(accepted.text), false);
+  assert.equal(Object.values(state.pendingContinuations).some((item) => Object.hasOwn(item, 'text')), false);
   assert.equal(pending[0].mapping.threadId, accepted.mapping.threadId);
   assert.equal(pending[0].attempts, 1);
   assert.equal(pending[0].lastAttemptAt, now);
@@ -433,7 +435,7 @@ test('migrates the reply queue and stores slash continuations without tokens or 
 
   const serialized = JSON.stringify(state);
   assert.equal(serialized.includes('interaction-token'), false);
-  assert.equal(serialized.includes('重新检查一次'), false);
+  assert.equal(Object.values(state.pendingContinuations).some((item) => Object.hasOwn(item, 'text')), false);
   assert.equal(listContinuations(state).length, 2);
   assert.equal(state.createdTasksByInteraction['create-1'].threadId, 'root-new');
   assert.equal(Object.hasOwn(state, 'pendingReplies'), false);
@@ -478,7 +480,7 @@ test('cancels only continuations that have not started and delivered entries can
   });
   const started = enqueueContinuation(state, {
     ...createContinuationRequest({ source: 'slash', requestId: 'started', threadId: 'root-2', text: 'started' }),
-    encryptedText: 'cipher:started', status: 'started',
+    encryptedText: 'cipher:started', status: 'attempting',
   });
   const delivered = enqueueContinuation(state, {
     ...createContinuationRequest({ source: 'slash', requestId: 'delivered', threadId: 'root-3', text: 'delivered' }),
@@ -523,7 +525,7 @@ test('dispatch queues an active writer, retries delivery, and preserves legacy r
   const queued = await dispatchContinuation(request, dependencies);
   assert.equal(queued.status, 'queued');
   assert.equal(listContinuations(state).length, 1);
-  assert.equal(JSON.stringify(state).includes('继续旧通知'), false);
+  assert.equal(Object.values(state.pendingContinuations).some((item) => Object.hasOwn(item, 'text')), false);
   assert.match(acknowledgements[0].content, /已排队/);
 
   const delivered = await dispatchContinuation(listContinuations(state)[0], dependencies);
@@ -558,6 +560,7 @@ test('slash dispatch persists its idempotence journal before starting an externa
   });
   const result = await dispatchContinuation(request, {
     state,
+    encryptText: async () => 'opaque-ciphertext',
     persistState: async () => { events.push(`persist:${state.processedInteractions.at(-1)?.status}`); },
     resumeCodexThread: async () => {
       events.push('resume');
@@ -565,7 +568,268 @@ test('slash dispatch persists its idempotence journal before starting an externa
     },
   });
   assert.equal(result.status, 'started');
-  assert.deepEqual(events.slice(0, 2), ['persist:started', 'resume']);
+  assert.deepEqual(events.slice(0, 3), ['persist:queued', 'persist:attempting', 'resume']);
+});
+
+test('reply dispatch durably journals encrypted text before any external resume', async () => {
+  const events = [];
+  const snapshots = [];
+  const state = createEmptyInboxState();
+  const request = createContinuationRequest({
+    source: 'reply', requestId: 'reply-journal-1', threadId: 'root-1', text: 'private reply',
+    channelId: 'channel-1', replyToMessageId: 'reply-journal-1',
+  });
+  const result = await dispatchContinuation(request, {
+    state,
+    encryptText: async () => { events.push('encrypt'); return 'opaque-ciphertext'; },
+    persistState: async () => { events.push(`persist:${listContinuations(state)[0]?.status}`); snapshots.push(structuredClone(state)); },
+    resumeCodexThread: async () => {
+      events.push('resume');
+      return { turnId: 'turn-reply', completion: Promise.resolve({ turn: { status: 'completed' } }) };
+    },
+  });
+  assert.equal(result.status, 'started');
+  assert.deepEqual(events.slice(0, 4), ['encrypt', 'persist:queued', 'persist:attempting', 'resume']);
+  assert.equal(Object.hasOwn(snapshots[0].pendingContinuations[Object.keys(snapshots[0].pendingContinuations)[0]], 'text'), false);
+  assert.equal(snapshots[0].pendingContinuations[Object.keys(snapshots[0].pendingContinuations)[0]].encryptedText, 'opaque-ciphertext');
+});
+
+test('an immediate reply acknowledgement never claims it came from the retry queue', async () => {
+  const acknowledgements = [];
+  const result = await dispatchContinuation(createContinuationRequest({
+    source: 'reply', requestId: 'reply-immediate', threadId: 'root-1', text: 'continue',
+    channelId: 'channel-1', replyToMessageId: 'reply-immediate',
+  }), {
+    state: createEmptyInboxState(),
+    encryptText: async () => 'opaque-ciphertext',
+    persistState: async () => {},
+    resumeCodexThread: async () => ({ turnId: 'turn-immediate', completion: Promise.resolve({ turn: { status: 'completed' } }) }),
+    sendReply: async (payload) => { acknowledgements.push(payload.content); },
+  });
+  assert.equal(result.status, 'started');
+  assert.match(acknowledgements[0], /^✅ 已送达/u);
+  assert.equal(acknowledgements[0].includes('排队回复'), false);
+});
+
+test('a reply remains confirmed-start when no acknowledgement transport is available', async () => {
+  const state = createEmptyInboxState();
+  const result = await dispatchContinuation(createContinuationRequest({
+    source: 'reply', requestId: 'reply-no-ack', threadId: 'root-1', text: 'continue',
+    channelId: 'channel-1', replyToMessageId: 'reply-no-ack',
+  }), {
+    state,
+    encryptText: async () => 'opaque-ciphertext',
+    persistState: async () => {},
+    resumeCodexThread: async () => ({ turnId: 'turn-no-ack', completion: Promise.resolve({ turn: { status: 'completed' } }) }),
+  });
+  assert.equal(result.status, 'started');
+  assert.equal(listContinuations(state)[0].status, 'confirmed-start');
+});
+
+test('a confirmed turn stays started when confirmation persistence, acknowledgement, or tracking fails', async () => {
+  const state = createEmptyInboxState();
+  const events = [];
+  let persistCount = 0;
+  const result = await dispatchContinuation(createContinuationRequest({
+    source: 'reply', requestId: 'confirmed-errors', threadId: 'root-1', text: 'continue',
+    channelId: 'channel-1', replyToMessageId: 'confirmed-errors',
+  }), {
+    state,
+    encryptText: async () => 'opaque-ciphertext',
+    persistState: async () => {
+      persistCount += 1;
+      events.push(`persist:${listContinuations(state)[0]?.status}`);
+      if (persistCount === 3) throw new Error('private persistence path');
+    },
+    resumeCodexThread: async () => {
+      events.push('resume');
+      return { turnId: 'turn-confirmed', completion: Promise.resolve({ turn: { status: 'completed' } }) };
+    },
+    sendReply: async () => { events.push('ack'); throw new Error('private token'); },
+    trackCompletion: () => { events.push('track'); throw new Error('private tracker'); },
+  });
+  assert.equal(result.status, 'started');
+  assert.equal(result.turnId, 'turn-confirmed');
+  assert.equal(result.reason, 'state-persist-failed');
+  assert.equal(listContinuations(state)[0].status, 'confirmed-start');
+  assert.equal(listContinuations(state)[0].turnId, 'turn-confirmed');
+  assert.equal(events.includes('ack'), true);
+  assert.equal(events.includes('track'), true);
+});
+
+test('queued retry claim persistence failure restores the exact queued snapshot and never resumes', async () => {
+  const state = createEmptyInboxState();
+  const queued = enqueueContinuation(state, {
+    ...createContinuationRequest({ source: 'slash', requestId: 'claim-fails', threadId: 'root-1', text: 'retry' }),
+    encryptedText: 'opaque-ciphertext',
+  });
+  const before = structuredClone(state);
+  let resumed = false;
+  const result = await dispatchContinuation(queued, {
+    state,
+    decryptText: async () => 'retry',
+    persistState: async () => { throw new Error('private state path'); },
+    resumeCodexThread: async () => { resumed = true; throw new Error('must not resume'); },
+  });
+  assert.deepEqual(state, before);
+  assert.equal(resumed, false);
+  assert.deepEqual(result, { status: 'failed', queueId: queued.queueId, reason: 'state-persist-failed' });
+});
+
+test('dispatch never starts an external turn without a persistence adapter', async () => {
+  const state = createEmptyInboxState();
+  const before = structuredClone(state);
+  let resumed = false;
+  const result = await dispatchContinuation(createContinuationRequest({
+    source: 'slash', requestId: 'missing-persist', threadId: 'root-1', text: 'continue',
+  }), {
+    state,
+    encryptText: async () => 'opaque-ciphertext',
+    resumeCodexThread: async () => { resumed = true; return { turnId: 'must-not-start' }; },
+  });
+  assert.deepEqual(state, before);
+  assert.equal(resumed, false);
+  assert.equal(result.reason, 'state-persist-failed');
+});
+
+test('restart recovery marks an ambiguous attempting claim terminal without starting another turn', async () => {
+  const state = createEmptyInboxState();
+  const queued = enqueueContinuation(state, {
+    ...createContinuationRequest({ source: 'slash', requestId: 'ambiguous-attempt', threadId: 'root-1', text: 'retry' }),
+    encryptedText: 'opaque-ciphertext', status: 'attempting',
+  });
+  recoverContinuationAttempts(state, '2026-09-01T01:00:00.000Z');
+  assert.equal(listContinuations(state)[0].status, 'failed');
+  assert.equal(listContinuations(state)[0].failureReason, 'attempt-uncertain');
+  let resumed = false;
+  const result = await dispatchContinuation({ ...queued, status: 'attempting' }, {
+    state,
+    decryptText: async () => 'retry',
+    resumeCodexThread: async () => { resumed = true; },
+  });
+  assert.equal(result.status, 'failed');
+  assert.equal(resumed, false);
+});
+
+test('active-writer queue persistence failure restores a retryable queue for the same request id', async () => {
+  const state = createEmptyInboxState();
+  let persistCount = 0;
+  let resumeCount = 0;
+  const dependencies = {
+    state,
+    encryptText: async () => 'opaque-ciphertext',
+    decryptText: async () => 'continue',
+    persistState: async () => {
+      persistCount += 1;
+      if (persistCount === 3) throw new Error('private state path');
+    },
+    resumeCodexThread: async () => {
+      resumeCount += 1;
+      if (resumeCount === 1) throw new Error('thread already has an active writer');
+      return { turnId: 'turn-recovered', completion: Promise.resolve({ turn: { status: 'completed' } }) };
+    },
+  };
+  const request = createContinuationRequest({ source: 'slash', requestId: 'active-persist', threadId: 'root-1', text: 'continue' });
+  const failed = await dispatchContinuation(request, dependencies);
+  assert.equal(failed.reason, 'state-persist-failed');
+  assert.equal(listContinuations(state)[0].status, 'queued');
+
+  const recovered = await dispatchContinuation(listContinuations(state)[0], dependencies);
+  assert.equal(recovered.status, 'started');
+  assert.equal(recovered.turnId, 'turn-recovered');
+});
+
+test('persisted cancellation rolls back both queue and processed interaction on failure', async () => {
+  const state = createEmptyInboxState();
+  const queued = enqueueContinuation(state, {
+    ...createContinuationRequest({ source: 'slash', requestId: 'cancel-rollback', threadId: 'root-1', text: 'cancel' }),
+    encryptedText: 'opaque-ciphertext',
+  });
+  const before = structuredClone(state);
+  await assert.rejects(() => cancelContinuationPersisted({
+    state, queueId: queued.queueId, now: '2026-09-01T01:00:00.000Z',
+    persistState: async () => { throw new Error('C:\\private\\state.json'); },
+  }), /^Error: Continuation state persistence failed$/);
+  assert.deepEqual(state, before);
+});
+
+test('terminal continuation history is bounded while every live queue entry is preserved', () => {
+  const pendingContinuations = {};
+  for (let index = 0; index < 205; index += 1) {
+    pendingContinuations[`terminal-${index}`] = {
+      queueId: `terminal-${index}`, source: 'slash', requestId: `terminal-${index}`,
+      threadId: 'root-1', status: 'delivered', createdAt: `2026-09-01T00:${String(index % 60).padStart(2, '0')}:00Z`,
+    };
+  }
+  pendingContinuations['live-queued'] = { queueId: 'live-queued', source: 'slash', requestId: 'live-queued', threadId: 'root-1', status: 'queued' };
+  pendingContinuations['live-attempting'] = { queueId: 'live-attempting', source: 'reply', requestId: 'live-attempting', threadId: 'root-1', status: 'attempting' };
+  const state = migrateInboxState({ pendingContinuations });
+  assert.equal(listContinuations(state).filter((item) => item.status === 'delivered').length, 200);
+  assert.equal(Object.hasOwn(state.pendingContinuations, 'live-queued'), true);
+  assert.equal(Object.hasOwn(state.pendingContinuations, 'live-attempting'), true);
+});
+
+test('a runtime delivery transition prunes the oldest terminal history before persistence', () => {
+  const state = createEmptyInboxState();
+  for (let index = 0; index < 200; index += 1) {
+    state.pendingContinuations[`terminal-${index}`] = {
+      queueId: `terminal-${index}`, source: 'slash', requestId: `terminal-${index}`,
+      threadId: 'root-1', status: 'delivered', createdAt: `2026-09-01T00:${String(index % 60).padStart(2, '0')}:00Z`,
+    };
+  }
+  const queued = enqueueContinuation(state, {
+    ...createContinuationRequest({ source: 'slash', requestId: 'new-terminal', threadId: 'root-1', text: 'deliver' }),
+    encryptedText: 'opaque-ciphertext', createdAt: '2026-09-02T00:00:00Z',
+  });
+  markContinuationDelivered(state, queued.queueId, '2026-09-02T00:01:00Z');
+  assert.equal(listContinuations(state).filter((item) => item.status === 'delivered').length, 200);
+  assert.equal(Object.hasOwn(state.pendingContinuations, queued.queueId), true);
+});
+
+test('terminal pruning retains a newly confirmed turn even when it waited in queue longer than history', async () => {
+  const state = createEmptyInboxState();
+  for (let index = 0; index < 200; index += 1) {
+    state.pendingContinuations[`history-${index}`] = {
+      queueId: `history-${index}`, source: 'slash', requestId: `history-${index}`,
+      threadId: 'root-history', status: 'delivered',
+      createdAt: `2026-09-02T${String(Math.floor(index / 60)).padStart(2, '0')}:${String(index % 60).padStart(2, '0')}:00Z`,
+      deliveredAt: `2026-09-02T${String(Math.floor(index / 60)).padStart(2, '0')}:${String(index % 60).padStart(2, '0')}:30Z`,
+    };
+  }
+  const queued = enqueueContinuation(state, {
+    ...createContinuationRequest({
+      source: 'slash', requestId: 'old-live-queue', threadId: 'root-1', text: 'continue',
+      createdAt: '2026-09-01T00:00:00Z',
+    }),
+    encryptedText: 'opaque-ciphertext',
+  });
+
+  const result = await dispatchContinuation(queued, {
+    state,
+    now: () => '2026-09-03T00:00:00Z',
+    decryptText: async () => 'continue',
+    persistState: async () => {},
+    resumeCodexThread: async () => ({ turnId: 'turn-new-fact', completion: Promise.resolve({ turn: { status: 'completed' } }) }),
+  });
+
+  assert.equal(result.status, 'started');
+  assert.equal(state.pendingContinuations[queued.queueId].status, 'confirmed-start');
+  assert.equal(state.pendingContinuations[queued.queueId].turnId, 'turn-new-fact');
+});
+
+test('continuation summaries add an ellipsis only when the safe summary is actually truncated', () => {
+  const state = createEmptyInboxState();
+  const short = enqueueContinuation(state, {
+    ...createContinuationRequest({ source: 'slash', requestId: 'short-summary', threadId: 'root-1', text: 'short' }),
+    encryptedText: 'opaque-short',
+  });
+  const long = enqueueContinuation(state, {
+    ...createContinuationRequest({ source: 'slash', requestId: 'long-summary', threadId: 'root-1', text: 'x'.repeat(140) }),
+    encryptedText: 'opaque-long',
+  });
+  assert.equal(short.summary, 'short');
+  assert.equal(long.summary.endsWith('…'), true);
+  assert.equal(long.summary.length, 120);
 });
 
 test('migrates legacy pending plaintext before state is rewritten', async () => {

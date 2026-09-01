@@ -24,8 +24,11 @@ export function createEmptyInboxState() {
 
 const MAX_PROCESSED_INTERACTIONS = 2_000;
 const MAX_CREATED_TASK_RECORDS = 2_000;
-const CONTINUATION_STATUSES = new Set(['queued', 'started', 'delivered', 'cancelled', 'failed']);
+const MAX_TERMINAL_CONTINUATIONS = 200;
+const CONTINUATION_STATUSES = new Set(['queued', 'attempting', 'confirmed-start', 'delivered', 'cancelled', 'failed']);
+const TERMINAL_CONTINUATION_STATUSES = new Set(['confirmed-start', 'delivered', 'cancelled', 'failed']);
 const TERMINAL_CREATION_STATUSES = new Set(['started', 'first-turn-failed', 'failed-before-thread', 'recovered-failed']);
+const continuationStateLocks = new WeakMap();
 
 function continuationQueueId(source, requestId) {
   return createHash('sha256').update(`${source}\0${requestId}`, 'utf8').digest().subarray(0, 12).toString('base64url');
@@ -39,7 +42,62 @@ function continuationSummary(value) {
     .replace(/\s+/gu, ' ')
     .trim();
   if (!safe) return '';
-  return safe.length <= 120 ? `${safe.slice(0, Math.max(0, safe.length - 1))}…` : `${safe.slice(0, 119)}…`;
+  return safe.length <= 120 ? safe : `${safe.slice(0, 119)}…`;
+}
+
+function restoreState(state, snapshot) {
+  for (const key of Object.keys(state)) delete state[key];
+  Object.assign(state, structuredClone(snapshot));
+}
+
+async function withContinuationStateLock(state, operation) {
+  const previous = continuationStateLocks.get(state) ?? Promise.resolve();
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const current = previous.catch(() => {}).then(async () => {
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
+  });
+  continuationStateLocks.set(state, gate);
+  try {
+    return await current;
+  } finally {
+    if (continuationStateLocks.get(state) === gate) continuationStateLocks.delete(state);
+  }
+}
+
+async function persistMutation(state, persistState, mutate) {
+  return withContinuationStateLock(state, async () => {
+    const snapshot = structuredClone(state);
+    const result = mutate();
+    pruneContinuationHistory(state);
+    try {
+      if (typeof persistState !== 'function') throw new Error('Persistence adapter is unavailable');
+      await persistState(state);
+      return result;
+    } catch {
+      restoreState(state, snapshot);
+      throw new Error('Continuation state persistence failed');
+    }
+  });
+}
+
+function pruneContinuationHistory(state) {
+  const terminalTime = (item) => String(({
+    'confirmed-start': item?.confirmedAt,
+    delivered: item?.deliveredAt,
+    cancelled: item?.cancelledAt,
+    failed: item?.failedAt,
+  })[String(item?.status ?? '')] ?? item?.createdAt ?? '');
+  const terminalContinuations = Object.entries(state?.pendingContinuations ?? {})
+    .filter(([, item]) => TERMINAL_CONTINUATION_STATUSES.has(String(item?.status ?? '')))
+    .sort((left, right) => terminalTime(left[1]).localeCompare(terminalTime(right[1])));
+  for (const [queueId] of terminalContinuations.slice(0, Math.max(0, terminalContinuations.length - MAX_TERMINAL_CONTINUATIONS))) {
+    delete state.pendingContinuations[queueId];
+  }
 }
 
 function processedInteraction(state, requestId) {
@@ -119,6 +177,8 @@ export function migrateInboxState(candidate) {
     }
   }
 
+  pruneContinuationHistory(state);
+
   for (const pending of Object.values(state.pendingReplies ?? {})) {
     const mapping = pending?.mapping ?? {};
     const requestId = String(pending?.messageId ?? '');
@@ -197,7 +257,30 @@ export function cancelContinuation(state, queueId, now = new Date().toISOString(
   item.status = 'cancelled';
   item.cancelledAt = String(now);
   if (item.source === 'slash') recordProcessedInteraction(state, item.requestId, { status: 'failed', queueId: item.queueId, reason: 'cancelled' }, now);
-  return { status: 'cancelled', queueId: item.queueId };
+  const result = { status: 'cancelled', queueId: item.queueId };
+  pruneContinuationHistory(state);
+  return result;
+}
+
+export async function cancelContinuationPersisted({ state, queueId, now = new Date().toISOString(), persistState }) {
+  return persistMutation(state, persistState, () => cancelContinuation(state, queueId, now));
+}
+
+export function recoverContinuationAttempts(state, now = new Date().toISOString()) {
+  migrateInboxState(state);
+  for (const item of Object.values(state.pendingContinuations)) {
+    if (item?.status !== 'attempting') continue;
+    item.status = 'failed';
+    item.failedAt = String(now);
+    item.failureReason = 'attempt-uncertain';
+    if (item.source === 'slash') {
+      recordProcessedInteraction(state, item.requestId, {
+        status: 'failed', queueId: item.queueId, reason: 'attempt-uncertain',
+      }, now);
+    }
+  }
+  pruneContinuationHistory(state);
+  return state;
 }
 
 export function markContinuationDelivered(state, queueId, now = new Date().toISOString()) {
@@ -206,6 +289,7 @@ export function markContinuationDelivered(state, queueId, now = new Date().toISO
   if (item.status === 'cancelled') return { status: 'cancelled', queueId: item.queueId };
   item.status = 'delivered';
   item.deliveredAt = String(now);
+  pruneContinuationHistory(state);
   return item;
 }
 
@@ -229,12 +313,13 @@ async function persistContinuationState(dependencies) {
 }
 
 async function acknowledgeContinuation(dependencies, request, content) {
-  if (request.source !== 'reply' || typeof dependencies.sendReply !== 'function') return;
+  if (request.source !== 'reply' || typeof dependencies.sendReply !== 'function') return false;
   await dependencies.sendReply({
     channelId: request.channelId,
     replyToMessageId: request.replyToMessageId ?? request.requestId,
     content,
   });
+  return true;
 }
 
 export async function dispatchContinuation(request, dependencies = {}) {
@@ -243,10 +328,17 @@ export async function dispatchContinuation(request, dependencies = {}) {
   const now = String(typeof dependencies.now === 'function' ? dependencies.now() : new Date().toISOString());
   const source = String(request?.source ?? '');
   const requestId = String(request?.requestId ?? '');
-  const existing = listContinuations(state).find((item) => item.source === source && item.requestId === requestId);
+  let existing = listContinuations(state).find((item) => item.source === source && item.requestId === requestId);
+  const wasQueuedRequest = Boolean(existing);
   const isQueuedRetry = Boolean(request?.queueId && existing?.queueId === String(request.queueId));
   if (!isQueuedRetry) {
-    if (existing) return { status: existing.status === 'delivered' ? 'started' : existing.status, queueId: existing.queueId };
+    if (existing) {
+      if (['confirmed-start', 'delivered'].includes(existing.status)) {
+        return { status: 'started', queueId: existing.queueId, turnId: existing.turnId };
+      }
+      if (existing.status === 'queued') return { status: 'queued', queueId: existing.queueId };
+      return { status: 'failed', queueId: existing.queueId, reason: existing.status === 'attempting' ? 'attempt-in-progress' : existing.failureReason ?? existing.status };
+    }
     const processed = source === 'slash' ? processedInteraction(state, requestId) : null;
     if (processed) {
       return {
@@ -259,9 +351,10 @@ export async function dispatchContinuation(request, dependencies = {}) {
   }
   if (existing && existing.status !== 'queued') {
     return {
-      status: existing.status === 'delivered' ? 'started' : 'failed',
+      status: ['confirmed-start', 'delivered'].includes(existing.status) ? 'started' : 'failed',
       queueId: existing.queueId,
-      reason: existing.status,
+      turnId: existing.turnId,
+      reason: existing.status === 'attempting' ? 'attempt-in-progress' : existing.failureReason ?? existing.status,
     };
   }
 
@@ -289,18 +382,45 @@ export async function dispatchContinuation(request, dependencies = {}) {
     return result;
   }
 
-  if (existing) {
-    existing.status = 'started';
-    existing.lastAttemptAt = now;
-    existing.attempts = Number(existing.attempts ?? 0) + 1;
-    await persistContinuationState(dependencies);
-  } else if (source === 'slash') {
-    recordProcessedInteraction(state, requestId, { status: 'started' }, now);
-    await persistContinuationState(dependencies);
+  if (!existing) {
+    let encryptedText;
+    try {
+      encryptedText = await dependencies.encryptText?.(normalized.text);
+    } catch {
+      return { status: 'failed', reason: 'encryption-unavailable' };
+    }
+    if (!String(encryptedText ?? '').trim()) return { status: 'failed', reason: 'encryption-unavailable' };
+    try {
+      await persistMutation(state, dependencies.persistState, () => enqueueContinuation(state, {
+        ...normalized,
+        encryptedText: String(encryptedText),
+        queuedAt: now,
+        attempts: 0,
+        status: 'queued',
+      }));
+    } catch {
+      return { status: 'failed', reason: 'state-persist-failed' };
+    }
+    existing = listContinuations(state).find((item) => item.source === source && item.requestId === requestId);
   }
+
+  const queuedSnapshot = structuredClone(state);
   try {
-    const resume = dependencies.resumeCodexThread ?? resumeCodexThread;
-    const started = await resume({
+    await persistMutation(state, dependencies.persistState, () => {
+      const current = state.pendingContinuations[existing.queueId];
+      current.status = 'attempting';
+      current.lastAttemptAt = now;
+      current.attempts = Number(current.attempts ?? 0) + 1;
+      if (source === 'slash') recordProcessedInteraction(state, requestId, { status: 'attempting', queueId: current.queueId }, now);
+    });
+  } catch {
+    return { status: 'failed', queueId: existing.queueId, reason: 'state-persist-failed' };
+  }
+
+  const resume = dependencies.resumeCodexThread ?? resumeCodexThread;
+  let started;
+  try {
+    started = await resume({
       threadId: normalized.threadId,
       cwd: normalized.cwd,
       processCwd: normalized.cwd ?? dependencies.processCwd,
@@ -308,44 +428,20 @@ export async function dispatchContinuation(request, dependencies = {}) {
       codexPath: dependencies.codexPath,
       clientFactory: dependencies.clientFactory,
     });
-    if (existing) markContinuationDelivered(state, existing.queueId, now);
-    const result = {
-      status: 'started',
-      queueId: existing?.queueId,
-      turnId: String(started?.turnId ?? '') || undefined,
-    };
-    if (source === 'slash') recordProcessedInteraction(state, requestId, result, now);
-    await persistContinuationState(dependencies);
-    await acknowledgeContinuation(
-      dependencies,
-      normalized,
-      `${existing ? '✅ 排队回复现已送达' : '✅ 已送达'}原 Codex 任务（…${normalized.threadId.slice(-8)}），已开始继续执行。`,
-    ).catch(() => {});
-    dependencies.trackCompletion?.(started, normalized);
-    return result;
   } catch (error) {
     if (isActiveWriterError(error)) {
-      let queued = existing;
-      if (queued) {
-        queued.status = 'queued';
-      } else {
-        const encryptedText = typeof dependencies.encryptText === 'function'
-          ? await dependencies.encryptText(normalized.text)
-          : '';
-        if (!String(encryptedText ?? '').trim()) return { status: 'failed', reason: 'encryption-unavailable' };
-        queued = enqueueContinuation(state, {
-          ...normalized,
-          text: normalized.text,
-          encryptedText: String(encryptedText),
-          queuedAt: now,
-          lastAttemptAt: now,
-          attempts: 1,
+      try {
+        await persistMutation(state, dependencies.persistState, () => {
+          const queued = state.pendingContinuations[existing.queueId];
+          queued.status = 'queued';
+          if (source === 'slash') recordProcessedInteraction(state, requestId, { status: 'queued', queueId: queued.queueId }, now);
         });
+      } catch {
+        restoreState(state, queuedSnapshot);
+        return { status: 'failed', queueId: existing.queueId, reason: 'state-persist-failed' };
       }
-      const result = { status: 'queued', queueId: queued.queueId };
-      if (source === 'slash') recordProcessedInteraction(state, requestId, result, now);
-      await persistContinuationState(dependencies);
-      if (!existing) {
+      const result = { status: 'queued', queueId: existing.queueId };
+      if (!wasQueuedRequest) {
         await acknowledgeContinuation(
           dependencies,
           normalized,
@@ -354,15 +450,60 @@ export async function dispatchContinuation(request, dependencies = {}) {
       }
       return result;
     }
-    if (existing) {
-      existing.status = 'failed';
-      existing.failedAt = now;
+    try {
+      await persistMutation(state, dependencies.persistState, () => {
+        const failed = state.pendingContinuations[existing.queueId];
+        failed.status = 'failed';
+        failed.failedAt = now;
+        failed.failureReason = 'resume-failed';
+        if (source === 'slash') recordProcessedInteraction(state, requestId, { status: 'failed', queueId: failed.queueId, reason: 'resume-failed' }, now);
+      });
+    } catch {
+      return { status: 'failed', queueId: existing.queueId, reason: 'state-persist-failed' };
     }
-    const result = { status: 'failed', queueId: existing?.queueId, reason: 'resume-failed' };
-    if (source === 'slash') recordProcessedInteraction(state, requestId, result, now);
-    await persistContinuationState(dependencies);
-    return result;
+    return { status: 'failed', queueId: existing.queueId, reason: 'resume-failed' };
   }
+
+  const turnId = String(started?.turnId ?? '') || undefined;
+  const result = { status: 'started', queueId: existing.queueId, turnId };
+  let confirmationPersistFailed = false;
+  await withContinuationStateLock(state, async () => {
+    const confirmed = state.pendingContinuations[existing.queueId];
+    confirmed.status = 'confirmed-start';
+    confirmed.confirmedAt = now;
+    confirmed.turnId = turnId;
+    if (source === 'slash') recordProcessedInteraction(state, requestId, result, now);
+    pruneContinuationHistory(state);
+    try {
+      await dependencies.persistState?.(state);
+    } catch {
+      confirmationPersistFailed = true;
+    }
+  });
+
+  let acknowledged = false;
+  try {
+    acknowledged = await acknowledgeContinuation(
+      dependencies,
+      normalized,
+      `✅ ${wasQueuedRequest ? '排队回复现已送达' : '已送达'}原 Codex 任务（…${normalized.threadId.slice(-8)}），已开始继续执行。`,
+    );
+  } catch {
+    acknowledged = false;
+  }
+  if (acknowledged && !confirmationPersistFailed) {
+    try {
+      await persistMutation(state, dependencies.persistState, () => markContinuationDelivered(state, existing.queueId, now));
+    } catch {
+      confirmationPersistFailed = true;
+    }
+  }
+  try {
+    await dependencies.trackCompletion?.(started, normalized);
+  } catch {
+    // A confirmed external turn remains started even when local tracking cannot attach.
+  }
+  return confirmationPersistFailed ? { ...result, reason: 'state-persist-failed' } : result;
 }
 
 export function enqueuePendingReply(state, accepted, attemptedAt = new Date().toISOString(), encryptedText) {
