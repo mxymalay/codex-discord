@@ -27,6 +27,7 @@ import {
   discordRequest,
   enqueueContinuation,
   enqueuePendingReply,
+  enrichDiscordOriginNotification,
   getPendingReplies,
   initializeAppServerClient,
   initializeInboxCursors,
@@ -1631,14 +1632,21 @@ test('persists bounded Discord turn origins and resolves only an exact trusted b
     'turn-id': 'turn-origin-1',
     'thread-id': '11111111-1111-4111-8111-111111111111',
     'discord-guild-id': '222222222222222222',
+    'discord-origin-channel-id': '777777777777777777',
   };
   assert.deepEqual(resolveDiscordOrigin(exact, state), state.discordTurnOrigins['turn-origin-1']);
   const nativeWithoutGuild = { ...exact };
   delete nativeWithoutGuild['discord-guild-id'];
-  assert.deepEqual(resolveDiscordOrigin(nativeWithoutGuild, state), state.discordTurnOrigins['turn-origin-1']);
+  delete nativeWithoutGuild['discord-origin-channel-id'];
+  assert.equal(resolveDiscordOrigin(nativeWithoutGuild, state), null);
+  const enriched = enrichDiscordOriginNotification(nativeWithoutGuild, state);
+  assert.equal(enriched['discord-guild-id'], '222222222222222222');
+  assert.equal(enriched['discord-origin-channel-id'], '777777777777777777');
+  assert.deepEqual(resolveDiscordOrigin(enriched, state), state.discordTurnOrigins['turn-origin-1']);
   assert.equal(resolveDiscordOrigin({ ...exact, 'thread-id': 'other-thread' }, state), null);
   assert.equal(resolveDiscordOrigin({ ...exact, 'discord-guild-id': '999999999999999999' }, state), null);
   assert.equal(resolveDiscordOrigin({ ...exact, 'discord-guild-id': 'not-a-snowflake' }, state), null);
+  assert.equal(enrichDiscordOriginNotification({ ...nativeWithoutGuild, 'discord-guild-id': '999999999999999999' }, state), null);
   state.discordTurnOrigins['turn-origin-1'].channelId = 'not-a-snowflake';
   assert.equal(resolveDiscordOrigin(exact, state), null);
 });

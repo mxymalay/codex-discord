@@ -988,6 +988,7 @@ export function createProductionBridgeDependencies({
       await recoverInterruptedTaskCreations({
         state: context.inboxState,
         worktreeRoot: context.config.discordWorktreeRoot,
+        sessionsRoot,
         persistState: persistInboxStateImpl,
       });
     },

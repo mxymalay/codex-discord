@@ -130,12 +130,22 @@ function validCleanupProof(value) {
   return isRecord(value) && hasOnlyKeys(value, new Set(fields)) && fields.every((field) => isNonEmptyString(value[field]));
 }
 
+function validCreationOriginIntent(value) {
+  if (value === undefined) return true;
+  const allowed = new Set(['guildId', 'channelId', 'source', 'projectId', 'projectName', 'createdAt']);
+  return isRecord(value) && hasOnlyKeys(value, allowed) &&
+    /^[0-9]{17,20}$/u.test(value.guildId) && /^[0-9]{17,20}$/u.test(value.channelId) &&
+    value.source === 'new-task' && isOptionalString(value.projectId) &&
+    isOptionalString(value.projectName) && Number.isFinite(Date.parse(value.createdAt));
+}
+
 function validTaskCreationRecord(value) {
   if (!isRecord(value)) return false;
   const allowed = new Set([
     'status', 'threadId', 'turnId', 'taskName', 'workspace', 'errorCategory',
     'recoveryStartedAt', 'recoveredAt', 'cleanupProof', 'projectId', 'projectName',
     'receiptStatus', 'receiptUpdatedAt', 'receiptErrorCategory', 'receiptMessageId',
+    'originIntent',
   ]);
   return hasOnlyKeys(value, allowed) && TASK_CREATION_STATUSES.has(value.status) &&
     ['threadId', 'turnId', 'taskName', 'errorCategory', 'projectId', 'projectName',
@@ -144,7 +154,8 @@ function validTaskCreationRecord(value) {
     (value.receiptStatus === undefined || CREATION_RECEIPT_STATUSES.has(value.receiptStatus)) &&
     isOptionalTimestamp(value.receiptUpdatedAt) &&
     isOptionalTimestamp(value.recoveryStartedAt) && isOptionalTimestamp(value.recoveredAt) &&
-    validWorkspace(value.workspace) && validCleanupProof(value.cleanupProof);
+    validWorkspace(value.workspace) && validCleanupProof(value.cleanupProof) &&
+    validCreationOriginIntent(value.originIntent);
 }
 
 function validDiscordTurnOrigin(_turnId, value) {
@@ -583,15 +594,38 @@ export async function persistDiscordTurnOrigin({ state, persistState, origin }) 
   });
 }
 
-/** Resolve only an exact turn/thread/guild binding; channel routing never trusts notification input. */
+/** Enrich a native notification only from a trusted exact persisted turn/thread binding. */
+export function enrichDiscordOriginNotification(notification, state) {
+  const turnId = String(notification?.['turn-id'] ?? '').trim();
+  const threadId = String(notification?.['thread-id'] ?? '').trim();
+  if (!turnId || !threadId) return null;
+  const origin = state?.discordTurnOrigins?.[turnId];
+  if (!origin || !validDiscordTurnOrigin(turnId, origin) || origin.threadId !== threadId) return null;
+  for (const [field, expected] of [
+    ['discord-guild-id', origin.guildId],
+    ['discord-origin-channel-id', origin.channelId],
+  ]) {
+    if (notification?.[field] === undefined) continue;
+    const supplied = String(notification[field] ?? '').trim();
+    if (!/^\d{17,20}$/u.test(supplied) || supplied !== expected) return null;
+  }
+  return {
+    ...notification,
+    'discord-guild-id': origin.guildId,
+    'discord-origin-channel-id': origin.channelId,
+  };
+}
+
+/** Resolve only an exact turn/thread/guild/channel binding after trusted enrichment. */
 export function resolveDiscordOrigin(notification, state) {
   const turnId = String(notification?.['turn-id'] ?? '').trim();
   const threadId = String(notification?.['thread-id'] ?? '').trim();
   const guildId = String(notification?.['discord-guild-id'] ?? '').trim();
-  if (!turnId || !threadId || (guildId && !/^\d{17,20}$/u.test(guildId))) return null;
+  const channelId = String(notification?.['discord-origin-channel-id'] ?? '').trim();
+  if (!turnId || !threadId || !/^\d{17,20}$/u.test(guildId) || !/^\d{17,20}$/u.test(channelId)) return null;
   const origin = state?.discordTurnOrigins?.[turnId];
   if (!origin || !validDiscordTurnOrigin(turnId, origin)) return null;
-  if (origin.threadId !== threadId || (guildId && origin.guildId !== guildId)) return null;
+  if (origin.threadId !== threadId || origin.guildId !== guildId || origin.channelId !== channelId) return null;
   return origin;
 }
 

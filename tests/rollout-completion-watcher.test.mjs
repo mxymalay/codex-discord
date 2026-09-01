@@ -295,8 +295,7 @@ test('streams only exact-root commentary and sanitized tool lifecycle to the per
     assert.equal(serialized.includes('RAW-OUTPUT-CANARY'), false);
     assert.equal(serialized.includes('COMPLETE-AFTER-CANARY'), false);
     assert.equal(serialized.includes('sub_agent_activity'), false);
-    assert.match(sent[1].content, /本机路径/);
-    assert.match(sent[1].content, /代码内容已省略/);
+    assert.match(sent[1].content, /详细进度包含本机或敏感内容，已隐藏/u);
     assert.match(sent[1].content, /第二步正在核对最新状态/u);
     assert.equal(state.discordTurnOrigins[turnId].deliveredEventIds.length, 4);
     assert.ok(state.discordTurnOrigins[turnId].rolloutCursor > 0);
@@ -309,6 +308,40 @@ test('streams only exact-root commentary and sanitized tool lifecycle to the per
     assert.equal(sent.length, 4, 'a persisted cursor must not replay successful progress after restart');
   } finally {
     await fs.rm(paths.root, { recursive: true, force: true });
+  }
+});
+
+test('suspicious commentary is default-denied to one fixed coarse progress message', async () => {
+  const samples = [
+    '查看 "/home/alice/private key.txt"', '查看 `/srv/top/secret.env`', '检查 C:/Users/Jane/private.txt',
+    '检查 "D:\\Private Folder\\key.txt"', '检查 \\\\server\\private share\\key.txt',
+    'curl -H "Authorization: Bearer abc def" https://example.test/x', 'node tool.js --password hunter2',
+    'AKIAABCDEFGHIJKLMNOP', 'ghp_abcdefghijklmnopqrstuvwxyz123456', 'xoxb-1234567890-secretvalue',
+    '[点此](https://private.example/path)', '```js\nconst secret = 1;', 'const secret = process.env.KEY;',
+    'powershell -File tool.ps1 -Token private-value',
+  ];
+  for (const [index, sample] of samples.entries()) {
+    const paths = await fixture();
+    const state = createEmptyInboxState();
+    state.discordTurnOrigins[turnId] = {
+      threadId, guildId: '222222222222222222', channelId: '777777777777777777', source: 'slash',
+      createdAt: '2026-09-01T00:00:01.000Z', rolloutCursor: 0, deliveredEventIds: [], deliveryState: 'pending',
+    };
+    const sent = [];
+    try {
+      await fs.writeFile(paths.rolloutPath, [sessionMeta(), taskStarted(), {
+        type: 'event_msg', payload: { type: 'agent_message', phase: 'commentary', message: sample },
+      }].map(jsonLine).join(''), 'utf8');
+      await pollDiscordOriginEvents({
+        sessionsRoot: paths.sessionsRoot, inboxState: state, persistInboxState: async () => {},
+        dispatchMessage: async (message) => { sent.push(message); return { id: `m-${index}` }; },
+      });
+      const commentary = sent.find((item) => item.kind === 'commentary');
+      assert.equal(commentary.content, '### 任务进度\n正在处理任务（详细进度包含本机或敏感内容，已隐藏）。');
+      assert.equal(JSON.stringify(sent).includes(sample), false);
+    } finally {
+      await fs.rm(paths.root, { recursive: true, force: true });
+    }
   }
 });
 
@@ -344,6 +377,48 @@ test('failed source-channel send advances only through prior successes and retri
     assert.equal(calls.at(-1).kind, 'commentary');
     assert.equal(calls.at(-1).nonce, failedNonce);
     assert.equal(state.discordTurnOrigins[turnId].deliveredEventIds.length, 2);
+  } finally {
+    await fs.rm(paths.root, { recursive: true, force: true });
+  }
+});
+
+test('a sent commentary keeps its nonce when state commit fails and a later commentary is appended', async () => {
+  const paths = await fixture();
+  const state = createEmptyInboxState();
+  state.discordTurnOrigins[turnId] = {
+    threadId, guildId: '222222222222222222', channelId: '777777777777777777', source: 'slash',
+    createdAt: '2026-09-01T00:00:01.000Z', rolloutCursor: 0, deliveredEventIds: [], deliveryState: 'pending',
+  };
+  const calls = [];
+  let failCommentaryCommit = true;
+  try {
+    await fs.writeFile(paths.rolloutPath, [sessionMeta(), taskStarted(), {
+      type: 'event_msg', payload: { type: 'agent_message', phase: 'commentary', message: '第一段安全进度' },
+    }].map(jsonLine).join(''), 'utf8');
+    const persistInboxState = async (snapshot) => {
+      if (failCommentaryCommit && snapshot.discordTurnOrigins[turnId].deliveredEventIds.length === 2) {
+        failCommentaryCommit = false;
+        throw new Error('state commit unavailable');
+      }
+    };
+    const dispatchMessage = async (message) => {
+      calls.push(structuredClone(message));
+      return { id: `message-${calls.length}` };
+    };
+    await assert.rejects(() => pollDiscordOriginEvents({
+      sessionsRoot: paths.sessionsRoot, inboxState: state, persistInboxState, dispatchMessage,
+    }), /progress persistence failed/u);
+    const firstAttempt = calls.find((item) => item.kind === 'commentary');
+
+    await fs.appendFile(paths.rolloutPath, jsonLine({
+      type: 'event_msg', payload: { type: 'agent_message', phase: 'commentary', message: '第二段安全进度' },
+    }), 'utf8');
+    await pollDiscordOriginEvents({ sessionsRoot: paths.sessionsRoot, inboxState: state, persistInboxState, dispatchMessage });
+    const attempts = calls.filter((item) => item.kind === 'commentary');
+    assert.equal(attempts.length, 2);
+    assert.equal(attempts[1].nonce, firstAttempt.nonce);
+    assert.equal(attempts[1].enforceNonce, true);
+    assert.match(attempts[1].content, /第二段安全进度/u);
   } finally {
     await fs.rm(paths.root, { recursive: true, force: true });
   }
@@ -503,6 +578,39 @@ test('terminal fallback enriches an exact persisted origin and marks delivery on
       dispatchNotification: async (notification) => { dispatched.push(structuredClone(notification)); },
     });
     assert.equal(dispatched.length, 1, 'a delivered Discord-origin terminal must not replay after restart polling');
+  } finally {
+    await fs.rm(paths.root, { recursive: true, force: true });
+  }
+});
+
+test('a missing watcher state recovers an already-complete exact pending Discord origin once', async () => {
+  const paths = await fixture();
+  const inboxState = createEmptyInboxState();
+  inboxState.discordTurnOrigins[turnId] = {
+    threadId, guildId: '222222222222222222', channelId: '777777777777777777', source: 'new-task',
+    createdAt: '2026-09-01T00:00:01.000Z', rolloutCursor: 0, deliveredEventIds: [], deliveryState: 'pending',
+  };
+  const dispatched = [];
+  try {
+    await fs.writeFile(paths.rolloutPath, [sessionMeta(), taskStarted(), userMessage(), taskComplete()].map(jsonLine).join(''), 'utf8');
+    const state = createEmptyRolloutWatcherState();
+    await pollRolloutCompletions({
+      sessionsRoot: paths.sessionsRoot, state, inboxState, persistInboxState: async () => {},
+      nowMs: Date.parse('2026-09-01T00:00:20.000Z'), graceMs: 0, retryMs: 0,
+      dispatchNotification: async (notification) => dispatched.push(structuredClone(notification)),
+    });
+
+    assert.equal(dispatched.length, 1);
+    assert.equal(dispatched[0]['turn-id'], turnId);
+    assert.equal(dispatched[0]['discord-origin-channel-id'], '777777777777777777');
+    assert.equal(inboxState.discordTurnOrigins[turnId].deliveryState, 'terminal-delivered');
+
+    await pollRolloutCompletions({
+      sessionsRoot: paths.sessionsRoot, state: structuredClone(state), inboxState: structuredClone(inboxState),
+      persistInboxState: async () => {}, nowMs: Date.parse('2026-09-01T00:00:30.000Z'), graceMs: 0, retryMs: 0,
+      dispatchNotification: async (notification) => dispatched.push(structuredClone(notification)),
+    });
+    assert.equal(dispatched.length, 1);
   } finally {
     await fs.rm(paths.root, { recursive: true, force: true });
   }

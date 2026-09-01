@@ -28,6 +28,8 @@ function Invoke-TaskCase {
         [string]$OriginGuildId = '',
         [string]$TurnId = $script:turnId,
         [string]$ThreadId = $script:threadId,
+        [string]$TaskMessage = '处理 Discord Bot 通知',
+        [string]$Cwd = 'C:\workspace\demo-project',
         [switch]$SyntheticTest,
         [switch]$LiveSend
     )
@@ -36,8 +38,8 @@ function Invoke-TaskCase {
         type = 'agent-turn-complete'
         'thread-id' = $ThreadId
         'turn-id' = $TurnId
-        cwd = 'C:\workspace\demo-project'
-        'input-messages' = @('处理 Discord Bot 通知')
+        cwd = $Cwd
+        'input-messages' = @($TaskMessage)
         'last-assistant-message' = $AssistantMessage
     }
     if (-not [string]::IsNullOrWhiteSpace($OriginChannelId)) {
@@ -149,6 +151,29 @@ try {
     if (@($completed.payload.allowed_mentions.parse).Count -ne 0) {
         throw 'Discord Bot payload enabled automatic mentions'
     }
+
+    $markdownTaskName = '# heading [task](https://evil.invalid) ``` > quote **bold**'
+    Write-Utf8NoBom -Path (Join-Path $tempRoot 'session_index.jsonl') -Content (([ordered]@{ id=$threadId; thread_name=$markdownTaskName; updated_at='2026-08-31T00:00:00Z' } | ConvertTo-Json -Compress) + "`n")
+    $markdownCase = Invoke-TaskCase `
+        -AssistantMessage '# result [link](https://evil.invalid) ``` > quote **bold**' `
+        -TaskMessage '# task [link](https://evil.invalid) ``` > quote **bold**' `
+        -Cwd 'C:\workspace\# project [link](evil) ``` > quote **bold**'
+    $markdownFields = @{}
+    foreach ($field in @($markdownCase.payload.embeds[0].fields)) { $markdownFields[[string]$field.name] = [string]$field.value }
+    foreach ($name in @('项目名', '任务名', '任务', '结果')) {
+        if (-not $markdownFields.ContainsKey($name)) { throw "Markdown case omitted fixed field heading: $name" }
+        $value = $markdownFields[$name]
+        if ($value -match '(?m)(^|\s)#\s' -or $value -match '\[[^\]]+\]\(' -or
+            $value.Contains('```') -or $value -match '(?m)(^|\s)>\s' -or $value.Contains('**bold**')) {
+            throw "Dynamic Discord field retained executable Markdown: $name"
+        }
+        if (-not $value.Contains('\#') -or -not $value.Contains('\[') -or
+            -not $value.Contains('\`') -or -not $value.Contains('\>') -or -not $value.Contains('\*')) {
+            throw "Dynamic Discord field was not uniformly Markdown-escaped: $name"
+        }
+    }
+    if (@($markdownCase.payload.allowed_mentions.parse).Count -ne 0) { throw 'Markdown case enabled automatic mentions' }
+    Write-Utf8NoBom -Path (Join-Path $tempRoot 'session_index.jsonl') -Content (([ordered]@{ id=$threadId; thread_name='Discord Bot 测试任务'; updated_at='2026-08-31T00:00:00Z' } | ConvertTo-Json -Compress) + "`n")
 
     $confirmation = Invoke-TaskCase -AssistantMessage '我准备安装依赖并修改配置，可以吗？'
     if ([string]$confirmation.channelId -ne $confirmationChannelId -or [string]$confirmation.event -ne 'user-task-confirmation-required') {
@@ -274,6 +299,10 @@ try {
     if ([string]$quota.channelId -ne $quotaChannelId) {
         throw 'Quota event did not remain on the fixed quota channel'
     }
+    if (-not [string]$quota.payload.embeds[0].description.Contains('**系统测试通知：**')) {
+        throw 'Fixed Discord bold label formatting was lost while escaping dynamic values'
+    }
+    if (@($quota.payload.allowed_mentions.parse).Count -ne 0) { throw 'Quota payload enabled automatic mentions' }
 
     $callLogPath = Join-Path $tempRoot 'discord-calls.jsonl'
     $oldCallLog = $env:CODEX_DISCORD_TEST_CALL_LOG

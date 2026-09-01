@@ -398,8 +398,11 @@ test('list, search, receipts, and detail metadata cannot inject structural Markd
   assert.equal(list.includes('\n```js'), false);
   assert.equal(list.includes('**bold**'), false);
   const detail = renderTaskDetail(hostile);
-  assert.match(detail, /# full task Markdown\n```js\nconst ok = true;/);
-  assert.match(detail, /\*\*full result Markdown\*\*/);
+  assert.equal(detail.includes('\n# full task Markdown'), false);
+  assert.equal(detail.includes('\n```js'), false);
+  assert.equal(detail.includes('**full result Markdown**'), false);
+  assert.match(detail, /\\# full task Markdown/u);
+  assert.match(detail, /\\\*\\\*full result Markdown\\\*\\\*/u);
   assert.equal(detail.includes('\n# injected'), false);
 
   const huge = 'X\n# injected **bold**'.repeat(1_000);
@@ -1632,6 +1635,26 @@ test('creation receipt records a fixed failure category when original and follow
     outcome: { status: 'failed', errorCategory: 'creation-receipt-delivery-failed' },
   }]);
   assert.equal(JSON.stringify(returned).includes('token should stay private'), false);
+});
+
+test('an externally-started task with uncertain persistence never claims that no task was created', async () => {
+  const { dependencies, responses, edits } = makeDependencies({
+    createNewTaskOnce: async () => ({
+      status: 'start-uncertain', threadId: 'thread-uncertain-1', turnId: 'turn-uncertain-1',
+      taskName: '远程任务', workspace: { mode: 'local', cwd: 'C:\\safe\\POS' },
+    }),
+  });
+  const router = createInteractionRouter(dependencies);
+  await router.handle(commandInteraction('新建任务', { 项目: 'project-1' }));
+  const customId = responses.shift().data.custom_id;
+
+  await router.handle(modalSubmit(customId, '外部已启动但状态提交未知', { id: 'interaction-uncertain' }));
+
+  const content = edits.at(-1).content;
+  assert.match(content, /可能已经启动/u);
+  assert.match(content, /请勿重复提交/u);
+  assert.doesNotMatch(content, /未创建可继续/u);
+  assert.doesNotMatch(content, /任务创建成功/u);
 });
 
 test('duplicate modal delivery creates and inserts exactly once', async () => {

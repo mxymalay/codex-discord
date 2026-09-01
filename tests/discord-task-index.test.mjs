@@ -436,6 +436,36 @@ test('reuses an unchanged previous record without opening its rollout body and r
   }
 });
 
+test('an unchanged historic null project is re-inferred from the latest ygf catalog', async () => {
+  const paths = await fixture();
+  const threadId = '019cdef0-4321-7890-abcd-1234567890ac';
+  const rolloutPath = paths.rollout(`2026-09-01T00-00-00-${threadId}`);
+  try {
+    await writeJsonl(paths.sessionIndexPath, [{ id: threadId, thread_name: 'ygf 历史任务' }]);
+    await writeJsonl(rolloutPath, [
+      meta(threadId, { cwd: 'C:\\Users\\86166\\Desktop\\ygf\\app' }),
+      event('2026-09-01T00:04:00.000Z', 'task_started', { turn_id: 'body-turn' }),
+      event('2026-09-01T00:05:00.000Z', 'task_complete', { turn_id: 'body-turn' }),
+    ]);
+    const size = (await fs.stat(rolloutPath)).size;
+    const previous = {
+      threadId, projectId: null, projectName: null, taskName: '旧标题', status: 'completed',
+      rolloutPath, offset: size, worktreePath: null, worktreeBranch: null,
+    };
+
+    const index = await buildTaskIndex({
+      ...paths,
+      previousIndex: { version: 1, generatedAt: null, tasks: [previous] },
+      projects: [{ id: 'ygf', name: 'ygf', roots: ['C:\\Users\\86166\\Desktop\\ygf'] }],
+    });
+
+    assert.equal(index.tasks[0].projectId, 'ygf');
+    assert.equal(index.tasks[0].projectName, 'ygf');
+  } finally {
+    await fs.rm(paths.root, { recursive: true, force: true });
+  }
+});
+
 test('streams sidebar lines and skips standard-filename rollouts absent from the current sidebar before body reads', async () => {
   const paths = await fixture();
   const sidebarId = '019cdef0-aaaa-7890-abcd-1234567890ab';

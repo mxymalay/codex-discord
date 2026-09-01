@@ -447,6 +447,40 @@ function Limit-DiscordText {
     return $Value.Substring(0, $MaximumLength - 1) + '…'
 }
 
+function ConvertTo-DiscordMarkdownValue {
+    param([string]$Value)
+
+    if ([string]::IsNullOrEmpty($Value)) {
+        return $Value
+    }
+    return [regex]::Replace(
+        $Value,
+        '[\\`*_{}\[\]()<>#+\-.!|~>]',
+        [System.Text.RegularExpressions.MatchEvaluator]{ param($match) '\' + $match.Value }
+    )
+}
+
+function ConvertTo-DiscordMarkdownBody {
+    param([string]$Value)
+
+    if ([string]::IsNullOrEmpty($Value)) {
+        return $Value
+    }
+    $lines = $Value -split '\r?\n', -1
+    $escaped = foreach ($line in $lines) {
+        $labelMatch = [regex]::Match($line, '\A([^：\r\n]{1,24})：(.*)\z')
+        if ($labelMatch.Success) {
+            $label = ConvertTo-DiscordMarkdownValue -Value $labelMatch.Groups[1].Value
+            $content = ConvertTo-DiscordMarkdownValue -Value $labelMatch.Groups[2].Value
+            "**$label：**$content"
+        }
+        else {
+            ConvertTo-DiscordMarkdownValue -Value $line
+        }
+    }
+    return $escaped -join "`n"
+}
+
 function New-DiscordWebhookPayload {
     param(
         [string]$Title,
@@ -462,7 +496,7 @@ function New-DiscordWebhookPayload {
     }
 
     $embed = [ordered]@{
-        title = Limit-DiscordText -Value $Title -MaximumLength 256
+        title = Limit-DiscordText -Value (ConvertTo-DiscordMarkdownValue -Value $Title) -MaximumLength 256
         color = $color
     }
 
@@ -472,33 +506,33 @@ function New-DiscordWebhookPayload {
         $fields = @(
             [ordered]@{
                 name = '项目名'
-                value = Limit-DiscordText -Value $taskBodyMatch.Groups[1].Value -MaximumLength 1024
+                value = Limit-DiscordText -Value (ConvertTo-DiscordMarkdownValue -Value $taskBodyMatch.Groups[1].Value) -MaximumLength 1024
                 inline = $true
             },
             [ordered]@{
                 name = '任务名'
-                value = Limit-DiscordText -Value $taskBodyMatch.Groups[2].Value -MaximumLength 1024
+                value = Limit-DiscordText -Value (ConvertTo-DiscordMarkdownValue -Value $taskBodyMatch.Groups[2].Value) -MaximumLength 1024
                 inline = $true
             }
         )
         if ($taskBodyMatch.Groups[3].Success -and -not [string]::IsNullOrWhiteSpace($taskBodyMatch.Groups[3].Value)) {
             $fields += [ordered]@{
                 name = '任务'
-                value = Limit-DiscordText -Value $taskBodyMatch.Groups[3].Value -MaximumLength 1024
+                value = Limit-DiscordText -Value (ConvertTo-DiscordMarkdownValue -Value $taskBodyMatch.Groups[3].Value) -MaximumLength 1024
                 inline = $false
             }
         }
         if ($taskBodyMatch.Groups[4].Success -and -not [string]::IsNullOrWhiteSpace($taskBodyMatch.Groups[5].Value)) {
             $fields += [ordered]@{
                 name = $taskBodyMatch.Groups[4].Value
-                value = Limit-DiscordText -Value $taskBodyMatch.Groups[5].Value -MaximumLength 1024
+                value = Limit-DiscordText -Value (ConvertTo-DiscordMarkdownValue -Value $taskBodyMatch.Groups[5].Value) -MaximumLength 1024
                 inline = $false
             }
         }
         $embed.fields = $fields
     }
     else {
-        $markdownBody = [regex]::Replace($Body, '(?m)^([^：\r\n]{1,24}：)', '**$1**')
+        $markdownBody = ConvertTo-DiscordMarkdownBody -Value $Body
         $embed.description = Limit-DiscordText -Value $markdownBody -MaximumLength 4096
     }
 
@@ -694,6 +728,25 @@ function Read-VerifiedDiscordTurnOrigins {
     }
 }
 
+function Resolve-DiscordOriginRoute {
+    param(
+        [string]$TurnId,
+        [string]$ThreadId,
+        [string]$GuildId,
+        [string]$ChannelId,
+        [string]$OriginTurnId,
+        [object]$Origin
+    )
+
+    if ($null -eq $Origin -or [string]::IsNullOrWhiteSpace($TurnId) -or [string]::IsNullOrWhiteSpace($ThreadId) -or
+        $GuildId -notmatch '\A[0-9]{17,20}\z' -or $ChannelId -notmatch '\A[0-9]{17,20}\z' -or
+        $TurnId -cne $OriginTurnId -or $ThreadId -cne [string]$Origin.threadId -or
+        $GuildId -cne [string]$Origin.guildId -or $ChannelId -cne [string]$Origin.channelId) {
+        return $null
+    }
+    return $Origin
+}
+
 function Get-VerifiedDiscordTurnOriginRecord {
     param([object]$Notification)
 
@@ -714,29 +767,39 @@ function Get-VerifiedDiscordTurnOriginRecord {
     $originProperty = $origins.PSObject.Properties |
         Where-Object { $_.Name -ceq [string]$turnProperty.Value } |
         Select-Object -First 1
-    if ($null -eq $originProperty -or [string]$originProperty.Value.threadId -cne [string]$threadProperty.Value) {
+    if ($null -eq $originProperty) {
         return $null
     }
 
+    $resolvedChannelId = [string]$originProperty.Value.channelId
     $notificationChannel = $Notification.PSObject.Properties |
         Where-Object { $_.Name -ceq 'discord-origin-channel-id' } |
         Select-Object -First 1
-    if ($null -ne $notificationChannel -and
-        ($notificationChannel.Value -isnot [string] -or
-         $notificationChannel.Value -notmatch '\A[0-9]{17,20}\z' -or
-         [string]$notificationChannel.Value -cne [string]$originProperty.Value.channelId)) {
-        return $null
+    if ($null -ne $notificationChannel) {
+        if ($notificationChannel.Value -isnot [string] -or $notificationChannel.Value -notmatch '\A[0-9]{17,20}\z') {
+            return $null
+        }
+        $resolvedChannelId = [string]$notificationChannel.Value
     }
+
+    $resolvedGuildId = [string]$originProperty.Value.guildId
     $notificationGuild = $Notification.PSObject.Properties |
         Where-Object { $_.Name -ceq 'discord-guild-id' } |
         Select-Object -First 1
-    if ($null -ne $notificationGuild -and
-        ($notificationGuild.Value -isnot [string] -or
-         $notificationGuild.Value -notmatch '\A[0-9]{17,20}\z' -or
-         [string]$notificationGuild.Value -cne [string]$originProperty.Value.guildId)) {
-        return $null
+    if ($null -ne $notificationGuild) {
+        if ($notificationGuild.Value -isnot [string] -or $notificationGuild.Value -notmatch '\A[0-9]{17,20}\z') {
+            return $null
+        }
+        $resolvedGuildId = [string]$notificationGuild.Value
     }
-    return $originProperty.Value
+
+    return Resolve-DiscordOriginRoute `
+        -TurnId ([string]$turnProperty.Value) `
+        -ThreadId ([string]$threadProperty.Value) `
+        -GuildId $resolvedGuildId `
+        -ChannelId $resolvedChannelId `
+        -OriginTurnId ([string]$originProperty.Name) `
+        -Origin $originProperty.Value
 }
 
 function Get-DiscordOriginChannelId {

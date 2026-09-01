@@ -1169,7 +1169,7 @@ test('task creation shares the inbox commit queue with cursor updates and prunes
   assert.equal(Object.keys(state.createdTasksByInteraction).length <= 2_000, true);
 });
 
-test('failed started persistence observes rejected completion cleanup without hiding the persistence error', async () => {
+test('failed started persistence returns an honest uncertain result with a durable origin intent', async () => {
   const state = {};
   let threadCreatedRecord = null;
   const appServerMethods = [];
@@ -1188,7 +1188,7 @@ test('failed started persistence observes rejected completion cleanup without hi
   const onUnhandled = (error) => unhandled.push(error);
   process.on('unhandledRejection', onUnhandled);
   try {
-    await assert.rejects(() => createNewTaskOnce({
+    const result = await createNewTaskOnce({
       state, interactionId: 'startedrollback1',
       selection: { kind: 'projectless', projectId: null, projectName: '无项目', roots: ['C:\\tasks'] },
       text: 'started rollback', fileSystem: { mkdir: async () => {} },
@@ -1198,10 +1198,15 @@ test('failed started persistence observes rejected completion cleanup without hi
         if (record.status === 'started') throw new Error('final write failed');
       },
       clientFactory: () => appServer,
-    }), (error) => {
-      assert.equal(error.message, 'Task creation state persistence failed');
-      return true;
+      now: new Date('2026-09-01T00:00:00.000Z'),
+      discordOrigin: {
+        guildId: '12345678901234567', channelId: '22345678901234567', source: 'new-task',
+        projectId: null, projectName: '无项目',
+      },
     });
+    assert.equal(result.status, 'start-uncertain');
+    assert.equal(result.threadId, 'thread-started-rollback');
+    assert.equal(result.turnId, 'turn-started-rollback');
     await new Promise((resolve) => setImmediate(resolve));
     assert.deepEqual(unhandled, []);
   } finally {
@@ -1210,6 +1215,10 @@ test('failed started persistence observes rejected completion cleanup without hi
   assert.deepEqual(state.createdTasksByInteraction.startedrollback1, threadCreatedRecord);
   assert.equal(state.createdTasksByInteraction.startedrollback1.status, 'thread-created');
   assert.equal(state.createdTasksByInteraction.startedrollback1.threadId, 'thread-started-rollback');
+  assert.deepEqual(state.createdTasksByInteraction.startedrollback1.originIntent, {
+    guildId: '12345678901234567', channelId: '22345678901234567', source: 'new-task',
+    projectId: null, projectName: '无项目', createdAt: '2026-09-01T00:00:00.000Z',
+  });
   assert.equal(appServerMethods.filter((method) => method === 'close').length, 1);
 
   let externalCalls = 0;
@@ -1254,6 +1263,61 @@ test('creation and recovery require an injected persistence boundary before exte
     }), /persistence boundary is required/);
     assert.deepEqual(calls, []);
   });
+});
+
+test('restart recovery binds a thread-created origin intent to one exact root rollout without starting again', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'discord-create-origin-recovery-'));
+  const rollout = path.join(root, 'rollout.jsonl');
+  await fs.writeFile(rollout, [
+    { type: 'session_meta', payload: { id: 'thread-recover-origin', session_id: 'thread-recover-origin', cwd: 'C:\\safe' } },
+    { type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn-recover-origin' } },
+  ].map((entry) => JSON.stringify(entry)).join('\n') + '\n');
+  const record = {
+    status: 'thread-created', threadId: 'thread-recover-origin', taskName: '恢复任务',
+    projectId: 'project-1', projectName: 'POS',
+    workspace: { mode: 'local', cwd: 'C:\\safe', runtimeWorkspaceRoots: ['C:\\safe'], operationId: 'recoverorigin1' },
+    originIntent: {
+      guildId: '12345678901234567', channelId: '22345678901234567', source: 'new-task',
+      projectId: 'project-1', projectName: 'POS', createdAt: '2026-09-01T00:00:00.000Z',
+    },
+  };
+  const state = { createdTasksByInteraction: { recoverorigin1: record } };
+  let externalStarts = 0;
+  const recovered = await recoverInterruptedTaskCreations({
+    state, sessionsRoot: root, persistState: async () => {},
+    clientFactory: () => { externalStarts += 1; throw new Error('must not start'); },
+  });
+
+  assert.equal(externalStarts, 0);
+  assert.deepEqual(recovered, [{ interactionId: 'recoverorigin1', status: 'started', recoveredTurnId: 'turn-recover-origin' }]);
+  assert.equal(state.createdTasksByInteraction.recoverorigin1.status, 'started');
+  assert.equal(state.createdTasksByInteraction.recoverorigin1.turnId, 'turn-recover-origin');
+  assert.equal(state.createdTasksByInteraction.recoverorigin1.originIntent, undefined);
+  assert.equal(state.discordTurnOrigins['turn-recover-origin'].threadId, 'thread-recover-origin');
+  assert.equal(state.discordTurnOrigins['turn-recover-origin'].channelId, '22345678901234567');
+
+  assert.deepEqual(await recoverInterruptedTaskCreations({ state, sessionsRoot: root, persistState: async () => {} }), []);
+  await fs.rm(root, { recursive: true, force: true });
+});
+
+test('origin-intent recovery fails closed for child or ambiguous root rollouts', async () => {
+  for (const variant of ['child', 'ambiguous']) {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), `discord-create-origin-${variant}-`));
+    const entries = variant === 'child'
+      ? [{ type: 'session_meta', payload: { id: `thread-${variant}`, session_id: `thread-${variant}`, parent_thread_id: 'parent' } },
+        { type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn-child' } }]
+      : [{ type: 'session_meta', payload: { id: `thread-${variant}`, session_id: `thread-${variant}` } },
+        { type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn-a' } },
+        { type: 'event_msg', payload: { type: 'task_started', turn_id: 'turn-b' } }];
+    await fs.writeFile(path.join(root, 'rollout.jsonl'), entries.map(JSON.stringify).join('\n') + '\n');
+    const state = { createdTasksByInteraction: { [`recover-${variant}`]: {
+      status: 'thread-created', threadId: `thread-${variant}`, taskName: 'x', projectId: null, projectName: '无项目',
+      originIntent: { guildId: '12345678901234567', channelId: '22345678901234567', source: 'new-task', projectId: null, projectName: '无项目', createdAt: '2026-09-01T00:00:00.000Z' },
+    } } };
+    assert.deepEqual(await recoverInterruptedTaskCreations({ state, sessionsRoot: root, persistState: async () => {} }), []);
+    assert.equal(state.discordTurnOrigins, undefined);
+    await fs.rm(root, { recursive: true, force: true });
+  }
 });
 
 test('persists an operation plan before worktree add and safely cleans an immediate partial add', async () => {

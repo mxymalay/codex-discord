@@ -5,6 +5,7 @@ import { createHash, randomUUID } from 'node:crypto';
 
 import {
   advanceDiscordTurnOrigin,
+  enrichDiscordOriginNotification,
   prepareDiscordOriginTerminalDelivery,
   resolveDiscordOrigin,
 } from './discord-bridge-lib.mjs';
@@ -154,18 +155,24 @@ function outputText(payload) {
 }
 
 function sanitizeProgressText(value) {
-  let text = String(value ?? '').replace(/\r\n?/gu, '\n');
-  text = text.replace(/```[\s\S]*?```/gu, '[代码内容已省略]');
-  text = text.replace(/```[\s\S]*$/gu, '[代码内容已省略]');
-  text = text.replace(/https:\/\/discord(?:app)?\.com\/api\/webhooks\/[^\s)]+/giu, '[敏感信息已隐藏]');
-  text = text.replace(/\b(?:sk|sess|token)[-_][A-Za-z0-9_-]{8,}\b/giu, '[敏感信息已隐藏]');
-  text = text.replace(/\b(?:api[_-]?key|access[_-]?token|token|secret|password)\b\s*[:=]\s*(?:"[^"\r\n]*"|'[^'\r\n]*'|`[^`\r\n]*`|[^\s"'`]+)/giu, '[敏感信息已隐藏]');
-  text = text.replace(/\b(?:gh[pousr]_[A-Za-z0-9]{16,}|xox[baprs]-[A-Za-z0-9-]{10,})\b/giu, '[敏感信息已隐藏]');
-  text = text.replace(/\b[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{20,}\b/gu, '[敏感信息已隐藏]');
-  const nextSensitiveValue = '(?:[A-Za-z]:[\\\\/]|\\\\\\\\|/(?!/)|(?:api[_-]?key|access[_-]?token|token|secret|password)\\b\\s*[:=]|\\[代码内容已省略\\]|＠)';
-  text = text.replace(new RegExp(`\\b[A-Za-z]:[\\\\/][^\\r\\n]*?(?=\\s+${nextSensitiveValue}|$)`, 'gimu'), '[本机路径]');
-  text = text.replace(new RegExp(`\\\\\\\\[^\\r\\n]*?(?=\\s+${nextSensitiveValue}|$)`, 'gimu'), '[本机路径]');
-  text = text.replace(new RegExp(`(^|[\\s(])/(?!/)[^\\r\\n]*?(?=\\s+${nextSensitiveValue}|$)`, 'gimu'), '$1[本机路径]');
+  let text = String(value ?? '').replace(/\r\n?/gu, '\n').trim();
+  const suspicious = [
+    /```|`/u,
+    /https?:\/\/|\[[^\]\r\n]+\]\([^\r\n)]+\)|<https?:/iu,
+    /(?:^|[\s"'`(])[A-Za-z]:[\\/]/mu,
+    /\\\\[^\s\\]+\\/u,
+    /(?:^|[\s"'`(])\/(?!\/)[^\s]/mu,
+    /\b(?:authorization|bearer|api[_ -]?key|access[_ -]?token|password|passwd|secret)\b/iu,
+    /--(?:password|passwd|token|secret|api[-_]?key)\b/iu,
+    /\bAKIA[A-Z0-9]{16}\b/u,
+    /\b(?:gh[pousr]_[A-Za-z0-9]{16,}|xox[baprs]-[A-Za-z0-9-]{10,})\b/iu,
+    /\b[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{20,}\b/u,
+    /(?:^|\n)\s*(?:curl|wget|node|python|git|npm|pnpm|yarn|pwsh|powershell|cmd|bash|sh|rm|cp|mv|Get-[A-Za-z]+)\b/imu,
+    /(?:^|\n)\s*(?:const|let|var|function|class|import|export|def)\b|=>|\bprocess\.env\b/imu,
+  ];
+  if (suspicious.some((pattern) => pattern.test(text))) {
+    return '正在处理任务（详细进度包含本机或敏感内容，已隐藏）。';
+  }
   text = text.replace(/@/gu, '＠').replace(/^\s*([#>|])/gmu, '\\$1');
   text = text.replace(/\n{3,}/gu, '\n\n').trim();
   if (!text) return '';
@@ -196,7 +203,7 @@ function coalesceProgressBursts(events) {
   for (const event of events) {
     const previous = coalesced.at(-1);
     if (event.kind !== 'commentary' || previous?.kind !== 'commentary') {
-      coalesced.push({ ...event });
+      coalesced.push({ ...event, identityStart: event.start, identityEnd: event.end });
       continue;
     }
     previous.end = event.end;
@@ -271,7 +278,7 @@ function extractOriginProgress(lines, origin, fingerprint) {
   return coalesceProgressBursts(events).map((event) => {
     const eventId = eventIdentifier({
       fingerprint, turnId: origin.turnId, kind: event.kind,
-      lineStart: event.start, lineEnd: event.end, semantic: event.semantic,
+      lineStart: event.identityStart ?? event.start, lineEnd: event.identityEnd ?? event.end,
     });
     return { ...event, eventId, nonce: discordNonce(eventId) };
   });
@@ -434,12 +441,56 @@ async function ensureRootEligibility(filePath, fileState, info) {
   fileState.rootEligible = rootSessionMeta(metadata, fileState.threadId);
 }
 
-export async function initializeRolloutWatcherState({ sessionsRoot, state, nowMs = Date.now() }) {
+async function recoverPersistedPendingCompletions({ filePaths, state, inboxState, nowMs }) {
+  const wanted = new Map(Object.entries(inboxState?.discordTurnOrigins ?? {})
+    .filter(([, origin]) => origin?.deliveryState !== 'terminal-delivered')
+    .map(([turnId, origin]) => [turnId, origin]));
+  if (wanted.size === 0) return;
+  const candidates = new Map();
+  for (const filePath of filePaths) {
+    let info;
+    try { info = await fs.stat(filePath); } catch { continue; }
+    if (!info.isFile() || info.size <= 0 || info.size > 16 * 1024 * 1024) continue;
+    const content = await readRange(filePath, 0, info.size);
+    const entries = parseLines(content);
+    const metas = entries.filter((entry) => entry?.type === 'session_meta');
+    if (metas.length !== 1) continue;
+    const threadId = String(metas[0].payload?.id ?? '');
+    if (!rootSessionMeta(metas[0], threadId)) continue;
+    const matching = [...wanted.entries()].filter(([, origin]) => origin.threadId === threadId);
+    if (matching.length === 0) continue;
+    const starts = new Set(entries
+      .filter((entry) => entry?.type === 'event_msg' && entry.payload?.type === 'task_started')
+      .map((entry) => String(entry.payload?.turn_id ?? '')).filter(Boolean));
+    for (const [turnId] of matching) {
+      if (!starts.has(turnId)) continue;
+      const completion = entries.find((entry) => entry?.type === 'event_msg' &&
+        entry.payload?.type === 'task_complete' && String(entry.payload?.turn_id ?? '') === turnId);
+      if (!completion) continue;
+      const items = candidates.get(turnId) ?? [];
+      items.push({
+        completedAtMs: Date.parse(String(completion.timestamp ?? '')) || nowMs,
+        lastAttemptAtMs: 0,
+        rolloutPath: filePath,
+        threadId,
+        cwd: String(metas[0].payload?.cwd ?? ''),
+      });
+      candidates.set(turnId, items);
+    }
+  }
+  for (const [turnId, items] of candidates) {
+    if (items.length === 1) state.pending[turnId] = items[0];
+  }
+}
+
+export async function initializeRolloutWatcherState({ sessionsRoot, state, nowMs = Date.now(), inboxState }) {
   if (state.initialized) return state;
-  for (const filePath of await listRolloutFiles(sessionsRoot)) {
+  const filePaths = await listRolloutFiles(sessionsRoot);
+  for (const filePath of filePaths) {
     const info = await fs.stat(filePath);
     state.files[filePath] = await hydrateExistingFile(filePath, info, nowMs);
   }
+  await recoverPersistedPendingCompletions({ filePaths, state, inboxState, nowMs });
   state.initialized = true;
   return state;
 }
@@ -469,7 +520,7 @@ export async function pollRolloutCompletions({
   inboxState,
   persistInboxState,
 }) {
-  if (!state.initialized) await initializeRolloutWatcherState({ sessionsRoot, state, nowMs });
+  if (!state.initialized) await initializeRolloutWatcherState({ sessionsRoot, state, nowMs, inboxState });
   for (const filePath of await listRolloutFiles(sessionsRoot)) {
     const info = await fs.stat(filePath);
     if (!state.files[filePath]) {
@@ -485,7 +536,8 @@ export async function pollRolloutCompletions({
   for (const [turnId, item] of ready) {
     item.lastAttemptAtMs = nowMs;
     const notification = await reconstructNotification(item, turnId);
-    const origin = resolveDiscordOrigin(notification, inboxState);
+    const enrichedNotification = enrichDiscordOriginNotification(notification, inboxState);
+    const origin = enrichedNotification ? resolveDiscordOrigin(enrichedNotification, inboxState) : null;
     if (origin?.deliveryState === 'terminal-delivered') {
       delete state.pending[turnId];
       continue;
@@ -501,8 +553,8 @@ export async function pollRolloutCompletions({
         turnId,
         eventId: terminalEventId,
       });
-      notification['discord-origin-channel-id'] = origin.channelId;
-      notification['discord-guild-id'] = origin.guildId;
+      notification['discord-origin-channel-id'] = enrichedNotification['discord-origin-channel-id'];
+      notification['discord-guild-id'] = enrichedNotification['discord-guild-id'];
     }
     await dispatchNotification(notification);
     if (origin) {

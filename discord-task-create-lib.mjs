@@ -882,6 +882,14 @@ export async function createNewTaskOnce({
       projectId: selection?.kind === 'project' ? selection.projectId : null,
       projectName: selection?.projectName ?? (selection?.kind === 'project' ? selection.projectId : '无项目'),
     };
+    const originIntent = discordOrigin ? {
+      guildId: discordOrigin.guildId,
+      channelId: discordOrigin.channelId,
+      source: 'new-task',
+      projectId: discordOrigin.projectId ?? null,
+      projectName: discordOrigin.projectName ?? null,
+      createdAt: now.toISOString(),
+    } : undefined;
     let prepared = null;
     let started = null;
     try {
@@ -935,6 +943,7 @@ export async function createNewTaskOnce({
               threadId,
               taskName,
               workspace: persistentWorkspace,
+              ...(originIntent ? { originIntent } : {}),
             },
             persistState,
           });
@@ -975,6 +984,16 @@ export async function createNewTaskOnce({
       }
       const current = state.createdTasksByInteraction[interactionId];
       if (error?.persistenceFailure) {
+        if (started) {
+          return {
+            status: 'start-uncertain',
+            threadId: started.threadId,
+            turnId: started.turnId,
+            taskName: started.taskName,
+            ...projectIdentity,
+            workspace: persistableWorkspace(started.workspace),
+          };
+        }
         throw error;
       }
       if (error?.threadId || current?.threadId) {
@@ -1017,9 +1036,63 @@ export async function createNewTaskOnce({
   }
 }
 
+function isExactRootSessionMeta(payload, threadId) {
+  if (!payload || typeof payload !== 'object' || String(payload.id ?? '') !== threadId) return false;
+  if (String(payload.thread_source ?? '').trim() && payload.thread_source !== 'user') return false;
+  if (String(payload.parent_thread_id ?? '').trim()) return false;
+  if (String(payload.session_id ?? '').trim() && String(payload.session_id) !== threadId) return false;
+  if (payload.source && typeof payload.source === 'object' && Object.entries(payload.source).some(
+    ([key, value]) => key.toLocaleLowerCase() === 'subagent' && value != null,
+  )) return false;
+  return true;
+}
+
+async function listRegularRollouts(root) {
+  if (!root || !path.isAbsolute(root)) return [];
+  const found = [];
+  const visit = async (directory) => {
+    let entries;
+    try { entries = await fs.readdir(directory, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      const candidate = path.join(directory, entry.name);
+      if (entry.isDirectory()) await visit(candidate);
+      else if (entry.isFile() && entry.name.endsWith('.jsonl')) found.push(candidate);
+    }
+  };
+  await visit(root);
+  return found;
+}
+
+async function findUniqueRootTurn(sessionsRoot, threadId) {
+  const candidates = [];
+  for (const filePath of await listRegularRollouts(sessionsRoot)) {
+    let info;
+    try { info = await fs.stat(filePath); } catch { continue; }
+    if (!info.isFile() || info.size <= 0 || info.size > 16 * 1024 * 1024) continue;
+    let content;
+    try { content = await fs.readFile(filePath, 'utf8'); } catch { continue; }
+    const entries = [];
+    let invalid = false;
+    for (const line of content.split(/\r?\n/u)) {
+      if (!line) continue;
+      try { entries.push(JSON.parse(line)); } catch { invalid = true; break; }
+    }
+    if (invalid) continue;
+    const metas = entries.filter((entry) => entry?.type === 'session_meta');
+    if (metas.length !== 1 || !isExactRootSessionMeta(metas[0].payload, threadId)) continue;
+    const turnIds = entries
+      .filter((entry) => entry?.type === 'event_msg' && entry.payload?.type === 'task_started')
+      .map((entry) => String(entry.payload?.turn_id ?? ''))
+      .filter(Boolean);
+    if (turnIds.length === 1) candidates.push(turnIds[0]);
+  }
+  return candidates.length === 1 ? candidates[0] : null;
+}
+
 export async function recoverInterruptedTaskCreations({
   state,
   worktreeRoot,
+  sessionsRoot,
   gitRunner = runGitWithSpawn,
   persistState,
   nowMs = Date.now(),
@@ -1029,6 +1102,20 @@ export async function recoverInterruptedTaskCreations({
   state.createdTasksByInteraction ??= {};
   const results = [];
   for (const [interactionId, record] of Object.entries(state.createdTasksByInteraction)) {
+    if (record?.status === 'thread-created' && record.threadId && record.originIntent) {
+      const turnId = await findUniqueRootTurn(sessionsRoot, record.threadId);
+      if (!turnId) continue;
+      const { originIntent, ...rest } = record;
+      await persistInteractionRecord({
+        state,
+        interactionId,
+        record: { ...rest, status: 'started', turnId },
+        persistState,
+        discordTurnOrigin: { ...originIntent, threadId: record.threadId, turnId },
+      });
+      results.push({ interactionId, status: 'started', recoveredTurnId: turnId });
+      continue;
+    }
     if (!['creating', 'workspace-ready', 'recovering', 'cleanup-proven', 'worktree-removed'].includes(record?.status)
       || record?.threadId) continue;
     if (!['cleanup-proven', 'worktree-removed'].includes(record.status)) {

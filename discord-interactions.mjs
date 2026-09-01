@@ -349,6 +349,12 @@ function metadataText(value, fallback = '未知', maximum = 80) {
   return escaped.length <= maximum ? escaped : `${escaped.slice(0, Math.max(0, maximum - 1))}…`;
 }
 
+function markdownBodyValue(value, fallback = '未知', maximum = 20_000) {
+  const normalized = text(value, fallback).replace(/\r\n?/gu, '\n').replace(/@/gu, '＠');
+  const escaped = normalized.replace(/([\\`*_{}\[\]()#+.!|>~-])/gu, '\\$1');
+  return escaped.length <= maximum ? escaped : `${escaped.slice(0, Math.max(0, maximum - 1))}…`;
+}
+
 function plainLabel(value, fallback = '未知', maximum = 80) {
   return displayText(text(value, fallback).replace(/\s+/gu, ' '), fallback, maximum);
 }
@@ -494,8 +500,8 @@ export function renderContinuationQueue(items, taskIndex = null) {
 
 export function renderTaskDetail(detail) {
   if (!detail) return '任务不存在或已不再是侧边栏主任务。';
-  const taskText = text(detail.taskText, detail.contentAvailable === false ? '内容暂不可用，请稍后重试。' : '（无可用内容）');
-  const resultText = text(detail.resultText, detail.contentAvailable === false ? '内容暂不可用，请稍后重试。' : '（暂无结果）');
+  const taskText = markdownBodyValue(detail.taskText, detail.contentAvailable === false ? '内容暂不可用，请稍后重试。' : '（无可用内容）');
+  const resultText = markdownBodyValue(detail.resultText, detail.contentAvailable === false ? '内容暂不可用，请稍后重试。' : '（暂无结果）');
   return [
     `# ${metadataText(detail.taskName, '未命名任务', 200)}`,
     `**项目：** ${metadataText(detail.projectName, '无项目', 200)}`,
@@ -876,6 +882,8 @@ function creationReceipt(result, selection) {
   let receipt;
   if (result?.status === 'first-turn-failed') {
     receipt = `## 任务创建结果\n任务线程已保留，但首轮启动失败。\n**项目：** ${projectName}\n**任务：** ${taskName}\n**状态：** 首轮启动失败\n**任务 ID：** …${suffix}\n**运行方式：** ${mode}\n**工作目录：** ${safeWorkspaceName(result?.workspace)}`;
+  } else if (result?.status === 'start-uncertain') {
+    receipt = `## 任务创建结果\n任务可能已经启动，但本地状态尚未确认；请勿重复提交。\n**项目：** ${projectName}\n**任务：** ${taskName}\n**状态：** 等待自动恢复确认\n**任务 ID：** …${suffix}\n**运行方式：** ${mode}\n**工作目录：** ${safeWorkspaceName(result?.workspace)}`;
   } else {
     receipt = `## 任务创建结果\n任务创建成功。\n**项目：** ${projectName}\n**任务：** ${taskName}\n**状态：** 正在运行\n**任务 ID：** …${suffix}\n**运行方式：** ${mode}\n**工作目录：** ${safeWorkspaceName(result?.workspace)}`;
   }
