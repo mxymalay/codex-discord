@@ -435,6 +435,64 @@ test('a durable progress intent preserves A and later sends B after A state comm
   }
 });
 
+test('terminal delivery never overtakes B after retrying a sent A intent', async () => {
+  const paths = await fixture();
+  const inboxState = createEmptyInboxState();
+  inboxState.discordTurnOrigins[turnId] = {
+    threadId, guildId: '222222222222222222', channelId: '777777777777777777', source: 'slash',
+    createdAt: '2026-09-01T00:00:01.000Z', rolloutCursor: 0, deliveredEventIds: [], deliveryState: 'pending',
+  };
+  const watcherState = createEmptyRolloutWatcherState();
+  const discordMessages = new Map();
+  const finalNotifications = [];
+  let failACommit = true;
+  const persistInboxState = async (snapshot) => {
+    if (failACommit && snapshot.discordTurnOrigins[turnId].deliveredEventIds.length === 2) {
+      failACommit = false;
+      throw new Error('ack unavailable');
+    }
+  };
+  const dispatchMessage = async (message) => {
+    if (!discordMessages.has(message.nonce)) discordMessages.set(message.nonce, structuredClone(message));
+    return { id: `m-${message.nonce}` };
+  };
+  try {
+    await fs.writeFile(paths.rolloutPath, [sessionMeta(), taskStarted(), {
+      type: 'event_msg', payload: { type: 'agent_message', phase: 'commentary', message: '进度 A' },
+    }].map(jsonLine).join(''), 'utf8');
+    await initializeRolloutWatcherState({ sessionsRoot: paths.sessionsRoot, state: watcherState, inboxState });
+
+    await assert.rejects(() => pollDiscordOriginEvents({
+      sessionsRoot: paths.sessionsRoot, inboxState, persistInboxState, dispatchMessage,
+    }), /progress persistence failed/u);
+    await pollRolloutCompletions({
+      sessionsRoot: paths.sessionsRoot, state: watcherState, inboxState, persistInboxState,
+      nowMs: Date.parse('2026-09-01T00:00:10.000Z'), graceMs: 0, retryMs: 0,
+      dispatchNotification: async (notification) => finalNotifications.push(notification),
+    });
+
+    await fs.appendFile(paths.rolloutPath, [{
+      type: 'event_msg', payload: { type: 'agent_message', phase: 'commentary', message: '进度 B' },
+    }, taskComplete('最终完成')].map(jsonLine).join(''), 'utf8');
+    await pollDiscordOriginEvents({ sessionsRoot: paths.sessionsRoot, inboxState, persistInboxState, dispatchMessage });
+    await pollRolloutCompletions({
+      sessionsRoot: paths.sessionsRoot, state: watcherState, inboxState, persistInboxState,
+      nowMs: Date.parse('2026-09-01T00:00:20.000Z'), graceMs: 0, retryMs: 0,
+      dispatchNotification: async (notification) => finalNotifications.push(notification),
+    });
+    await pollDiscordOriginEvents({ sessionsRoot: paths.sessionsRoot, inboxState, persistInboxState, dispatchMessage });
+
+    const delivered = [...discordMessages.values()];
+    assert.deepEqual(delivered.map((item) => item.kind), ['started', 'commentary', 'commentary']);
+    assert.match(delivered[1].content, /进度 A/u);
+    assert.match(delivered[2].content, /进度 B/u);
+    assert.equal(finalNotifications.length, 1);
+    assert.equal(inboxState.discordTurnOrigins[turnId].deliveryState, 'terminal-delivered');
+    assert.equal(inboxState.discordTurnOrigins[turnId].progressDispatch, undefined);
+    assert.equal(inboxState.discordTurnOrigins[turnId].rolloutCursor, (await fs.stat(paths.rolloutPath)).size);
+  } finally { await fs.rm(paths.root, { recursive: true, force: true }); }
+});
+
 test('one failed origin stays pending without blocking progress for another Discord task', async () => {
   const paths = await fixture();
   const otherThreadId = '33333333-3333-4333-8333-333333333333';
@@ -562,6 +620,7 @@ test('terminal fallback enriches an exact persisted origin and marks delivery on
   try {
     const beforeComplete = [sessionMeta(), taskStarted(), userMessage()].map(jsonLine).join('');
     await fs.writeFile(paths.rolloutPath, `${beforeComplete}${jsonLine(taskComplete())}`, 'utf8');
+    inboxState.discordTurnOrigins[turnId].rolloutCursor = (await fs.stat(paths.rolloutPath)).size;
     const state = createEmptyRolloutWatcherState();
     await initializeRolloutWatcherState({ sessionsRoot: paths.sessionsRoot, state });
     state.files[path.resolve(paths.rolloutPath)].offset = Buffer.byteLength(beforeComplete);
@@ -604,6 +663,7 @@ test('a missing watcher state recovers an already-complete exact pending Discord
   const dispatched = [];
   try {
     await fs.writeFile(paths.rolloutPath, [sessionMeta(), taskStarted(), userMessage(), taskComplete()].map(jsonLine).join(''), 'utf8');
+    inboxState.discordTurnOrigins[turnId].rolloutCursor = (await fs.stat(paths.rolloutPath)).size;
     const state = createEmptyRolloutWatcherState();
     await pollRolloutCompletions({
       sessionsRoot: paths.sessionsRoot, state, inboxState, persistInboxState: async () => {},
@@ -638,6 +698,7 @@ test('terminal origin send failure retains dispatch intent and retries without m
   try {
     const beforeComplete = [sessionMeta(), taskStarted(), userMessage()].map(jsonLine).join('');
     await fs.writeFile(paths.rolloutPath, `${beforeComplete}${jsonLine(taskComplete())}`, 'utf8');
+    inboxState.discordTurnOrigins[turnId].rolloutCursor = (await fs.stat(paths.rolloutPath)).size;
     const state = createEmptyRolloutWatcherState();
     await initializeRolloutWatcherState({ sessionsRoot: paths.sessionsRoot, state });
     state.files[path.resolve(paths.rolloutPath)].offset = Buffer.byteLength(beforeComplete);

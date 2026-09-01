@@ -334,7 +334,8 @@ async function pollDiscordOriginEventsUnlocked({ sessionsRoot, inboxState, persi
           rolloutCursor: pendingDispatch.end, eventId: pendingDispatch.eventId,
           lastMessageId: response?.id, rolloutFingerprint: rollout.fingerprint,
         });
-        continue;
+        origin.rolloutCursor = pendingDispatch.end;
+        delete origin.progressDispatch;
       }
       const events = extractOriginProgress(rollout.parsed.entries, origin, rollout.fingerprint);
       for (const event of events) {
@@ -573,6 +574,10 @@ export async function pollRolloutCompletions({
       delete state.pending[turnId];
       continue;
     }
+    if (origin) {
+      const boundary = await exactTerminalBoundary(item, turnId);
+      if (origin.progressDispatch || boundary === null || Number(origin.rolloutCursor ?? 0) < boundary) continue;
+    }
     let terminalEventId = null;
     if (origin) {
       if (typeof persistInboxState !== 'function') throw new Error('Discord origin terminal persistence is unavailable');
@@ -600,6 +605,20 @@ export async function pollRolloutCompletions({
     delete state.pending[turnId];
   }
   return state;
+}
+
+async function exactTerminalBoundary(item, turnId) {
+  let bytes;
+  try { bytes = await fs.readFile(String(item.rolloutPath ?? '')); } catch { return null; }
+  const parsed = parseLinesWithOffsets(bytes);
+  const metas = parsed.entries.filter(({ entry }) => entry?.type === 'session_meta');
+  if (metas.length !== 1 || !rootSessionMeta(metas[0].entry, item.threadId)) return null;
+  const started = parsed.entries.some(({ entry }) => entry?.type === 'event_msg' &&
+    entry.payload?.type === 'task_started' && String(entry.payload?.turn_id ?? '') === String(turnId));
+  if (!started) return null;
+  const completion = parsed.entries.find(({ entry }) => entry?.type === 'event_msg' &&
+    entry.payload?.type === 'task_complete' && String(entry.payload?.turn_id ?? '') === String(turnId));
+  return completion?.end ?? null;
 }
 
 async function reconstructNotification(item, turnId) {

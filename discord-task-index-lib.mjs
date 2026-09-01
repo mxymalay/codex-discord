@@ -464,7 +464,7 @@ function durableRecord(record) {
     .map((field) => [field, record[field]]));
 }
 
-function refreshedPreviousRecord(previous, sidebarEntry, latestMapping) {
+function refreshedPreviousRecord(previous, sidebarEntry, latestMapping, projectOverride = null) {
   const retained = durableRecord(previous);
   const sidebarCreatedMs = validTime(sidebarEntry?.created_at ?? sidebarEntry?.createdAt);
   const sidebarUpdatedMs = validTime(sidebarEntry?.updated_at ?? sidebarEntry?.updatedAt);
@@ -473,8 +473,8 @@ function refreshedPreviousRecord(previous, sidebarEntry, latestMapping) {
   retained.taskName = stringOrNull(sidebarEntry?.thread_name ?? sidebarEntry?.threadName ?? sidebarEntry?.name) ??
     retained.taskName ?? '未命名任务';
   const project = projectMetadata(null, sidebarEntry, retained);
-  retained.projectId = project.projectId;
-  retained.projectName = project.projectName;
+  retained.projectId = projectOverride ? projectOverride.projectId : project.projectId;
+  retained.projectName = projectOverride ? projectOverride.projectName : project.projectName;
   retained.createdAt = isoTime(sidebarCreatedMs == null ? previousCreatedMs :
     (previousCreatedMs == null ? sidebarCreatedMs : Math.min(sidebarCreatedMs, previousCreatedMs)));
   retained.lastActivityAt = isoTime(sidebarUpdatedMs == null ? previousActivityMs :
@@ -546,7 +546,10 @@ export async function buildTaskIndex({
       const hasStableProjectProvenance = projects.length === 0 || stableProject(previous) || stableProject(createdRecord);
       if (previous && sidebarEntry && hasStableProjectProvenance &&
           path.resolve(String(previous.rolloutPath ?? '')) === path.resolve(rolloutPath) && Number(previous.offset) === offset) {
-        recordsById.set(key, refreshedPreviousRecord(previous, sidebarEntry, mappings.get(key)));
+        const createdProject = stableProject(createdRecord)
+          ? inferSavedProject({ projectId: createdRecord.projectId, projectName: createdRecord.projectName }, projects)
+          : null;
+        recordsById.set(key, refreshedPreviousRecord(previous, sidebarEntry, mappings.get(key), createdProject));
         continue;
       }
       const parsed = await readBoundedEntries(rolloutPath, offset, limits, fileSystem, headRegion);

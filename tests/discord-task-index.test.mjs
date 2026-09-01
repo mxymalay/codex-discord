@@ -490,6 +490,32 @@ test('an unchanged stale explicit project is re-inferred to the current longest 
   } finally { await fs.rm(paths.root, { recursive: true, force: true }); }
 });
 
+test('unchanged managed worktree fast path applies its valid persisted creation project', async () => {
+  const paths = await fixture();
+  const threadId = '019cdef0-4321-7890-abcd-1234567890ae';
+  const rolloutPath = paths.rollout(`2026-09-01T00-00-00-${threadId}`);
+  try {
+    await writeJsonl(rolloutPath, [meta(threadId, { cwd: 'G:\\generated\\discord-worktree' })]);
+    const size = (await fs.stat(rolloutPath)).size;
+    await writeJsonl(paths.sessionIndexPath, [{ id: threadId, thread_name: '托管工作树任务' }]);
+    const index = await buildTaskIndex({
+      ...paths,
+      previousIndex: { version: 1, generatedAt: null, tasks: [{
+        threadId, projectId: null, projectName: null, taskName: '旧任务', status: 'running',
+        rolloutPath, offset: size, worktreePath: 'G:\\generated\\discord-worktree', worktreeBranch: 'codex/discord-test',
+      }] },
+      projects: [{ id: 'ygf', name: 'ygf', roots: ['C:\\Users\\86166\\Desktop\\ygf'] }],
+      createdTasksByInteraction: { create1: {
+        status: 'started', threadId, turnId: 'turn-1', projectId: 'ygf', projectName: 'ygf',
+        taskName: '托管工作树任务',
+        workspace: { mode: 'worktree', cwd: 'G:\\generated\\discord-worktree', runtimeWorkspaceRoots: ['G:\\generated\\discord-worktree'], operationId: 'create1' },
+      } },
+    });
+    assert.equal(index.tasks[0].projectId, 'ygf');
+    assert.equal(index.tasks[0].projectName, 'ygf');
+  } finally { await fs.rm(paths.root, { recursive: true, force: true }); }
+});
+
 test('streams sidebar lines and skips standard-filename rollouts absent from the current sidebar before body reads', async () => {
   const paths = await fixture();
   const sidebarId = '019cdef0-aaaa-7890-abcd-1234567890ab';
