@@ -28,3 +28,23 @@ node --test .\tests\*.test.mjs
 ## 已知问题
 
 无（Task 1 范围内）。
+
+## Round 1 修复
+
+- 收紧 `validateTakeoverUiState`：状态与期望的 kind/user/guild 必须存在且为非空有效标识；`nowMs` 必须是有限数值；`expiresAt` 必须是有限数值，否则 fail closed。
+- 保留有效时间的边界语义：`nowMs >= expiresAt` 返回过期。
+- 新增错误 kind、用户、guild、缺失身份、缺失/NaN/Infinity `nowMs`，以及缺失/NaN/Infinity/空 `expiresAt` 测试。
+
+验证结果：
+
+```text
+node --test .\tests\codex-takeover.test.mjs .\tests\discord-commands.test.mjs .\tests\discord-bridge.test.mjs
+88 passed, 0 failed
+
+node --test .\tests\*.test.mjs
+261 passed, 0 failed
+```
+
+修复提交：`待提交后更新`
+
+已知问题：无。

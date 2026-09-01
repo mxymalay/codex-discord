@@ -45,3 +45,27 @@ test('takeover UI state expires after five minutes and validates tenancy', () =>
   assert.deepEqual(validateTakeoverUiState(state, { kind: 'takeover', userId: '333', guildId: '222', nowMs: 300999 }), { ok: true, reason: 'valid' });
   assert.deepEqual(validateTakeoverUiState(state, { kind: 'takeover', userId: '333', guildId: '222', nowMs: 301000 }), { ok: false, reason: 'expired' });
 });
+
+test('takeover UI validation fails closed for mismatched or missing security context', () => {
+  const state = createTakeoverUiState({
+    id: 'interaction-1', kind: 'takeover', userId: '333', guildId: '222', nowMs: 1000,
+  });
+  for (const expected of [
+    { kind: 'other', userId: '333', guildId: '222', nowMs: 1000 },
+    { kind: 'takeover', userId: '999', guildId: '222', nowMs: 1000 },
+    { kind: 'takeover', userId: '333', guildId: '999', nowMs: 1000 },
+    { kind: 'takeover', userId: undefined, guildId: '222', nowMs: 1000 },
+    { kind: 'takeover', userId: '333', guildId: undefined, nowMs: 1000 },
+    { kind: undefined, userId: '333', guildId: '222', nowMs: 1000 },
+    { kind: 'takeover', userId: '333', guildId: '222', nowMs: undefined },
+    { kind: 'takeover', userId: '333', guildId: '222', nowMs: Number.NaN },
+    { kind: 'takeover', userId: '333', guildId: '222', nowMs: Number.POSITIVE_INFINITY },
+  ]) assert.equal(validateTakeoverUiState(state, expected).ok, false);
+});
+
+test('takeover UI validation fails closed for missing or non-finite expiry', () => {
+  for (const expiresAt of [undefined, null, '', Number.NaN, Number.POSITIVE_INFINITY]) {
+    const state = { kind: 'takeover', userId: '333', guildId: '222', expiresAt };
+    assert.equal(validateTakeoverUiState(state, { kind: 'takeover', userId: '333', guildId: '222', nowMs: 1000 }).ok, false);
+  }
+});

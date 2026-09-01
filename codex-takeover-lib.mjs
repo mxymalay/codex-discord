@@ -48,10 +48,16 @@ export function createTakeoverUiState({
 
 export function validateTakeoverUiState(state, { kind, userId, guildId, nowMs } = {}) {
   if (!state || typeof state !== 'object') return { ok: false, reason: 'missing' };
+  const validIdentity = (value) => (typeof value === 'string' || typeof value === 'number' || typeof value === 'bigint')
+    && String(value).length > 0 && String(value).trim() === String(value);
+  if (!validIdentity(state.kind) || !validIdentity(kind)) return { ok: false, reason: 'invalid-kind' };
+  if (!validIdentity(state.userId) || !validIdentity(userId)) return { ok: false, reason: 'invalid-user' };
+  if (!validIdentity(state.guildId) || !validIdentity(guildId)) return { ok: false, reason: 'invalid-guild' };
   if (String(state.kind) !== String(kind)) return { ok: false, reason: 'wrong-kind' };
   if (String(state.userId) !== String(userId)) return { ok: false, reason: 'wrong-user' };
   if (String(state.guildId) !== String(guildId)) return { ok: false, reason: 'wrong-guild' };
-  if (!Number.isFinite(Number(state.expiresAt)) || Number(nowMs) >= Number(state.expiresAt)) {
+  if (typeof nowMs !== 'number' || !Number.isFinite(nowMs)) return { ok: false, reason: 'invalid-time' };
+  if (typeof state.expiresAt !== 'number' || !Number.isFinite(state.expiresAt) || nowMs >= state.expiresAt) {
     return { ok: false, reason: 'expired' };
   }
   return { ok: true, reason: 'valid' };
