@@ -7,6 +7,7 @@ import { PassThrough } from 'node:stream';
 import test from 'node:test';
 
 import { startNewCodexTask } from '../discord-task-create-lib.mjs';
+import { finalizeContinuationOutcome, pollChannel } from '../discord-bridge.mjs';
 
 import {
   AppServerClient,
@@ -356,6 +357,64 @@ test('records processed messages and advances channel cursor monotonically', () 
   recordInboxMessage(state, config.discordTaskChannelId, '777777777777777810', false);
   assert.equal(state.cursors[config.discordTaskChannelId], '777777777777777820');
   assert.deepEqual(state.processedMessageIds, ['777777777777777820']);
+});
+
+test('non-durable reply outcome stops the channel batch before a higher snowflake advances the cursor', async () => {
+  const state = createEmptyInboxState();
+  state.cursors[config.discordConfirmationChannelId] = '777777777777777800';
+  const low = makeMessage({ id: '777777777777777801' });
+  const high = makeMessage({ id: '777777777777777802', content: 'higher message' });
+  const attempted = [];
+
+  const outcome = await pollChannel({
+    token: 'test-token',
+    config,
+    state,
+    channelId: config.discordConfirmationChannelId,
+    getMessages: async () => [low, high],
+    readMapping: async () => mapping,
+    continueRequest: async ({ request }) => {
+      attempted.push(request.requestId);
+      return { status: 'failed', reason: 'state-persist-failed', durable: false, stopChannelScan: true };
+    },
+    persistState: async () => {},
+    writeLog: async () => {},
+  });
+
+  assert.deepEqual(attempted, [low.id]);
+  assert.equal(state.cursors[config.discordConfirmationChannelId], '777777777777777800');
+  assert.deepEqual(outcome, { status: 'stopped', requestId: low.id, reason: 'state-persist-failed' });
+});
+
+test('transient reply failure returns a stop contract and rate-limits its Bot error receipt', async () => {
+  const state = createEmptyInboxState();
+  state.cursors[config.discordConfirmationChannelId] = '777777777777777800';
+  const request = createContinuationRequest({
+    source: 'reply', requestId: '777777777777777801', threadId: 'root-1', text: 'continue',
+    channelId: config.discordConfirmationChannelId, replyToMessageId: '777777777777777801',
+  });
+  const replies = [];
+  const transientFailureAcks = new Map();
+  const input = {
+    result: { status: 'failed', reason: 'state-persist-failed' },
+    state,
+    request,
+    transientFailureAcks,
+    now: () => Date.parse('2026-09-01T00:00:00Z'),
+    persistState: async () => {},
+    sendReply: async (payload) => { replies.push(payload); },
+  };
+
+  const first = await finalizeContinuationOutcome(input);
+  const second = await finalizeContinuationOutcome(input);
+
+  assert.equal(first.durable, false);
+  assert.equal(first.stopChannelScan, true);
+  assert.equal(second.stopChannelScan, true);
+  assert.equal(replies.length, 1);
+  assert.match(replies[0].content, /暂时|稍后重试|安全保存/);
+  assert.equal(replies[0].content.includes('没有成功续接'), false);
+  assert.equal(state.cursors[config.discordConfirmationChannelId], '777777777777777800');
 });
 
 test('Discord REST requests always send the required Bot user agent', async () => {
@@ -754,6 +813,83 @@ test('a confirmed turn stays started when confirmation persistence, acknowledgem
   assert.equal(events.includes('track'), true);
 });
 
+test('restart preserves an uncertain external start after confirmation persistence failed', async () => {
+  const state = createEmptyInboxState();
+  let persistedState;
+  let persistCount = 0;
+  let resumeCount = 0;
+  const request = createContinuationRequest({
+    source: 'reply', requestId: '777777777777777801',
+    threadId: mapping.messages['777777777777777701'].threadId, text: 'continue',
+    channelId: config.discordConfirmationChannelId, replyToMessageId: '777777777777777801',
+  });
+  const first = await dispatchContinuation(request, {
+    state,
+    encryptText: async () => 'opaque-ciphertext',
+    persistState: async () => {
+      persistCount += 1;
+      if (persistCount === 3) throw new Error('confirmation persistence failed');
+      persistedState = structuredClone(state);
+    },
+    resumeCodexThread: async () => {
+      resumeCount += 1;
+      return { turnId: 'turn-uncertain', completion: Promise.resolve({ turn: { status: 'completed' } }) };
+    },
+  });
+  assert.equal(first.status, 'started');
+  assert.equal(first.reason, 'state-persist-failed');
+  assert.equal(listContinuations(persistedState)[0].status, 'attempting');
+
+  const reloaded = migrateInboxState(structuredClone(persistedState));
+  recoverContinuationAttempts(reloaded, '2026-09-01T01:00:00Z');
+  const recovered = listContinuations(reloaded)[0];
+  assert.equal(recovered.status, 'start-uncertain');
+  assert.equal(cancelContinuation(reloaded, recovered.queueId).status, 'already-started');
+
+  const second = await dispatchContinuation(recovered, {
+    state: reloaded,
+    persistState: async () => {},
+    resumeCodexThread: async () => { resumeCount += 1; throw new Error('must not retry uncertain start'); },
+  });
+  assert.equal(second.status, 'uncertain');
+  assert.equal(second.reason, 'start-outcome-uncertain');
+  assert.equal(resumeCount, 1);
+
+  const polledState = migrateInboxState(structuredClone(reloaded));
+  polledState.cursors[config.discordConfirmationChannelId] = '777777777777777800';
+  const replies = [];
+  const pollResult = await pollChannel({
+    token: 'test-token',
+    config,
+    state: polledState,
+    channelId: config.discordConfirmationChannelId,
+    getMessages: async () => [makeMessage({ id: request.requestId })],
+    readMapping: async () => mapping,
+    continueRequest: async ({ request: polledRequest }) => {
+      const result = await dispatchContinuation(polledRequest, {
+        state: polledState,
+        persistState: async () => {},
+        resumeCodexThread: async () => { resumeCount += 1; throw new Error('must not retry uncertain start'); },
+      });
+      return finalizeContinuationOutcome({
+        result,
+        state: polledState,
+        request: polledRequest,
+        persistState: async () => {},
+        sendReply: async (payload) => { replies.push(payload.content); },
+      });
+    },
+    persistState: async () => {},
+    writeLog: async () => {},
+  });
+  assert.equal(pollResult.status, 'complete');
+  assert.equal(resumeCount, 1);
+  assert.equal(polledState.cursors[config.discordConfirmationChannelId], request.requestId);
+  assert.equal(replies.length, 1);
+  assert.match(replies[0], /启动结果不确定|不会自动重试/);
+  assert.equal(replies[0].includes('没有成功续接'), false);
+});
+
 test('queued retry claim persistence failure restores the exact queued snapshot and never resumes', async () => {
   const state = createEmptyInboxState();
   const queued = enqueueContinuation(state, {
@@ -855,22 +991,22 @@ test('dispatch never starts an external turn without a persistence adapter', asy
   assert.equal(result.reason, 'state-persist-failed');
 });
 
-test('restart recovery marks an ambiguous attempting claim terminal without starting another turn', async () => {
+test('restart recovery preserves an ambiguous attempting claim as non-retryable uncertainty', async () => {
   const state = createEmptyInboxState();
   const queued = enqueueContinuation(state, {
     ...createContinuationRequest({ source: 'slash', requestId: 'ambiguous-attempt', threadId: 'root-1', text: 'retry' }),
     encryptedText: 'opaque-ciphertext', status: 'attempting',
   });
   recoverContinuationAttempts(state, '2026-09-01T01:00:00.000Z');
-  assert.equal(listContinuations(state)[0].status, 'failed');
-  assert.equal(listContinuations(state)[0].failureReason, 'attempt-uncertain');
+  assert.equal(listContinuations(state)[0].status, 'start-uncertain');
+  assert.equal(listContinuations(state)[0].failureReason, 'start-outcome-uncertain');
   let resumed = false;
   const result = await dispatchContinuation({ ...queued, status: 'attempting' }, {
     state,
     decryptText: async () => 'retry',
     resumeCodexThread: async () => { resumed = true; },
   });
-  assert.equal(result.status, 'failed');
+  assert.equal(result.status, 'uncertain');
   assert.equal(resumed, false);
 });
 
@@ -978,6 +1114,42 @@ test('terminal pruning retains a newly confirmed turn even when it waited in que
   assert.equal(result.status, 'started');
   assert.equal(state.pendingContinuations[queued.queueId].status, 'confirmed-start');
   assert.equal(state.pendingContinuations[queued.queueId].turnId, 'turn-new-fact');
+});
+
+test('confirmed reply is never pruned by later terminal history or resumed again', async () => {
+  const state = createEmptyInboxState();
+  const request = createContinuationRequest({
+    source: 'reply', requestId: 'blocked-confirmed-a', threadId: 'root-1', text: 'continue',
+    channelId: 'channel-1', replyToMessageId: 'blocked-confirmed-a', createdAt: '2026-09-01T00:00:00Z',
+  });
+  const blocked = enqueueContinuation(state, { ...request, encryptedText: 'cipher:a' });
+  for (let index = 0; index < 200; index += 1) {
+    state.pendingContinuations[`later-${index}`] = {
+      queueId: `later-${index}`, source: 'slash', requestId: `later-${index}`,
+      threadId: 'root-history', status: 'delivered',
+      createdAt: `2026-09-02T${String(Math.floor(index / 60)).padStart(2, '0')}:${String(index % 60).padStart(2, '0')}:00Z`,
+      deliveredAt: `2026-09-02T${String(Math.floor(index / 60)).padStart(2, '0')}:${String(index % 60).padStart(2, '0')}:30Z`,
+    };
+  }
+  let resumeCount = 0;
+  const dependencies = {
+    state,
+    now: () => '2026-09-01T01:00:00Z',
+    encryptText: async () => 'cipher:a',
+    decryptText: async () => 'continue',
+    persistState: async () => {},
+    resumeCodexThread: async () => {
+      resumeCount += 1;
+      return { turnId: 'turn-a', completion: Promise.resolve({ turn: { status: 'completed' } }) };
+    },
+    sendReply: async () => { throw new Error('ack blocked'); },
+  };
+
+  await dispatchContinuation(blocked, dependencies);
+  await dispatchContinuation(request, dependencies);
+
+  assert.equal(state.pendingContinuations[blocked.queueId].status, 'confirmed-start');
+  assert.equal(resumeCount, 1);
 });
 
 test('continuation summaries add an ellipsis only when the safe summary is actually truncated', () => {

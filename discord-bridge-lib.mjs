@@ -25,8 +25,8 @@ export function createEmptyInboxState() {
 const MAX_PROCESSED_INTERACTIONS = 2_000;
 const MAX_CREATED_TASK_RECORDS = 2_000;
 const MAX_TERMINAL_CONTINUATIONS = 200;
-const CONTINUATION_STATUSES = new Set(['queued', 'attempting', 'confirmed-start', 'delivered', 'cancelled', 'failed']);
-const TERMINAL_CONTINUATION_STATUSES = new Set(['confirmed-start', 'delivered', 'cancelled', 'failed']);
+const CONTINUATION_STATUSES = new Set(['queued', 'attempting', 'start-uncertain', 'confirmed-start', 'delivered', 'cancelled', 'failed']);
+const TERMINAL_CONTINUATION_STATUSES = new Set(['delivered', 'cancelled', 'failed']);
 const TERMINAL_CREATION_STATUSES = new Set(['started', 'first-turn-failed', 'failed-before-thread', 'recovered-failed']);
 const continuationStateLocks = new WeakMap();
 
@@ -275,12 +275,12 @@ export function recoverContinuationAttempts(state, now = new Date().toISOString(
   migrateInboxState(state);
   for (const item of Object.values(state.pendingContinuations)) {
     if (item?.status !== 'attempting') continue;
-    item.status = 'failed';
-    item.failedAt = String(now);
-    item.failureReason = 'attempt-uncertain';
+    item.status = 'start-uncertain';
+    item.uncertainAt = String(now);
+    item.failureReason = 'start-outcome-uncertain';
     if (item.source === 'slash') {
       recordProcessedInteraction(state, item.requestId, {
-        status: 'failed', queueId: item.queueId, reason: 'attempt-uncertain',
+        status: 'uncertain', queueId: item.queueId, reason: 'start-outcome-uncertain',
       }, now);
     }
   }
@@ -374,6 +374,9 @@ export async function dispatchContinuation(request, dependencies = {}) {
   let existing = listContinuations(state).find((item) => item.source === source && item.requestId === requestId);
   const wasQueuedRequest = Boolean(existing);
   const isQueuedRetry = Boolean(request?.queueId && existing?.queueId === String(request.queueId));
+  if (existing?.status === 'start-uncertain') {
+    return { status: 'uncertain', queueId: existing.queueId, reason: 'start-outcome-uncertain' };
+  }
   if (existing?.source === 'reply' && existing.status === 'confirmed-start') {
     return deliverConfirmedReply(state, existing, dependencies, now);
   }
@@ -477,6 +480,9 @@ export async function dispatchContinuation(request, dependencies = {}) {
     return { status: 'failed', queueId: existing.queueId, reason: 'state-persist-failed' };
   }
   if (claimObservation !== undefined) {
+    if (claimObservation?.status === 'start-uncertain') {
+      return { status: 'uncertain', queueId: existing.queueId, reason: 'start-outcome-uncertain' };
+    }
     if (claimObservation?.source === 'reply' && claimObservation.status === 'confirmed-start') {
       return deliverConfirmedReply(state, claimObservation, dependencies, now);
     }

@@ -44,6 +44,7 @@ const pollIntervalMs = 4000;
 const pendingRetryIntervalMs = 30_000;
 const runOnce = process.argv.includes('--once');
 const activeTurns = new Set();
+const transientFailureAcks = new Map();
 let stopping = false;
 
 function mask(value, visible = 6) {
@@ -108,6 +109,63 @@ function trackContinuationCompletion(started, request, token) {
   activeTurns.add(tracked);
 }
 
+function restoreInboxState(state, snapshot) {
+  for (const key of Object.keys(state)) delete state[key];
+  Object.assign(state, structuredClone(snapshot));
+}
+
+export async function finalizeContinuationOutcome({
+  result,
+  state,
+  request,
+  token,
+  persistState = saveState,
+  sendReply = (payload) => sendDiscordReply({ token, ...payload }),
+  transientFailureAcks: failureAcks = transientFailureAcks,
+  now = Date.now,
+}) {
+  let durable = result?.status === 'started' || result?.status === 'queued' || result?.status === 'uncertain' ||
+    !['state-persist-failed', 'encryption-unavailable'].includes(String(result?.reason ?? ''));
+  if (request.source === 'reply' && durable) {
+    const snapshot = structuredClone(state);
+    recordInboxMessage(state, request.channelId, request.requestId, true);
+    try {
+      await persistState(state);
+    } catch {
+      restoreInboxState(state, snapshot);
+      durable = false;
+      result = { ...result, reason: 'state-persist-failed' };
+    }
+  }
+
+  if (request.source === 'reply' && result?.status === 'uncertain' && durable) {
+    await sendReply({
+      channelId: request.channelId,
+      replyToMessageId: request.replyToMessageId,
+      content: '⚠️ Codex 启动结果不确定；为避免重复执行不会自动重试，请打开原任务确认实际状态。',
+    }).catch(() => {});
+  } else if (request.source === 'reply' && result?.status === 'failed' && durable) {
+    await sendReply({
+      channelId: request.channelId,
+      replyToMessageId: request.replyToMessageId,
+      content: '❌ 没有成功续接原 Codex 任务。不会新建任务；请确认 Codex 可正常打开后，再回复一次。',
+    }).catch(() => {});
+  } else if (request.source === 'reply' && !durable && result?.status === 'failed') {
+    const requestId = String(request.requestId);
+    const currentTime = Number(now());
+    const lastAcknowledged = Number(failureAcks.get(requestId));
+    if (!Number.isFinite(lastAcknowledged) || currentTime - lastAcknowledged >= pendingRetryIntervalMs) {
+      const sent = await sendReply({
+        channelId: request.channelId,
+        replyToMessageId: request.replyToMessageId,
+        content: '⚠️ 暂时无法安全保存这条续接请求；本频道已暂停后续处理，并会稍后重试。',
+      }).then(() => true).catch(() => false);
+      if (sent) failureAcks.set(requestId, currentTime);
+    }
+  }
+  return { ...result, durable, stopChannelScan: !durable };
+}
+
 async function startContinuation({ token, config, state, request }) {
   const mappedCwd = await existingDirectory(String(request.cwd ?? ''));
   const input = { ...request, cwd: mappedCwd ?? undefined };
@@ -121,22 +179,9 @@ async function startContinuation({ token, config, state, request }) {
     sendReply: (payload) => sendDiscordReply({ token, ...payload }),
     trackCompletion: (started, normalized) => trackContinuationCompletion(started, normalized, token),
   });
-  const durableResult = result.status === 'started' || result.status === 'queued' ||
-    !['state-persist-failed', 'encryption-unavailable'].includes(String(result.reason ?? ''));
-  if (request.source === 'reply' && durableResult) {
-    recordInboxMessage(state, request.channelId, request.requestId, true);
-    await saveState(state);
-  }
+  const outcome = await finalizeContinuationOutcome({ result, state, request, token });
   await log(`continuation ${result.status} source=${request.source} request=${mask(request.requestId)} thread=${mask(request.threadId, 8)} turn=${mask(result.turnId, 8)}`);
-  if (result.status === 'failed' && request.source === 'reply') {
-    await sendDiscordReply({
-      token,
-      channelId: request.channelId,
-      replyToMessageId: request.replyToMessageId,
-      content: '❌ 没有成功续接原 Codex 任务。不会新建任务；请确认 Codex 可正常打开后，再回复一次。',
-    }).catch(() => {});
-  }
-  return result;
+  return outcome;
 }
 
 async function retryPendingTurns({ token, config, state }) {
@@ -148,14 +193,24 @@ async function retryPendingTurns({ token, config, state }) {
   }
 }
 
-async function pollChannel({ token, config, state, channelId }) {
+export async function pollChannel({
+  token,
+  config,
+  state,
+  channelId,
+  getMessages = getDiscordMessagesAfter,
+  readMapping = () => readJsonFile(mappingPath, { version: 1, messages: {} }),
+  continueRequest = startContinuation,
+  persistState = saveState,
+  writeLog = log,
+}) {
   let cursor = String(state.cursors[channelId] ?? '0');
   for (;;) {
-    const messages = await getDiscordMessagesAfter({ token, channelId, after: cursor });
-    if (messages.length === 0) return;
+    const messages = await getMessages({ token, channelId, after: cursor });
+    if (messages.length === 0) return { status: 'complete' };
 
     for (const message of messages) {
-      const mapping = await readJsonFile(mappingPath, { version: 1, messages: {} });
+      const mapping = await readMapping();
       const accepted = classifyReply(message, config, mapping, state);
       if (accepted.accepted) {
         const request = createContinuationRequest({
@@ -167,16 +222,19 @@ async function pollChannel({ token, config, state, channelId }) {
           channelId: accepted.channelId,
           replyToMessageId: accepted.messageId,
         });
-        await startContinuation({ token, config, state, request });
+        const outcome = await continueRequest({ token, config, state, request });
+        if (outcome?.stopChannelScan) {
+          return { status: 'stopped', requestId: request.requestId, reason: outcome.reason };
+        }
       } else {
         recordInboxMessage(state, channelId, String(message.id), false);
-        await saveState(state);
-        await log(`message ignored message=${mask(message.id)} channel=${mask(channelId)} reason=${accepted.reason}`);
+        await persistState(state);
+        await writeLog(`message ignored message=${mask(message.id)} channel=${mask(channelId)} reason=${accepted.reason}`);
       }
       cursor = String(state.cursors[channelId]);
     }
 
-    if (messages.length < 100) return;
+    if (messages.length < 100) return { status: 'complete' };
   }
 }
 
@@ -241,13 +299,17 @@ async function main() {
   await Promise.allSettled([...activeTurns]);
 }
 
-for (const signal of ['SIGINT', 'SIGTERM']) {
-  process.on(signal, () => {
-    stopping = true;
+const isBridgeEntryPoint = process.argv[1] &&
+  path.resolve(process.argv[1]).toLocaleLowerCase() === fileURLToPath(import.meta.url).toLocaleLowerCase();
+if (isBridgeEntryPoint) {
+  for (const signal of ['SIGINT', 'SIGTERM']) {
+    process.on(signal, () => {
+      stopping = true;
+    });
+  }
+
+  main().catch(async (error) => {
+    await log(`bridge fatal error=${error?.message ?? 'unknown'}`);
+    process.exitCode = 1;
   });
 }
-
-main().catch(async (error) => {
-  await log(`bridge fatal error=${error?.message ?? 'unknown'}`);
-  process.exitCode = 1;
-});

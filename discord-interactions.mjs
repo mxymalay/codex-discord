@@ -386,6 +386,7 @@ function continuationStatusLabel(status) {
   return ({
     queued: '等待发送',
     attempting: '正在尝试',
+    'start-uncertain': '启动结果不确定',
     'confirmed-start': '已开始',
     delivered: '已送达',
     cancelled: '已取消',
@@ -1033,6 +1034,9 @@ function continuationReceipt(result) {
   }
   if (result?.status === 'queued') {
     return `已排队；目标任务释放后会自动送达。队列编号：…${String(result?.queueId ?? '').slice(-8)}`;
+  }
+  if (result?.status === 'uncertain') {
+    return 'Codex 启动结果不确定；为避免重复执行不会自动重试，请打开原任务确认实际状态。';
   }
   return '没有成功续接原 Codex 任务；不会新建任务，请稍后重试。';
 }

@@ -756,6 +756,27 @@ test('continue command and modal reject unknown roots and blank text without dis
   assert.equal(dispatched, false);
 });
 
+test('continue UI reports an uncertain external start without claiming failure', async () => {
+  const { dependencies, responses, edits } = makeDependencies({
+    dispatchContinuation: async () => ({
+      status: 'uncertain', queueId: 'queue-uncertain', reason: 'start-outcome-uncertain',
+    }),
+  });
+  const router = createInteractionRouter(dependencies);
+  await router.handle(commandInteraction('继续任务', { 任务: 'root-1' }));
+  const modalId = responses.shift().data.custom_id;
+  await router.handle(modalSubmit(modalId, 'continue', { fieldId: '继续内容', id: 'uncertain-submit' }));
+  assert.equal(responses.shift().type, 5);
+  assert.match(edits.shift().content, /启动结果不确定|请确认原任务/);
+
+  const rendered = renderContinuationQueue([{
+    queueId: 'queue-uncertain', source: 'reply', threadId: 'root-1', summary: 'continue',
+    status: 'start-uncertain', createdAt: '2026-09-01T00:00:00Z',
+  }]);
+  assert.match(rendered, /启动结果不确定/);
+  assert.equal(rendered.includes('状态：失败'), false);
+});
+
 test('continue queue renders safe summaries and atomically cancels then refreshes', async () => {
   const queue = [{
     queueId: 'queue-abcdef12345678',
