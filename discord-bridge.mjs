@@ -207,33 +207,63 @@ export function createBridgeApplication(dependencies = {}) {
   const healthIsCurrent = (generation, controller, forceFinal) => generation === healthGeneration && controller === healthController && !controller.signal.aborted &&
     (forceFinal ? healthLifecycle === 'stopping' && healthFinalAllowed : ['starting', 'running'].includes(healthLifecycle));
   const safePublishHealth = ({ forceFinal = false } = {}) => {
-    if (typeof dependencies.publishHealth !== 'function') return Promise.resolve();
+    if (typeof dependencies.publishHealth !== 'function') return Promise.resolve(false);
     const generation = healthGeneration;
     const lifecycleController = healthController;
-    if (!lifecycleController || !healthIsCurrent(generation, lifecycleController, forceFinal)) return Promise.resolve();
+    if (!lifecycleController || !healthIsCurrent(generation, lifecycleController, forceFinal)) return Promise.resolve(false);
     const previous = healthPublication;
     const run = async () => {
-      await previous.catch(() => {});
-      if (!healthIsCurrent(generation, lifecycleController, forceFinal)) return;
-      const publicationController = new AbortController();
-      const abort = () => publicationController.abort();
-      lifecycleController.signal.addEventListener('abort', abort, { once: true });
-      const operation = Promise.resolve().then(() => dependencies.publishHealth(context, {
-        signal: publicationController.signal, generation, forceFinal,
-        shouldCommit: () => healthIsCurrent(generation, lifecycleController, forceFinal) && !publicationController.signal.aborted,
-      }));
-      operation.catch(() => {});
-      let timeoutId;
-      const outcome = await Promise.race([
+      try {
+        await previous.catch(() => {});
+        if (!healthIsCurrent(generation, lifecycleController, forceFinal)) return false;
+        const publicationController = new AbortController();
+        const abort = () => publicationController.abort();
+        lifecycleController.signal.addEventListener('abort', abort, { once: true });
+        const operation = Promise.resolve().then(() => dependencies.publishHealth(context, {
+          signal: publicationController.signal, generation, forceFinal,
+          shouldCommit: () => healthIsCurrent(generation, lifecycleController, forceFinal) && !publicationController.signal.aborted,
+        }));
+        operation.catch(() => {});
+        let timeoutId;
+        let outcome = 'failed';
+        try {
+          outcome = await Promise.race([
+            operation.then(() => 'ok', () => 'failed'),
+            new Promise((resolve) => { timeoutId = setTimeout(() => resolve('timeout'), boundedHealthTimeout(dependencies.healthPublishTimeoutMs)); }),
+          ]);
+        } finally {
+          clearTimeout(timeoutId);
+          lifecycleController.signal.removeEventListener('abort', abort);
+        }
+        if (outcome === 'ok') return true;
+        publicationController.abort();
+        reportHealthFailure(generation);
+        return false;
+      } catch {
+        reportHealthFailure(generation);
+        return false;
+      }
+    };
+    healthPublication = run().catch(() => false);
+    return healthPublication;
+  };
+
+  const safeInvalidateHealth = async () => {
+    if (typeof dependencies.invalidateHealth !== 'function') return false;
+    const generation = healthGeneration;
+    const operation = Promise.resolve().then(() => dependencies.invalidateHealth());
+    operation.catch(() => {});
+    let timeoutId;
+    let outcome = 'failed';
+    try {
+      outcome = await Promise.race([
         operation.then(() => 'ok', () => 'failed'),
         new Promise((resolve) => { timeoutId = setTimeout(() => resolve('timeout'), boundedHealthTimeout(dependencies.healthPublishTimeoutMs)); }),
       ]);
-      clearTimeout(timeoutId);
-      lifecycleController.signal.removeEventListener('abort', abort);
-      if (outcome !== 'ok') { publicationController.abort(); reportHealthFailure(generation); }
-    };
-    healthPublication = run().catch(() => {});
-    return healthPublication;
+    } catch {}
+    clearTimeout(timeoutId);
+    if (outcome !== 'ok') reportHealthFailure(generation);
+    return outcome === 'ok';
   };
 
   const publishHealthSoon = () => { void safePublishHealth(); };
@@ -338,6 +368,13 @@ export function createBridgeApplication(dependencies = {}) {
         healthTimer = setHealthInterval(() => { publishHealthSoon(); }, 10_000);
       } catch (error) {
         context.setLatestErrorCategory('startup-failed');
+        context.isStopping = true;
+        context.gatewayStatus = { state: 'failed' };
+        const clearHealthInterval = dependencies.clearInterval ?? globalThis.clearInterval;
+        if (healthTimer != null) {
+          try { clearHealthInterval(healthTimer); } catch {}
+          healthTimer = null;
+        }
         await context.gateway?.stop?.().catch(() => {});
         healthController?.abort();
         healthGeneration++;
@@ -345,10 +382,17 @@ export function createBridgeApplication(dependencies = {}) {
         healthLifecycle = 'stopping';
         healthFinalAllowed = true;
         healthPublication = Promise.resolve();
-        await safePublishHealth({ forceFinal: true });
-        await Promise.resolve(dependencies.invalidateHealth?.()).catch(() => {});
-        healthFinalAllowed = false;
-        healthLifecycle = 'stopped';
+        let terminalCommitted = false;
+        try {
+          terminalCommitted = await safePublishHealth({ forceFinal: true });
+          if (!terminalCommitted) {
+            healthController?.abort();
+            await safeInvalidateHealth();
+          }
+        } finally {
+          healthFinalAllowed = false;
+          healthLifecycle = 'stopped';
+        }
         throw error;
       }
     },

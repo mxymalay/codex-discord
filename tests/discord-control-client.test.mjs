@@ -197,3 +197,85 @@ test('hung ordinary preparation coalesces to one active and one latest pending w
     assert.equal(JSON.parse(await fs.readFile(target, 'utf8')).queueCount, 21);
   } finally { await fs.rm(root, { recursive: true, force: true }); }
 });
+
+test('health writer retains forced preparation state and cleans it after a rejected rename', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-bridge-health-forced-state-'));
+  const target = path.join(root, 'discord-bridge-health.json');
+  let releaseWrite;
+  const unhandled = [];
+  const onUnhandled = (reason) => unhandled.push(reason);
+  process.on('unhandledRejection', onUnhandled);
+  const fsImpl = {
+    async writeFile(file, contents) {
+      await new Promise((resolve) => { releaseWrite = resolve; });
+      await fs.writeFile(file, contents, 'utf8');
+    },
+    async rename() { throw new Error('rename failed'); },
+    rm: fs.rm.bind(fs),
+  };
+  try {
+    const forced = writeBridgeHealthAtomic(target, { gateway: { state: 'stopped' } }, { fsImpl, bypassQueue: true });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(getBridgeHealthWriterStats(target).activeForcedPreparations, 1);
+    releaseWrite();
+    await assert.rejects(forced, /rename failed/);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(unhandled, []);
+    assert.deepEqual(getBridgeHealthWriterStats(target), { activePreparations: 0, pendingOrdinary: 0, activeForcedPreparations: 0 });
+    assert.deepEqual((await fs.readdir(root)).filter((name) => name.endsWith('.tmp')), []);
+  } finally {
+    process.off('unhandledRejection', onUnhandled);
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('forced preparation retains the target commit mutex across ordinary cleanup', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-bridge-health-shared-mutex-'));
+  const target = path.join(root, 'discord-bridge-health.json');
+  let releaseOldRename;
+  let releaseForcedWrite;
+  let releaseLaterRename;
+  let firstRename = true;
+  let activeRenames = 0;
+  let maxActiveRenames = 0;
+  const fsImpl = {
+    async writeFile(file, contents) {
+      if (JSON.parse(contents).gateway.state === 'stopped') await new Promise((resolve) => { releaseForcedWrite = resolve; });
+      await fs.writeFile(file, contents, 'utf8');
+    },
+    async rename(source, destination) {
+      const snapshot = JSON.parse(await fs.readFile(source, 'utf8'));
+      if (firstRename) {
+        firstRename = false;
+        await new Promise((resolve) => { releaseOldRename = resolve; });
+      } else if (snapshot.queueCount === 3) {
+        await new Promise((resolve) => { releaseLaterRename = resolve; });
+      }
+      activeRenames += 1;
+      maxActiveRenames = Math.max(maxActiveRenames, activeRenames);
+      try { await fs.rename(source, destination); } finally { activeRenames -= 1; }
+    },
+    rm: fs.rm.bind(fs),
+  };
+  try {
+    const old = writeBridgeHealthAtomic(target, { queueCount: 1 }, { fsImpl });
+    while (!releaseOldRename) await new Promise((resolve) => setImmediate(resolve));
+    const forced = writeBridgeHealthAtomic(target, { gateway: { state: 'stopped' } }, { fsImpl, bypassQueue: true });
+    while (!releaseForcedWrite) await new Promise((resolve) => setImmediate(resolve));
+    releaseOldRename();
+    await old;
+    assert.equal(getBridgeHealthWriterStats(target).activeForcedPreparations, 1);
+    const later = writeBridgeHealthAtomic(target, { queueCount: 3 }, { fsImpl });
+    while (!releaseLaterRename) await new Promise((resolve) => setImmediate(resolve));
+    releaseForcedWrite();
+    const forcedBeforeLaterCommit = await Promise.race([
+      forced.then(() => true),
+      new Promise((resolve) => setTimeout(() => resolve(false), 5)),
+    ]);
+    assert.equal(forcedBeforeLaterCommit, false);
+    releaseLaterRename();
+    await Promise.all([later, forced]);
+    assert.equal(maxActiveRenames, 1);
+    assert.equal(JSON.parse(await fs.readFile(target, 'utf8')).gateway.state, 'stopped');
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
+});

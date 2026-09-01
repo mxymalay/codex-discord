@@ -201,6 +201,67 @@ test('health lifecycle bounds hung publication and makes stopped final publicati
   assert.equal(published.includes('late-ordinary'), false);
 });
 
+test('startup failure preserves its cause while bounded terminal health invalidation fails', async () => {
+  const events = [];
+  let allowStart = false;
+  const app = createBridgeApplication(makeBridgeDependencies(events, {
+    healthPublishTimeoutMs: 5,
+    async registerCommands() {
+      if (!allowStart) throw new Error('startup root cause');
+    },
+    publishHealth: async (_context, { forceFinal } = {}) => {
+      if (forceFinal) throw new Error('terminal write failed');
+    },
+    invalidateHealth() { throw new Error('invalidator sync failure'); },
+  }));
+
+  const outcome = await Promise.race([
+    app.start().then(() => 'started', (error) => error),
+    new Promise((resolve) => setTimeout(() => resolve('timed-out'), 40)),
+  ]);
+  assert.ok(outcome instanceof Error);
+  assert.match(outcome.message, /startup root cause/);
+  allowStart = true;
+  await app.start();
+  await app.stop();
+});
+
+test('startup failure preserves a committed terminal snapshot without invalidation', async () => {
+  const events = [];
+  let invalidations = 0;
+  const terminalSnapshots = [];
+  const app = createBridgeApplication(makeBridgeDependencies(events, {
+    async registerCommands() { throw new Error('startup root cause'); },
+    publishHealth: async (context, { forceFinal } = {}) => {
+      if (forceFinal) terminalSnapshots.push(context.getSystemStatus());
+    },
+    async invalidateHealth() { invalidations += 1; },
+  }));
+
+  await assert.rejects(() => app.start(), /startup root cause/);
+  assert.equal(terminalSnapshots.length, 1);
+  assert.equal(invalidations, 0);
+});
+
+test('startup failure bounds a never-settling health invalidator and preserves its cause', async () => {
+  const events = [];
+  const app = createBridgeApplication(makeBridgeDependencies(events, {
+    healthPublishTimeoutMs: 5,
+    async registerCommands() { throw new Error('startup root cause'); },
+    publishHealth: async (_context, { forceFinal } = {}) => {
+      if (forceFinal) throw new Error('terminal write failed');
+    },
+    invalidateHealth: () => new Promise(() => {}),
+  }));
+
+  const outcome = await Promise.race([
+    app.start().then(() => 'started', (error) => error),
+    new Promise((resolve) => setTimeout(() => resolve('timed-out'), 40)),
+  ]);
+  assert.ok(outcome instanceof Error);
+  assert.match(outcome.message, /startup root cause/);
+});
+
 test('REST tracker publishes failed then recovered state without raw failures', async () => {
   const events = [];
   const published = [];

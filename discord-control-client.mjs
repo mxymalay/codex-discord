@@ -146,51 +146,42 @@ function sanitizeHealth(status) {
   };
 }
 
-/** Atomically replace a same-directory, sanitized bridge health snapshot. */
-async function writeBridgeHealthAtomicLegacy(targetPath, status, { fsImpl = fs, signal, shouldCommit = () => !signal?.aborted, bypassQueue = false } = {}) {
-  const canCommit = () => !signal?.aborted && shouldCommit();
-  if (!canCommit()) return;
-  const queueKey = path.resolve(targetPath);
-  const previous = healthWriters.get(queueKey) ?? Promise.resolve();
-  const writeOperation = async () => {
-    if (!canCommit()) return;
-    const directory = path.dirname(targetPath);
-    const temporaryPath = path.join(directory, `.${path.basename(targetPath)}.${process.pid}.${randomUUID()}.tmp`);
-    const serialized = `${JSON.stringify(sanitizeHealth(status))}\n`;
-    try {
-      await fsImpl.writeFile(temporaryPath, serialized, 'utf8');
-      if (!canCommit()) return;
-      await fsImpl.rename(temporaryPath, targetPath);
-    } finally {
-      try {
-        if (typeof fsImpl.rm === 'function') await fsImpl.rm(temporaryPath, { force: true });
-        else if (typeof fsImpl.unlink === 'function') await fsImpl.unlink(temporaryPath);
-      } catch {
-        // A successful rename has already consumed the unique temporary file.
-      }
-    }
-  };
-  const write = previous.catch(() => {}).then(writeOperation);
-  if (!bypassQueue) healthWriters.set(queueKey, write);
-  try {
-    await write;
-  } finally {
-    if (!bypassQueue && healthWriters.get(queueKey) === write) healthWriters.delete(queueKey);
-  }
-}
-
 export function getBridgeHealthWriterStats(targetPath) {
   const state = healthWriters.get(path.resolve(targetPath));
-  return { activePreparations: state?.activeOrdinary ? 1 : 0, pendingOrdinary: state?.pendingOrdinary ? 1 : 0 };
+  return {
+    activePreparations: state?.activeOrdinary ? 1 : 0,
+    pendingOrdinary: state?.pendingOrdinary ? 1 : 0,
+    activeForcedPreparations: state?.activeForcedPreparations ?? 0,
+  };
 }
 
 function stateFor(targetPath) {
   const key = path.resolve(targetPath);
   let state = healthWriters.get(key);
-  if (!state || !Object.hasOwn(state, 'commitTail')) { state = { key, activeOrdinary: null, pendingOrdinary: null, commitTail: Promise.resolve() }; healthWriters.set(key, state); }
+  if (!state || !Object.hasOwn(state, 'commitTail')) {
+    state = { key, activeOrdinary: null, pendingOrdinary: null, activeForcedPreparations: 0, commitTail: Promise.resolve() };
+    healthWriters.set(key, state);
+  }
   return state;
 }
-async function cleanTemp(fsImpl, temporaryPath) { try { if (fsImpl.rm) await fsImpl.rm(temporaryPath, { force: true }); else await fsImpl.unlink?.(temporaryPath); } catch {} }
+async function cleanTemp(fsImpl, temporaryPath) {
+  try {
+    if (fsImpl.rm) await fsImpl.rm(temporaryPath, { force: true });
+    else await fsImpl.unlink?.(temporaryPath);
+  } catch {}
+}
+
+function tryCleanupState(state, observedTail = state.commitTail) {
+  if (state.activeOrdinary || state.pendingOrdinary || state.activeForcedPreparations > 0) return;
+  const cleanup = () => {
+    if (!state.activeOrdinary && !state.pendingOrdinary && state.activeForcedPreparations === 0 &&
+      state.commitTail === observedTail && healthWriters.get(state.key) === state) {
+      healthWriters.delete(state.key);
+    }
+  };
+  observedTail.then(cleanup, cleanup);
+}
+
 async function prepareWrite(request, state) {
   const canCommit = () => !request.signal?.aborted && request.shouldCommit();
   if (!canCommit()) return;
@@ -199,19 +190,50 @@ async function prepareWrite(request, state) {
     await request.fsImpl.writeFile(temp, `${JSON.stringify(sanitizeHealth(request.status))}\n`, 'utf8');
     if (!canCommit()) return;
     const prior = state.commitTail;
-    state.commitTail = prior.catch(() => {}).then(async () => { if (canCommit()) await request.fsImpl.rename(temp, request.targetPath); });
-    await state.commitTail;
+    const commitPromise = prior.then(async () => {
+      if (canCommit()) await request.fsImpl.rename(temp, request.targetPath);
+    });
+    state.commitTail = commitPromise.catch(() => {});
+    await commitPromise;
   } finally { await cleanTemp(request.fsImpl, temp); }
 }
+
 function launchOrdinary(state) {
   const request = state.pendingOrdinary;
   if (!request || state.activeOrdinary) return;
   state.pendingOrdinary = null; state.activeOrdinary = request;
-  prepareWrite(request, state).then(request.resolve, request.reject).finally(() => { state.activeOrdinary = null; launchOrdinary(state); if (!state.activeOrdinary && !state.pendingOrdinary) state.commitTail.finally(() => { if (!state.activeOrdinary && !state.pendingOrdinary && healthWriters.get(state.key) === state) healthWriters.delete(state.key); }); });
+  prepareWrite(request, state).then(request.resolve, request.reject).then(
+    () => {
+      state.activeOrdinary = null;
+      launchOrdinary(state);
+      tryCleanupState(state);
+    },
+    () => {
+      state.activeOrdinary = null;
+      launchOrdinary(state);
+      tryCleanupState(state);
+    },
+  );
 }
+
+/** Atomically replace a same-directory, sanitized bridge health snapshot. Ordinary writes may resolve as { coalesced: true } when replaced by a newer pending snapshot. */
 export function writeBridgeHealthAtomic(targetPath, status, { fsImpl = fs, signal, shouldCommit = () => !signal?.aborted, bypassQueue = false } = {}) {
   const state = stateFor(targetPath);
   const request = { targetPath, status, fsImpl, signal, shouldCommit, resolve: null, reject: null };
-  if (bypassQueue) return prepareWrite(request, state);
+  if (bypassQueue) {
+    state.activeForcedPreparations += 1;
+    return prepareWrite(request, state).then(
+      (value) => {
+        state.activeForcedPreparations -= 1;
+        tryCleanupState(state);
+        return value;
+      },
+      (error) => {
+        state.activeForcedPreparations -= 1;
+        tryCleanupState(state);
+        throw error;
+      },
+    );
+  }
   return new Promise((resolve, reject) => { request.resolve = resolve; request.reject = reject; if (state.pendingOrdinary) state.pendingOrdinary.resolve({ coalesced: true }); state.pendingOrdinary = request; launchOrdinary(state); });
 }
