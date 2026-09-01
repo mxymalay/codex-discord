@@ -10,7 +10,7 @@ import {
   encryptPendingReplyText,
   dispatchContinuation,
   getDiscordMessagesAfter,
-  listContinuations,
+  listRetryableContinuations,
   getLatestDiscordMessageId,
   initializeInboxCursors,
   loadDiscordToken,
@@ -141,7 +141,7 @@ async function startContinuation({ token, config, state, request }) {
 
 async function retryPendingTurns({ token, config, state }) {
   const now = Date.now();
-  for (const pending of listContinuations(state).filter((item) => item.status === 'queued')) {
+  for (const pending of listRetryableContinuations(state)) {
     const lastAttempt = Date.parse(String(pending.lastAttemptAt ?? ''));
     if (Number.isFinite(lastAttempt) && now - lastAttempt < pendingRetryIntervalMs) continue;
     await startContinuation({ token, config, state, request: pending });

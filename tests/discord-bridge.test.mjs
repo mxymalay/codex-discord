@@ -26,6 +26,7 @@ import {
   initializeInboxCursors,
   isActiveWriterError,
   listContinuations,
+  listRetryableContinuations,
   markContinuationDelivered,
   migrateInboxState,
   migrateLegacyPendingReplies,
@@ -626,6 +627,102 @@ test('a reply remains confirmed-start when no acknowledgement transport is avail
   assert.equal(listContinuations(state)[0].status, 'confirmed-start');
 });
 
+test('a confirmed reply retries only its failed acknowledgement on another dispatch', async () => {
+  const state = createEmptyInboxState();
+  const request = createContinuationRequest({
+    source: 'reply', requestId: 'retry-ack-only', threadId: 'root-1', text: 'continue',
+    channelId: 'channel-1', replyToMessageId: 'retry-ack-only',
+  });
+  let resumeCount = 0;
+  let acknowledgementCount = 0;
+  const dependencies = {
+    state,
+    encryptText: async () => 'opaque-ciphertext',
+    persistState: async () => {},
+    resumeCodexThread: async () => {
+      resumeCount += 1;
+      return { turnId: 'turn-ack-only', completion: Promise.resolve({ turn: { status: 'completed' } }) };
+    },
+    sendReply: async () => {
+      acknowledgementCount += 1;
+      if (acknowledgementCount === 1) throw new Error('temporary Discord failure');
+    },
+  };
+
+  const first = await dispatchContinuation(request, dependencies);
+  const second = await dispatchContinuation(request, dependencies);
+
+  assert.equal(first.status, 'started');
+  assert.equal(second.status, 'started');
+  assert.equal(resumeCount, 1);
+  assert.equal(acknowledgementCount, 2);
+  assert.equal(listContinuations(state)[0].status, 'delivered');
+});
+
+test('a reloaded confirmed reply sends only its pending acknowledgement and persists delivery', async () => {
+  const originalState = createEmptyInboxState();
+  const request = createContinuationRequest({
+    source: 'reply', requestId: 'reload-ack-only', threadId: 'root-1', text: 'continue',
+    channelId: 'channel-1', replyToMessageId: 'reload-ack-only',
+  });
+  let resumeCount = 0;
+  await dispatchContinuation(request, {
+    state: originalState,
+    encryptText: async () => 'opaque-ciphertext',
+    persistState: async () => {},
+    resumeCodexThread: async () => {
+      resumeCount += 1;
+      return { turnId: 'turn-before-reload', completion: Promise.resolve({ turn: { status: 'completed' } }) };
+    },
+    sendReply: async () => { throw new Error('temporary Discord failure'); },
+  });
+  const reloaded = migrateInboxState(structuredClone(originalState));
+  let acknowledgementCount = 0;
+  let persistedStatus;
+
+  const result = await dispatchContinuation(listContinuations(reloaded)[0], {
+    state: reloaded,
+    persistState: async () => { persistedStatus = listContinuations(reloaded)[0]?.status; },
+    resumeCodexThread: async () => { resumeCount += 1; throw new Error('must not resume confirmed turn'); },
+    sendReply: async () => { acknowledgementCount += 1; },
+  });
+
+  assert.equal(result.status, 'started');
+  assert.equal(resumeCount, 1);
+  assert.equal(acknowledgementCount, 1);
+  assert.equal(listContinuations(reloaded)[0].status, 'delivered');
+  assert.equal(persistedStatus, 'delivered');
+});
+
+test('bridge retry candidates include queued work and confirmed replies awaiting acknowledgement', () => {
+  const state = createEmptyInboxState();
+  for (const entry of [
+    { source: 'slash', requestId: 'queued-slash', status: 'queued' },
+    { source: 'reply', requestId: 'queued-reply', status: 'queued' },
+    { source: 'reply', requestId: 'confirmed-reply', status: 'confirmed-start' },
+    { source: 'slash', requestId: 'confirmed-slash', status: 'confirmed-start' },
+    { source: 'reply', requestId: 'delivered-reply', status: 'delivered' },
+  ]) {
+    enqueueContinuation(state, {
+      ...createContinuationRequest({
+        source: entry.source,
+        requestId: entry.requestId,
+        threadId: 'root-1',
+        text: 'continue',
+        channelId: entry.source === 'reply' ? 'channel-1' : undefined,
+        replyToMessageId: entry.source === 'reply' ? entry.requestId : undefined,
+      }),
+      encryptedText: `cipher:${entry.requestId}`,
+      status: entry.status,
+    });
+  }
+
+  assert.deepEqual(
+    listRetryableContinuations(state).map((item) => item.requestId).sort(),
+    ['confirmed-reply', 'queued-reply', 'queued-slash'],
+  );
+});
+
 test('a confirmed turn stays started when confirmation persistence, acknowledgement, or tracking fails', async () => {
   const state = createEmptyInboxState();
   const events = [];
@@ -674,6 +771,72 @@ test('queued retry claim persistence failure restores the exact queued snapshot 
   assert.deepEqual(state, before);
   assert.equal(resumed, false);
   assert.deepEqual(result, { status: 'failed', queueId: queued.queueId, reason: 'state-persist-failed' });
+});
+
+test('queued retry rechecks cancellation under the state lock after asynchronous decryption', async () => {
+  const state = createEmptyInboxState();
+  const queued = enqueueContinuation(state, {
+    ...createContinuationRequest({
+      source: 'reply', requestId: 'decrypt-cancel-race', threadId: 'root-1', text: 'continue',
+      channelId: 'channel-1', replyToMessageId: 'decrypt-cancel-race',
+    }),
+    encryptedText: 'opaque-ciphertext',
+  });
+  let releaseDecrypt;
+  let signalDecryptStarted;
+  const decryptStarted = new Promise((resolve) => { signalDecryptStarted = resolve; });
+  const decryptGate = new Promise((resolve) => { releaseDecrypt = resolve; });
+  let resumeCount = 0;
+  const dispatch = dispatchContinuation(queued, {
+    state,
+    decryptText: async () => { signalDecryptStarted(); await decryptGate; return 'continue'; },
+    persistState: async () => {},
+    resumeCodexThread: async () => { resumeCount += 1; return { turnId: 'must-not-start' }; },
+  });
+  await decryptStarted;
+  await cancelContinuationPersisted({ state, queueId: queued.queueId, persistState: async () => {} });
+  releaseDecrypt();
+
+  const result = await dispatch;
+
+  assert.equal(result.status, 'failed');
+  assert.equal(result.reason, 'cancelled');
+  assert.equal(resumeCount, 0);
+  assert.equal(state.pendingContinuations[queued.queueId].status, 'cancelled');
+});
+
+test('two concurrent dispatches for one request claim at most one external resume', async () => {
+  const state = createEmptyInboxState();
+  const request = createContinuationRequest({
+    source: 'slash', requestId: 'concurrent-request', threadId: 'root-1', text: 'continue',
+  });
+  let encryptionCount = 0;
+  let releaseEncryption;
+  const encryptionGate = new Promise((resolve) => { releaseEncryption = resolve; });
+  let resumeCount = 0;
+  const dependencies = {
+    state,
+    encryptText: async () => {
+      encryptionCount += 1;
+      if (encryptionCount === 2) releaseEncryption();
+      await encryptionGate;
+      return 'opaque-ciphertext';
+    },
+    persistState: async () => {},
+    resumeCodexThread: async () => {
+      resumeCount += 1;
+      return { turnId: `turn-${resumeCount}`, completion: Promise.resolve({ turn: { status: 'completed' } }) };
+    },
+  };
+
+  const results = await Promise.all([
+    dispatchContinuation(request, dependencies),
+    dispatchContinuation(request, dependencies),
+  ]);
+
+  assert.equal(resumeCount, 1);
+  assert.equal(results.some((result) => result.status === 'started'), true);
+  assert.equal(listContinuations(state).length, 1);
 });
 
 test('dispatch never starts an external turn without a persistence adapter', async () => {

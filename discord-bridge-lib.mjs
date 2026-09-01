@@ -249,6 +249,11 @@ export function listContinuations(state) {
   });
 }
 
+export function listRetryableContinuations(state) {
+  return listContinuations(state).filter((item) =>
+    item?.status === 'queued' || (item?.source === 'reply' && item?.status === 'confirmed-start'));
+}
+
 export function cancelContinuation(state, queueId, now = new Date().toISOString()) {
   const item = state?.pendingContinuations?.[String(queueId)];
   if (!item) return { status: 'not-found' };
@@ -322,6 +327,44 @@ async function acknowledgeContinuation(dependencies, request, content) {
   return true;
 }
 
+async function deliverConfirmedReply(state, item, dependencies, now) {
+  return withContinuationStateLock(state, async () => {
+    const current = state.pendingContinuations[item.queueId];
+    const result = { status: 'started', queueId: item.queueId, turnId: current?.turnId ?? item.turnId };
+    if (current?.status === 'delivered') return result;
+    if (current?.status !== 'confirmed-start' || current?.source !== 'reply') {
+      return {
+        status: 'failed',
+        queueId: item.queueId,
+        reason: current?.status === 'attempting'
+          ? 'attempt-in-progress'
+          : current?.failureReason ?? current?.status ?? 'not-found',
+      };
+    }
+    try {
+      const acknowledged = await acknowledgeContinuation(
+        dependencies,
+        current,
+        `✅ 已送达原 Codex 任务（…${String(current.threadId).slice(-8)}），已开始继续执行。`,
+      );
+      if (!acknowledged) return result;
+    } catch {
+      return { ...result, reason: 'ack-failed' };
+    }
+
+    const snapshot = structuredClone(state);
+    markContinuationDelivered(state, current.queueId, now);
+    try {
+      if (typeof dependencies.persistState !== 'function') throw new Error('Persistence adapter is unavailable');
+      await dependencies.persistState(state);
+      return result;
+    } catch {
+      restoreState(state, snapshot);
+      return { ...result, reason: 'state-persist-failed' };
+    }
+  });
+}
+
 export async function dispatchContinuation(request, dependencies = {}) {
   const state = migrateInboxState(dependencies.state ?? createEmptyInboxState());
   dependencies.state = state;
@@ -331,6 +374,9 @@ export async function dispatchContinuation(request, dependencies = {}) {
   let existing = listContinuations(state).find((item) => item.source === source && item.requestId === requestId);
   const wasQueuedRequest = Boolean(existing);
   const isQueuedRetry = Boolean(request?.queueId && existing?.queueId === String(request.queueId));
+  if (existing?.source === 'reply' && existing.status === 'confirmed-start') {
+    return deliverConfirmedReply(state, existing, dependencies, now);
+  }
   if (!isQueuedRetry) {
     if (existing) {
       if (['confirmed-start', 'delivered'].includes(existing.status)) {
@@ -404,17 +450,46 @@ export async function dispatchContinuation(request, dependencies = {}) {
     existing = listContinuations(state).find((item) => item.source === source && item.requestId === requestId);
   }
 
-  const queuedSnapshot = structuredClone(state);
+  let queuedSnapshot;
+  let claimObservation;
   try {
-    await persistMutation(state, dependencies.persistState, () => {
+    await withContinuationStateLock(state, async () => {
       const current = state.pendingContinuations[existing.queueId];
+      if (!current || current.status !== 'queued') {
+        claimObservation = current ? structuredClone(current) : null;
+        return;
+      }
+      queuedSnapshot = structuredClone(state);
       current.status = 'attempting';
       current.lastAttemptAt = now;
       current.attempts = Number(current.attempts ?? 0) + 1;
       if (source === 'slash') recordProcessedInteraction(state, requestId, { status: 'attempting', queueId: current.queueId }, now);
+      pruneContinuationHistory(state);
+      try {
+        if (typeof dependencies.persistState !== 'function') throw new Error('Persistence adapter is unavailable');
+        await dependencies.persistState(state);
+      } catch {
+        restoreState(state, queuedSnapshot);
+        throw new Error('Continuation state persistence failed');
+      }
     });
   } catch {
     return { status: 'failed', queueId: existing.queueId, reason: 'state-persist-failed' };
+  }
+  if (claimObservation !== undefined) {
+    if (claimObservation?.source === 'reply' && claimObservation.status === 'confirmed-start') {
+      return deliverConfirmedReply(state, claimObservation, dependencies, now);
+    }
+    if (['confirmed-start', 'delivered'].includes(claimObservation?.status)) {
+      return { status: 'started', queueId: existing.queueId, turnId: claimObservation.turnId };
+    }
+    return {
+      status: 'failed',
+      queueId: existing.queueId,
+      reason: claimObservation?.status === 'attempting'
+        ? 'attempt-in-progress'
+        : claimObservation?.failureReason ?? claimObservation?.status ?? 'not-found',
+    };
   }
 
   const resume = dependencies.resumeCodexThread ?? resumeCodexThread;
