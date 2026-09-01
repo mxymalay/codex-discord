@@ -361,14 +361,25 @@ export function decryptPendingReplyText({ toolDir, powershellPath = 'pwsh', ciph
 }
 
 export class AppServerClient {
-  constructor({ codexPath, cwd }) {
-    this.child = spawn(codexPath, ['app-server', '--stdio'], {
+  constructor({
+    codexPath,
+    cwd,
+    spawnImpl = spawn,
+    earlyCompletionMax = 100,
+    earlyCompletionTtlMs = 5 * 60 * 1000,
+    now = Date.now,
+  }) {
+    this.child = spawnImpl(codexPath, ['app-server', '--stdio'], {
       cwd,
       windowsHide: true,
       stdio: ['pipe', 'pipe', 'ignore'],
     });
     this.pending = new Map();
     this.completedTurns = new Map();
+    this.earlyCompletedTurns = new Map();
+    this.earlyCompletionMax = Math.max(1, Number(earlyCompletionMax) || 1);
+    this.earlyCompletionTtlMs = Math.max(1, Number(earlyCompletionTtlMs) || 1);
+    this.now = now;
     this.closed = false;
     this.exitError = null;
 
@@ -399,12 +410,31 @@ export class AppServerClient {
     }
     if (message.method === 'turn/completed') {
       const turnId = String(message.params?.turn?.id ?? '');
+      if (!turnId) return;
       const completion = this.completedTurns.get(turnId);
       if (completion) {
         this.completedTurns.delete(turnId);
         clearTimeout(completion.timer);
         completion.resolve(message.params);
+      } else {
+        this.#pruneEarlyCompletions();
+        this.earlyCompletedTurns.delete(turnId);
+        this.earlyCompletedTurns.set(turnId, {
+          params: message.params,
+          receivedAt: Number(this.now()),
+        });
+        while (this.earlyCompletedTurns.size > this.earlyCompletionMax) {
+          this.earlyCompletedTurns.delete(this.earlyCompletedTurns.keys().next().value);
+        }
       }
+    }
+  }
+
+  #pruneEarlyCompletions() {
+    const cutoff = Number(this.now()) - this.earlyCompletionTtlMs;
+    for (const [turnId, completion] of this.earlyCompletedTurns) {
+      if (completion.receivedAt > cutoff) continue;
+      this.earlyCompletedTurns.delete(turnId);
     }
   }
 
@@ -422,6 +452,7 @@ export class AppServerClient {
       completion.reject(error ?? new Error('Codex App Server connection closed before turn completion'));
     }
     this.completedTurns.clear();
+    this.earlyCompletedTurns.clear();
   }
 
   send(message) {
@@ -442,6 +473,12 @@ export class AppServerClient {
   }
 
   waitForTurn(turnId, timeoutMs = 24 * 60 * 60 * 1000) {
+    this.#pruneEarlyCompletions();
+    const early = this.earlyCompletedTurns.get(turnId);
+    if (early) {
+      this.earlyCompletedTurns.delete(turnId);
+      return Promise.resolve(early.params);
+    }
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.completedTurns.delete(turnId);

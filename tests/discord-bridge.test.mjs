@@ -1,8 +1,12 @@
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { PassThrough } from 'node:stream';
 import test from 'node:test';
+
+import { startNewCodexTask } from '../discord-task-create-lib.mjs';
 
 import {
   AppServerClient,
@@ -42,6 +46,38 @@ const mapping = {
     },
   },
 };
+
+function scriptedAppServerProcess({ threadId, turnId, resume = false }) {
+  const child = new EventEmitter();
+  child.stdin = new PassThrough();
+  child.stdout = new PassThrough();
+  child.kill = () => child.emit('close', 0);
+  let buffered = '';
+  child.stdin.on('data', (chunk) => {
+    buffered += chunk.toString('utf8');
+    for (;;) {
+      const newline = buffered.indexOf('\n');
+      if (newline < 0) break;
+      const line = buffered.slice(0, newline);
+      buffered = buffered.slice(newline + 1);
+      const message = JSON.parse(line);
+      if (message.method === 'initialized') continue;
+      let result = {};
+      if (message.method === 'thread/start' || message.method === 'thread/resume') {
+        result = { thread: { id: threadId, name: null } };
+      }
+      if (message.method === 'turn/start') {
+        const response = JSON.stringify({ id: message.id, result: { turn: { id: turnId } } });
+        const completion = JSON.stringify({ method: 'turn/completed', params: { turn: { id: turnId, status: 'completed' } } });
+        child.stdout.write(`${response}\n${completion}\n`);
+        continue;
+      }
+      child.stdout.write(`${JSON.stringify({ id: message.id, result })}\n`);
+    }
+  });
+  child.stdin.on('finish', () => queueMicrotask(() => child.emit('close', 0)));
+  return { child, resume };
+}
 
 function makeMessage(overrides = {}) {
   return {
@@ -173,6 +209,59 @@ test('resume uses the reusable initializer before preserving resume and turn com
   assert.deepEqual(methods, [
     'initialize', 'initialized', 'thread/resume', 'turn/start', 'waitForTurn', 'close',
   ]);
+});
+
+test('new task consumes an early completion from the same stdout chunk and closes promptly', async () => {
+  const { child } = scriptedAppServerProcess({ threadId: 'thread-early-new', turnId: 'turn-early-new' });
+  const client = new AppServerClient({
+    codexPath: 'not-used', cwd: 'C:\\workspace', spawnImpl: () => child,
+  });
+  const result = await startNewCodexTask({
+    selection: { kind: 'project', projectId: 'p1', projectName: 'POS', roots: ['C:\\workspace'] },
+    workspace: { mode: 'local', cwd: 'C:\\workspace', runtimeWorkspaceRoots: ['C:\\workspace'] },
+    text: 'early', interactionId: 'early-new', codexPath: 'not-used', processCwd: 'C:\\workspace',
+    clientFactory: () => client,
+  });
+  assert.equal((await result.completion).turn.id, 'turn-early-new');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(child.stdin.writableEnded, true);
+});
+
+test('resume consumes an early completion from the same stdout chunk and closes promptly', async () => {
+  const { child } = scriptedAppServerProcess({ threadId: 'thread-early-resume', turnId: 'turn-early-resume', resume: true });
+  const client = new AppServerClient({
+    codexPath: 'not-used', cwd: 'C:\\workspace', spawnImpl: () => child,
+  });
+  const result = await resumeCodexThread({
+    threadId: 'thread-early-resume', cwd: 'C:\\workspace', text: 'continue', codexPath: 'not-used',
+    clientFactory: () => client,
+  });
+  assert.equal((await result.completion).turn.id, 'turn-early-resume');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(child.stdin.writableEnded, true);
+});
+
+test('early completion buffering has bounded size and retention', async () => {
+  let clock = 0;
+  const child = new EventEmitter();
+  child.stdin = new PassThrough();
+  child.stdout = new PassThrough();
+  child.kill = () => {};
+  const client = new AppServerClient({
+    codexPath: 'not-used', cwd: 'C:\\workspace', spawnImpl: () => child,
+    earlyCompletionMax: 2, earlyCompletionTtlMs: 10, now: () => clock,
+  });
+  const completed = (id) => `${JSON.stringify({ method: 'turn/completed', params: { turn: { id } } })}\n`;
+  child.stdout.write(completed('turn-1'));
+  child.stdout.write(completed('turn-2'));
+  child.stdout.write(completed('turn-3'));
+
+  await assert.rejects(() => client.waitForTurn('turn-1', 5), /completion timed out/);
+  assert.equal((await client.waitForTurn('turn-2', 5)).turn.id, 'turn-2');
+  clock = 11;
+  await assert.rejects(() => client.waitForTurn('turn-3', 5), /completion timed out/);
+  client.close();
+  child.emit('close', 0);
 });
 
 test('orders Discord Snowflakes numerically', () => {

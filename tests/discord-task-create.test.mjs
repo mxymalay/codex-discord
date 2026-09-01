@@ -42,21 +42,98 @@ function fakeGitRunner(calls, {
   isRepo = true,
   defaultRef = 'origin/main',
   head = '0123456789abcdef',
+  headError = null,
+  repositoryRoot = 'C:\\repo',
+  probeError = null,
+  versionError = null,
+  partialAddError = null,
+  worktrees = [],
 } = {}) {
   return async ({ command, args }) => {
     calls.push({ command, args: [...args] });
     assert.equal(command, 'git');
     assert.equal(Array.isArray(args), true);
+    if (args[0] === '--version') {
+      if (versionError) throw versionError;
+      return { stdout: 'git version 2.51.0\n' };
+    }
+    if (args.includes('worktree') && args.includes('list')) {
+      return {
+        stdout: worktrees.map((item) => [
+          `worktree ${item.path}`,
+          `HEAD ${item.head ?? head}`,
+          `branch refs/heads/${item.branch}`,
+          '',
+        ].join('\0')).join(''),
+      };
+    }
+    if (args.includes('worktree') && args.includes('add')) {
+      const branch = args[args.indexOf('-b') + 1];
+      const worktreePath = args.at(-2);
+      worktrees.push({ path: worktreePath, branch, head });
+      if (partialAddError) throw partialAddError;
+      return { stdout: '' };
+    }
+    if (args.includes('worktree') && args.includes('remove')) {
+      const target = path.resolve(args.at(-1));
+      const index = worktrees.findIndex((item) => path.resolve(item.path) === target);
+      if (index >= 0) worktrees.splice(index, 1);
+      return { stdout: '' };
+    }
     if (args.at(-1) === '--show-toplevel') {
-      if (!isRepo) throw Object.assign(new Error('not a repository'), { code: 'GIT_FAILED' });
-      return { stdout: `${args[1]}\n` };
+      if (probeError) throw probeError;
+      if (!isRepo) throw Object.assign(new Error('not a repository'), { code: 'GIT_NOT_REPOSITORY' });
+      return { stdout: `${repositoryRoot}\n` };
     }
     if (args.includes('symbolic-ref')) {
       if (!defaultRef) throw Object.assign(new Error('no origin HEAD'), { code: 'GIT_FAILED' });
       return { stdout: `${defaultRef}\n` };
     }
-    if (args.at(-1) === 'HEAD') return { stdout: `${head}\n` };
+    if (args.at(-1) === 'HEAD') {
+      if (headError) throw headError;
+      return { stdout: `${head}\n` };
+    }
     return { stdout: '' };
+  };
+}
+
+function fakeFileSystem({
+  gitRoots = [],
+  missingRoots = [],
+  nonDirectoryRoots = [],
+  inaccessibleMarkers = [],
+} = {}) {
+  const normalize = (value) => path.resolve(value).toLocaleLowerCase();
+  const gitMarkers = new Set(gitRoots.map((root) => normalize(path.join(root, '.git'))));
+  const missing = new Set(missingRoots.map(normalize));
+  const nonDirectories = new Set(nonDirectoryRoots.map(normalize));
+  const inaccessible = new Set(inaccessibleMarkers.map(normalize));
+  return {
+    async stat(target) {
+      if (missing.has(normalize(target))) throw Object.assign(new Error('missing'), { code: 'ENOENT' });
+      return { isDirectory: () => !nonDirectories.has(normalize(target)) };
+    },
+    async lstat(target) {
+      const key = normalize(target);
+      if (inaccessible.has(key)) throw Object.assign(new Error('access denied'), { code: 'EACCES' });
+      if (gitMarkers.has(key)) return { isDirectory: () => true, isFile: () => false };
+      throw Object.assign(new Error('missing'), { code: 'ENOENT' });
+    },
+    async mkdir() {},
+  };
+}
+
+function capturingPersistence(events = []) {
+  const snapshots = [];
+  return {
+    snapshots,
+    persistState: async (state) => {
+      const snapshot = structuredClone(state);
+      snapshots.push(snapshot);
+      const records = Object.values(snapshot.createdTasksByInteraction ?? {});
+      const record = records.at(-1);
+      events.push(`persist:${record?.status ?? 'empty'}${record?.status === 'creating' && record.workspace ? '-planned' : ''}`);
+    },
   };
 }
 
@@ -96,8 +173,48 @@ test('closes the project-list App Server client when paging fails', async () => 
     codexPath: 'codex',
     processCwd: 'C:\\workspace',
     clientFactory: () => fakeAppServer(methods, { 'project/list': new Error('unavailable') }),
-  }), /unavailable/);
+  }), (error) => {
+    assert.equal(error.message, 'Codex project catalog request failed');
+    assert.equal(error.message.includes('unavailable'), false);
+    return true;
+  });
   assert.deepEqual(methods, ['initialize', 'initialized', 'project/list', 'close']);
+});
+
+test('rejects malformed project pages and repeated cursors with sanitized closure', async (t) => {
+  let invalidCursorRequests = 0;
+  const cases = [
+    ['non-array data', { data: {}, nextCursor: null }],
+    ['invalid cursor type', () => {
+      invalidCursorRequests += 1;
+      if (invalidCursorRequests > 1) throw new Error('invalid cursor was not rejected');
+      return { data: [], nextCursor: 7 };
+    }],
+  ];
+  for (const [name, page] of cases) {
+    await t.test(name, async () => {
+      const methods = [];
+      await assert.rejects(() => listCodexProjects({
+        codexPath: 'codex', processCwd: 'C:\\workspace',
+        clientFactory: () => fakeAppServer(methods, { 'project/list': page }),
+      }), /Codex project catalog response invalid/);
+      assert.equal(methods.at(-1), 'close');
+    });
+  }
+
+  const methods = [];
+  let cycleRequests = 0;
+  await assert.rejects(() => listCodexProjects({
+    codexPath: 'codex', processCwd: 'C:\\workspace',
+    clientFactory: () => fakeAppServer(methods, {
+      'project/list': () => {
+        cycleRequests += 1;
+        if (cycleRequests > 2) throw new Error('cycle was not detected');
+        return { data: [], nextCursor: 'same-cursor' };
+      },
+    }),
+  }), /Codex project catalog response invalid/);
+  assert.deepEqual(methods, ['initialize', 'initialized', 'project/list', 'project/list', 'close']);
 });
 
 test('project catalog autocomplete is cache-only and deduplicates an expired background refresh', async () => {
@@ -166,6 +283,27 @@ test('project catalog keeps last good data and exposes only a sanitized refresh 
   });
 });
 
+test('an initial catalog failure remains unwarmed and warm retries successfully', async () => {
+  let calls = 0;
+  const catalog = createProjectCatalog({
+    loader: async () => {
+      calls += 1;
+      if (calls === 1) throw new Error('first load failed');
+      return [project({ id: 'retry', name: 'Retry Project' })];
+    },
+  });
+  await assert.rejects(() => catalog.warm(), /project catalog refresh failed/);
+  assert.deepEqual(catalog.status(), {
+    warmed: false,
+    refreshing: false,
+    lastRefreshAt: null,
+    errorCategory: 'project-refresh-failed',
+  });
+  assert.equal((await catalog.warm())[0].id, 'retry');
+  assert.equal(calls, 2);
+  assert.equal(catalog.status().warmed, true);
+});
+
 test('resolves only exact saved project IDs and rejects deleted, rootless, or path selections', () => {
   const projects = [project()];
   assert.deepEqual(resolveProjectSelection({ projects, selectionId: 'project-1' }), {
@@ -228,6 +366,7 @@ test('routes a Git saved project to an operation-owned generated worktree and pr
     worktreeRoot: 'G:\\codex-worktrees',
     operationId: 'abc123',
     now: new Date('2026-09-01T01:02:03Z'),
+    fileSystem: fakeFileSystem({ gitRoots: ['C:\\repo'] }),
     gitRunner: fakeGitRunner(calls, { isRepo: true, defaultRef: 'origin/main' }),
   });
 
@@ -246,6 +385,7 @@ test('falls back from missing remote HEAD to the current Git HEAD', async () => 
     worktreeRoot: 'G:\\codex-worktrees',
     operationId: 'fallback1',
     now: new Date('2026-09-01T01:02:03Z'),
+    fileSystem: fakeFileSystem({ gitRoots: ['C:\\repo'] }),
     gitRunner: fakeGitRunner(calls, { defaultRef: null, head: 'deadbeef' }),
   });
   assert.equal(prepared.mode, 'worktree');
@@ -259,12 +399,14 @@ test('routes non-Git saved projects locally with every saved root', async () => 
     selection: { kind: 'project', projectId: 'p1', projectName: 'Files', roots: ['C:\\files', 'D:\\shared'] },
     worktreeRoot: 'G:\\codex-worktrees',
     operationId: 'local1',
+    fileSystem: fakeFileSystem(),
     gitRunner: fakeGitRunner(calls, { isRepo: false }),
   });
   assert.equal(prepared.mode, 'local');
   assert.equal(prepared.cwd, 'C:\\files');
   assert.deepEqual(prepared.runtimeWorkspaceRoots, ['C:\\files', 'D:\\shared']);
-  assert.equal(calls.length, 1);
+  assert.equal(calls.length, 2);
+  assert.equal(calls.some(({ args }) => args.includes('add')), false);
 });
 
 test('creates the configured projectless directory only while preparing the workspace', async () => {
@@ -284,12 +426,30 @@ test('creates the configured projectless directory only while preparing the work
   }
 });
 
+test('persists a projectless operation plan before creating its directory', async () => {
+  const events = [];
+  const fileSystem = {
+    async mkdir() { events.push('mkdir'); },
+  };
+  const prepared = await prepareTaskWorkspace({
+    selection: { kind: 'projectless', projectId: null, projectName: '无项目', roots: ['C:\\tasks'] },
+    worktreeRoot: 'G:\\unused', operationId: 'projectlessplan1', fileSystem,
+    onWorkspacePlanned: async (workspace) => {
+      assert.equal(workspace.cwd, 'C:\\tasks');
+      events.push('persist-plan');
+    },
+  });
+  assert.equal(prepared.mode, 'projectless');
+  assert.deepEqual(events, ['persist-plan', 'mkdir']);
+});
+
 test('rejects unsafe operation IDs before invoking Git', async () => {
   const calls = [];
   await assert.rejects(() => prepareTaskWorkspace({
     selection: { kind: 'project', projectId: 'p1', projectName: 'POS', roots: ['C:\\repo'] },
     worktreeRoot: 'G:\\codex-worktrees',
     operationId: '..\\outside',
+    fileSystem: fakeFileSystem({ gitRoots: ['C:\\repo'] }),
     gitRunner: fakeGitRunner(calls),
   }), /operation ID/i);
   assert.deepEqual(calls, []);
@@ -301,9 +461,110 @@ test('rejects a missing configured worktree root before invoking Git', async () 
     selection: { kind: 'project', projectId: 'p1', projectName: 'POS', roots: ['C:\\repo'] },
     worktreeRoot: '',
     operationId: 'missingroot1',
+    fileSystem: fakeFileSystem({ gitRoots: ['C:\\repo'] }),
     gitRunner: fakeGitRunner(calls),
   }), /worktree root/i);
   assert.deepEqual(calls, []);
+});
+
+test('rejects missing and non-directory saved roots before probing Git', async (t) => {
+  const cases = [
+    ['missing root', fakeFileSystem({ missingRoots: ['C:\\shared'] })],
+    ['non-directory root', fakeFileSystem({ nonDirectoryRoots: ['C:\\shared'] })],
+  ];
+  for (const [name, fileSystem] of cases) {
+    await t.test(name, async () => {
+      const calls = [];
+      await assert.rejects(() => prepareTaskWorkspace({
+        selection: { kind: 'project', projectId: 'p1', projectName: 'POS', roots: ['C:\\repo', 'C:\\shared'] },
+        worktreeRoot: 'G:\\codex-worktrees', operationId: 'invalidroot1', fileSystem,
+        gitRunner: fakeGitRunner(calls),
+      }), /saved project root is unavailable/i);
+      assert.deepEqual(calls, []);
+    });
+  }
+});
+
+test('does not bypass Git isolation when executable, ownership, or repository probes fail', async (t) => {
+  const cases = [
+    ['missing executable', {
+      fileSystem: fakeFileSystem(),
+      git: { isRepo: false, versionError: Object.assign(new Error('spawn failed'), { code: 'GIT_START_FAILED' }) },
+    }],
+    ['ownership probe failure', {
+      fileSystem: fakeFileSystem({ gitRoots: ['C:\\repo'] }),
+      git: { probeError: Object.assign(new Error('dubious ownership C:\\private'), { code: 'GIT_FAILED' }) },
+    }],
+    ['filesystem access failure', {
+      fileSystem: fakeFileSystem({ inaccessibleMarkers: ['C:\\repo\\.git'] }),
+      git: { isRepo: false },
+    }],
+  ];
+  for (const [name, setup] of cases) {
+    await t.test(name, async () => {
+      const calls = [];
+      await assert.rejects(() => prepareTaskWorkspace({
+        selection: { kind: 'project', projectId: 'p1', projectName: 'POS', roots: ['C:\\repo'] },
+        worktreeRoot: 'G:\\codex-worktrees', operationId: 'probefail1',
+        fileSystem: setup.fileSystem,
+        gitRunner: fakeGitRunner(calls, setup.git),
+      }), (error) => {
+        assert.equal(error.message, 'Git workspace inspection failed');
+        assert.equal(error.message.includes('private'), false);
+        return true;
+      });
+      assert.equal(calls.some(({ args }) => args.includes('add')), false);
+    });
+  }
+});
+
+test('sanitizes failure to resolve both remote HEAD and current HEAD without creating a worktree', async () => {
+  const calls = [];
+  await assert.rejects(() => prepareTaskWorkspace({
+    selection: { kind: 'project', projectId: 'p1', projectName: 'POS', roots: ['C:\\repo'] },
+    worktreeRoot: 'G:\\codex-worktrees', operationId: 'headfail1',
+    fileSystem: fakeFileSystem({ gitRoots: ['C:\\repo'] }),
+    gitRunner: fakeGitRunner(calls, {
+      defaultRef: null,
+      headError: Object.assign(new Error('cannot read C:\\private\\HEAD'), { code: 'GIT_FAILED' }),
+    }),
+  }), (error) => {
+    assert.equal(error.message, 'Git workspace preparation failed');
+    assert.equal(error.message.includes('private'), false);
+    return true;
+  });
+  assert.equal(calls.some(({ args }) => args.includes('add')), false);
+});
+
+test('expands an absolute CODEX_HOME worktree root and fails closed on missing or relative values', async () => {
+  const previous = process.env.CODEX_HOME;
+  process.env.CODEX_HOME = 'G:\\CodexData\\.codex';
+  try {
+    const calls = [];
+    const prepared = await prepareTaskWorkspace({
+      selection: { kind: 'project', projectId: 'p1', projectName: 'POS', roots: ['C:\\repo'] },
+      worktreeRoot: '%CODEX_HOME%\\worktrees\\discord', operationId: 'expanded1',
+      fileSystem: fakeFileSystem({ gitRoots: ['C:\\repo'] }),
+      gitRunner: fakeGitRunner(calls),
+    });
+    assert.equal(prepared.worktreePath, 'G:\\CodexData\\.codex\\worktrees\\discord\\expanded1');
+
+    await assert.rejects(() => prepareTaskWorkspace({
+      selection: { kind: 'project', projectId: 'p1', projectName: 'POS', roots: ['C:\\repo'] },
+      worktreeRoot: 'relative\\worktrees', operationId: 'relative1',
+      fileSystem: fakeFileSystem({ gitRoots: ['C:\\repo'] }), gitRunner: fakeGitRunner([]),
+    }), /absolute worktree root/);
+
+    delete process.env.CODEX_HOME;
+    await assert.rejects(() => prepareTaskWorkspace({
+      selection: { kind: 'project', projectId: 'p1', projectName: 'POS', roots: ['C:\\repo'] },
+      worktreeRoot: '%CODEX_HOME%\\worktrees\\discord', operationId: 'missinghome1',
+      fileSystem: fakeFileSystem({ gitRoots: ['C:\\repo'] }), gitRunner: fakeGitRunner([]),
+    }), /worktree root could not be expanded/);
+  } finally {
+    if (previous === undefined) delete process.env.CODEX_HOME;
+    else process.env.CODEX_HOME = previous;
+  }
 });
 
 test('starts a durable thread before its first turn with exact workspace metadata', async () => {
@@ -384,6 +645,8 @@ test('persists each creation state before the corresponding external mutation an
     text: 'run once',
     codexPath: 'codex',
     processCwd: 'C:\\files',
+    fileSystem: fakeFileSystem(),
+    persistState: async () => {},
     gitRunner: fakeGitRunner(gitCalls, { isRepo: false }),
     clientFactory: () => {
       clients += 1;
@@ -408,13 +671,212 @@ test('persists each creation state before the corresponding external mutation an
   assert.equal(duplicate.threadId, 'thread-once');
   assert.equal(duplicate.duplicate, true);
   assert.equal(clients, 1);
-  assert.equal(gitCalls.length, 1);
+  assert.equal(gitCalls.length, 2);
+  assert.equal(gitCalls.some(({ args }) => args.includes('add')), false);
   await first.completion;
+});
+
+test('awaits durable creation transitions before each following Git or App Server mutation', async () => {
+  const events = [];
+  const snapshots = [];
+  const state = {};
+  const worktrees = [];
+  const baseFileSystem = fakeFileSystem({ gitRoots: ['C:\\repo'] });
+  const fileSystem = {
+    ...baseFileSystem,
+    async stat(target) {
+      events.push('fs:stat');
+      return baseFileSystem.stat(target);
+    },
+  };
+  const baseGit = fakeGitRunner([], { worktrees });
+  const gitRunner = async (request) => {
+    if (request.args.includes('add')) events.push('git:add');
+    return baseGit(request);
+  };
+  const persistState = async (current) => {
+    const snapshot = structuredClone(current);
+    snapshots.push(snapshot);
+    const record = snapshot.createdTasksByInteraction.durable1;
+    events.push(`persist:${record.status}${record.status === 'creating' && record.workspace ? '-planned' : ''}`);
+  };
+  const clientFactory = () => ({
+    async request(message) {
+      events.push(`app:${message.method}`);
+      if (message.method === 'thread/start') return { thread: { id: 'thread-durable', name: null } };
+      if (message.method === 'turn/start') return { turn: { id: 'turn-durable' } };
+      return {};
+    },
+    send(message) { events.push(`app:${message.method}`); },
+    waitForTurn: async (turnId) => ({ turn: { id: turnId } }),
+    close() {},
+  });
+
+  const result = await createNewTaskOnce({
+    state, interactionId: 'durable1',
+    selection: { kind: 'project', projectId: 'p1', projectName: 'POS', roots: ['C:\\repo'] },
+    worktreeRoot: 'G:\\codex-worktrees', text: 'durable', codexPath: 'codex', processCwd: 'C:\\repo',
+    fileSystem, gitRunner, persistState, clientFactory,
+  });
+  await result.completion;
+
+  const before = (left, right) => assert.ok(events.indexOf(left) < events.indexOf(right), `${left} must precede ${right}: ${events}`);
+  before('persist:creating', 'fs:stat');
+  before('persist:creating-planned', 'git:add');
+  before('persist:workspace-ready', 'app:initialize');
+  before('persist:thread-created', 'app:turn/start');
+  before('app:turn/start', 'persist:started');
+  assert.deepEqual(snapshots.map((snapshot) => {
+    const record = snapshot.createdTasksByInteraction.durable1;
+    return `${record.status}${record.status === 'creating' && record.workspace ? '-planned' : ''}`;
+  }), ['creating', 'creating-planned', 'workspace-ready', 'thread-created', 'started']);
+
+  for (const snapshot of snapshots) {
+    let externalCalls = 0;
+    const duplicate = await createNewTaskOnce({
+      state: structuredClone(snapshot), interactionId: 'durable1',
+      selection: { kind: 'project', projectId: 'p1', projectName: 'POS', roots: ['C:\\repo'] },
+      worktreeRoot: 'G:\\codex-worktrees', text: 'must not repeat',
+      fileSystem: { stat: async () => { externalCalls += 1; } },
+      gitRunner: async () => { externalCalls += 1; },
+      clientFactory: () => { externalCalls += 1; },
+      persistState: async () => { externalCalls += 1; },
+    });
+    assert.equal(duplicate.duplicate, true);
+    assert.equal(externalCalls, 0);
+  }
+});
+
+test('creation and recovery require an injected persistence boundary before external mutation', async (t) => {
+  await t.test('creation', async () => {
+    let mkdirCalls = 0;
+    await assert.rejects(() => createNewTaskOnce({
+      state: {}, interactionId: 'nopersist1',
+      selection: { kind: 'projectless', projectId: null, projectName: '无项目', roots: ['C:\\tasks'] },
+      worktreeRoot: 'G:\\unused', text: 'no persistence',
+      fileSystem: { mkdir: async () => { mkdirCalls += 1; } },
+      clientFactory: () => fakeAppServer([], {
+        'thread/start': { thread: { id: 'thread-no-persist' } },
+        'turn/start': { turn: { id: 'turn-no-persist' } },
+      }),
+    }), /persistence boundary is required/);
+    assert.equal(mkdirCalls, 0);
+  });
+
+  await t.test('recovery', async () => {
+    const calls = [];
+    const workspace = {
+      mode: 'worktree', cwd: 'G:\\codex-worktrees\\nopersist2',
+      runtimeWorkspaceRoots: ['G:\\codex-worktrees\\nopersist2'],
+      worktreePath: 'G:\\codex-worktrees\\nopersist2',
+      branchName: 'codex/discord-20260901-010203-abcdef',
+      sourceRoot: 'C:\\repo', repositoryRoot: 'C:\\repo', operationId: 'nopersist2',
+    };
+    await assert.rejects(() => recoverInterruptedTaskCreations({
+      state: { createdTasksByInteraction: { nopersist2: { status: 'workspace-ready', workspace } } },
+      worktreeRoot: 'G:\\codex-worktrees',
+      gitRunner: fakeGitRunner(calls, { worktrees: [{ path: workspace.worktreePath, branch: workspace.branchName }] }),
+    }), /persistence boundary is required/);
+    assert.deepEqual(calls, []);
+  });
+});
+
+test('persists an operation plan before worktree add and safely cleans an immediate partial add', async () => {
+  const events = [];
+  const calls = [];
+  const worktrees = [];
+  const persistence = capturingPersistence(events);
+  const baseGit = fakeGitRunner(calls, {
+    worktrees,
+    partialAddError: Object.assign(new Error('partial add C:\\private'), { code: 'GIT_FAILED' }),
+  });
+  const gitRunner = async (request) => {
+    if (request.args.includes('add')) events.push('git:add');
+    return baseGit(request);
+  };
+  const state = {};
+  await assert.rejects(() => createNewTaskOnce({
+    state, interactionId: 'partial1',
+    selection: { kind: 'project', projectId: 'p1', projectName: 'POS', roots: ['C:\\repo'] },
+    worktreeRoot: 'G:\\codex-worktrees', text: 'partial', codexPath: 'codex', processCwd: 'C:\\repo',
+    fileSystem: fakeFileSystem({ gitRoots: ['C:\\repo'] }), gitRunner,
+    persistState: persistence.persistState,
+  }), (error) => {
+    assert.equal(error.message.includes('private'), false);
+    return true;
+  });
+
+  const plannedIndex = persistence.snapshots.findIndex((snapshot) => snapshot.createdTasksByInteraction.partial1.workspace?.mode === 'worktree');
+  assert.notEqual(plannedIndex, -1);
+  assert.ok(events.indexOf('persist:creating-planned') < events.indexOf('git:add'));
+  assert.equal(persistence.snapshots.at(-1).createdTasksByInteraction.partial1.status, 'failed-before-thread');
+  assert.equal(calls.filter(({ args }) => args.includes('remove') || args.includes('-D')).length, 2);
+  assert.deepEqual(worktrees, []);
+});
+
+test('a restart during worktree add reloads the durable plan, prevents duplication, and recovers it', async () => {
+  const calls = [];
+  const worktrees = [];
+  const persistence = capturingPersistence();
+  let signalAdd;
+  const addStarted = new Promise((resolve) => { signalAdd = resolve; });
+  let rejectAdd;
+  const addGate = new Promise((_resolve, reject) => { rejectAdd = reject; });
+  const baseGit = fakeGitRunner(calls, { worktrees });
+  const gitRunner = async (request) => {
+    const result = await baseGit(request);
+    if (request.args.includes('add')) {
+      signalAdd();
+      return addGate;
+    }
+    return result;
+  };
+  const liveState = {};
+  const creation = createNewTaskOnce({
+    state: liveState, interactionId: 'crashadd1',
+    selection: { kind: 'project', projectId: 'p1', projectName: 'POS', roots: ['C:\\repo'] },
+    worktreeRoot: 'G:\\codex-worktrees', text: 'crash', codexPath: 'codex', processCwd: 'C:\\repo',
+    fileSystem: fakeFileSystem({ gitRoots: ['C:\\repo'] }), gitRunner,
+    persistState: persistence.persistState,
+  });
+  await addStarted;
+  const durableState = structuredClone(persistence.snapshots.at(-1));
+  assert.equal(durableState.createdTasksByInteraction.crashadd1.status, 'creating');
+  assert.equal(durableState.createdTasksByInteraction.crashadd1.workspace.operationId, 'crashadd1');
+
+  let duplicateCalls = 0;
+  const duplicate = await createNewTaskOnce({
+    state: structuredClone(durableState), interactionId: 'crashadd1',
+    fileSystem: { stat: async () => { duplicateCalls += 1; } },
+    gitRunner: async () => { duplicateCalls += 1; },
+    clientFactory: () => { duplicateCalls += 1; },
+    persistState: async () => { duplicateCalls += 1; },
+  });
+  assert.equal(duplicate.duplicate, true);
+  assert.equal(duplicateCalls, 0);
+
+  const recoveryPersistence = capturingPersistence();
+  const recoveryCalls = [];
+  const recovered = await recoverInterruptedTaskCreations({
+    state: durableState, worktreeRoot: 'G:\\codex-worktrees',
+    gitRunner: fakeGitRunner(recoveryCalls, { worktrees }),
+    persistState: recoveryPersistence.persistState,
+    nowMs: 1_788_230_400_000,
+  });
+  assert.equal(recovered[0].cleaned, true);
+  assert.deepEqual(recoveryPersistence.snapshots.map((snapshot) => snapshot.createdTasksByInteraction.crashadd1.status), [
+    'recovering', 'recovered-failed',
+  ]);
+  assert.equal(recoveryCalls.filter(({ args }) => args.includes('remove') || args.includes('-D')).length, 2);
+
+  rejectAdd(Object.assign(new Error('process interrupted'), { code: 'GIT_FAILED' }));
+  await assert.rejects(() => creation, /Git workspace preparation failed/);
 });
 
 test('cleans only its generated worktree and branch when thread creation fails', async () => {
   const state = {};
   const gitCalls = [];
+  const persistence = capturingPersistence();
   await assert.rejects(() => createNewTaskOnce({
     state,
     interactionId: 'cleanup1',
@@ -422,6 +884,8 @@ test('cleans only its generated worktree and branch when thread creation fails',
     worktreeRoot: 'G:\\codex-worktrees',
     text: 'will fail', codexPath: 'codex', processCwd: 'C:\\repo',
     now: new Date('2026-09-01T01:02:03Z'),
+    fileSystem: fakeFileSystem({ gitRoots: ['C:\\repo'] }),
+    persistState: persistence.persistState,
     gitRunner: fakeGitRunner(gitCalls),
     clientFactory: () => fakeAppServer([], { 'thread/start': new Error('thread failed') }),
   }), /thread failed/);
@@ -434,17 +898,21 @@ test('cleans only its generated worktree and branch when thread creation fails',
   assert.deepEqual(destructive[0].args.slice(2), ['worktree', 'remove', '--force', 'G:\\codex-worktrees\\cleanup1']);
   assert.equal(destructive[1].args.at(-2), '-D');
   assert.match(destructive[1].args.at(-1), /^codex\/discord-/);
+  assert.equal(persistence.snapshots.at(-1).createdTasksByInteraction.cleanup1.status, 'failed-before-thread');
 });
 
 test('preserves the durable thread and worktree when the first turn fails', async () => {
   const state = {};
   const gitCalls = [];
+  const persistence = capturingPersistence();
   const result = await createNewTaskOnce({
     state,
     interactionId: 'turnfail1',
     selection: { kind: 'project', projectId: 'p1', projectName: 'POS', roots: ['C:\\repo'] },
     worktreeRoot: 'G:\\codex-worktrees',
     text: 'first turn fails', codexPath: 'codex', processCwd: 'C:\\repo',
+    fileSystem: fakeFileSystem({ gitRoots: ['C:\\repo'] }),
+    persistState: persistence.persistState,
     gitRunner: fakeGitRunner(gitCalls),
     clientFactory: () => fakeAppServer([], {
       'thread/start': { thread: { id: 'thread-retained', name: null } },
@@ -456,6 +924,7 @@ test('preserves the durable thread and worktree when the first turn fails', asyn
   assert.equal(result.threadId, 'thread-retained');
   assert.equal(state.createdTasksByInteraction.turnfail1.threadId, 'thread-retained');
   assert.equal(gitCalls.some(({ args }) => args.includes('remove') || args.includes('-D')), false);
+  assert.equal(persistence.snapshots.at(-1).createdTasksByInteraction.turnfail1.status, 'first-turn-failed');
 });
 
 test('successful creation disables pre-thread cleanup so its worktree is retained', async () => {
@@ -467,6 +936,8 @@ test('successful creation disables pre-thread cleanup so its worktree is retaine
     selection: { kind: 'project', projectId: 'p1', projectName: 'POS', roots: ['C:\\repo'] },
     worktreeRoot: 'G:\\codex-worktrees',
     text: 'retain', codexPath: 'codex', processCwd: 'C:\\repo',
+    fileSystem: fakeFileSystem({ gitRoots: ['C:\\repo'] }),
+    persistState: async () => {},
     gitRunner: fakeGitRunner(gitCalls),
     clientFactory: () => fakeAppServer([], {
       'thread/start': { thread: { id: 'thread-retain', name: null } },
@@ -480,6 +951,7 @@ test('successful creation disables pre-thread cleanup so its worktree is retaine
 
 test('startup recovery cleans only descendant, prefixed, operation-owned records without a thread', async () => {
   const gitCalls = [];
+  const persistence = capturingPersistence();
   const validWorkspace = {
     mode: 'worktree',
     cwd: 'G:\\codex-worktrees\\valid1',
@@ -487,6 +959,7 @@ test('startup recovery cleans only descendant, prefixed, operation-owned records
     worktreePath: 'G:\\codex-worktrees\\valid1',
     branchName: 'codex/discord-20260901-010203-abcdef',
     sourceRoot: 'C:\\repo',
+    repositoryRoot: 'C:\\repo',
     operationId: 'valid1',
   };
   const state = {
@@ -502,7 +975,11 @@ test('startup recovery cleans only descendant, prefixed, operation-owned records
   const recovered = await recoverInterruptedTaskCreations({
     state,
     worktreeRoot: 'G:\\codex-worktrees',
-    gitRunner: fakeGitRunner(gitCalls),
+    gitRunner: fakeGitRunner(gitCalls, { worktrees: [{
+      path: 'G:\\codex-worktrees\\valid1',
+      branch: 'codex/discord-20260901-010203-abcdef',
+    }] }),
+    persistState: persistence.persistState,
     nowMs: 1_788_230_400_000,
   });
   assert.equal(recovered.find(({ interactionId }) => interactionId === 'valid1').cleaned, true);
@@ -511,6 +988,7 @@ test('startup recovery cleans only descendant, prefixed, operation-owned records
   assert.equal(state.createdTasksByInteraction.outside1.status, 'recovered-failed');
   assert.equal(state.createdTasksByInteraction.durable1.status, 'workspace-ready');
   assert.equal(recovered.some(({ interactionId }) => interactionId === 'durable1'), false);
+  assert.equal(persistence.snapshots.at(-1).createdTasksByInteraction.valid1.status, 'recovered-failed');
 });
 
 test('startup recovery marks mutation-free creating records as recovered and never invents cleanup targets', async () => {
@@ -520,8 +998,78 @@ test('startup recovery marks mutation-free creating records as recovered and nev
     state,
     worktreeRoot: 'G:\\codex-worktrees',
     gitRunner: fakeGitRunner(calls),
+    persistState: async () => {},
     nowMs: 1_788_230_400_000,
   });
   assert.deepEqual(result, [{ interactionId: 'creating1', cleaned: false, status: 'recovered-failed' }]);
   assert.deepEqual(calls, []);
+});
+
+test('recovery makes zero destructive calls when live Git metadata crosses repository, path, or branch', async (t) => {
+  const workspace = {
+    mode: 'worktree',
+    cwd: 'G:\\codex-worktrees\\cross1',
+    runtimeWorkspaceRoots: ['G:\\codex-worktrees\\cross1'],
+    worktreePath: 'G:\\codex-worktrees\\cross1',
+    branchName: 'codex/discord-20260901-010203-abcdef',
+    sourceRoot: 'C:\\repo',
+    repositoryRoot: 'C:\\repo',
+    operationId: 'cross1',
+  };
+  const cases = [
+    ['repository mismatch', {
+      repositoryRoot: 'C:\\other',
+      worktrees: [{ path: workspace.worktreePath, branch: workspace.branchName }],
+    }],
+    ['path mismatch', {
+      repositoryRoot: 'C:\\repo',
+      worktrees: [{ path: 'G:\\codex-worktrees\\someone-else', branch: workspace.branchName }],
+    }],
+    ['branch mismatch', {
+      repositoryRoot: 'C:\\repo',
+      worktrees: [{ path: workspace.worktreePath, branch: 'codex/discord-20260901-010203-fedcba' }],
+    }],
+  ];
+  for (const [name, git] of cases) {
+    await t.test(name, async () => {
+      const calls = [];
+      const state = { createdTasksByInteraction: { cross1: { status: 'workspace-ready', workspace } } };
+      const result = await recoverInterruptedTaskCreations({
+        state, worktreeRoot: 'G:\\codex-worktrees',
+        gitRunner: fakeGitRunner(calls, git), persistState: async () => {},
+      });
+      assert.equal(result[0].cleaned, false);
+      assert.equal(calls.some(({ args }) => args.includes('remove') || args.includes('-D')), false);
+    });
+  }
+});
+
+test('recovery persistence is awaited before any destructive inspection or mutation', async () => {
+  const calls = [];
+  const workspace = {
+    mode: 'worktree', cwd: 'G:\\codex-worktrees\\awaitrecovery1',
+    runtimeWorkspaceRoots: ['G:\\codex-worktrees\\awaitrecovery1'],
+    worktreePath: 'G:\\codex-worktrees\\awaitrecovery1',
+    branchName: 'codex/discord-20260901-010203-abcdef',
+    sourceRoot: 'C:\\repo', repositoryRoot: 'C:\\repo', operationId: 'awaitrecovery1',
+  };
+  const state = { createdTasksByInteraction: { awaitrecovery1: { status: 'workspace-ready', workspace } } };
+  let releasePersist;
+  const persistGate = new Promise((resolve) => { releasePersist = resolve; });
+  let persistenceCalls = 0;
+  const recovery = recoverInterruptedTaskCreations({
+    state, worktreeRoot: 'G:\\codex-worktrees',
+    gitRunner: fakeGitRunner(calls, { worktrees: [{ path: workspace.worktreePath, branch: workspace.branchName }] }),
+    persistState: async () => {
+      persistenceCalls += 1;
+      if (persistenceCalls === 1) await persistGate;
+    },
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(state.createdTasksByInteraction.awaitrecovery1.status, 'recovering');
+  assert.deepEqual(calls, []);
+  releasePersist();
+  await recovery;
+  assert.equal(persistenceCalls, 2);
+  assert.equal(calls.filter(({ args }) => args.includes('remove') || args.includes('-D')).length, 2);
 });

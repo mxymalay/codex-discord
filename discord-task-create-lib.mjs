@@ -24,21 +24,45 @@ function closeClient(client) {
 export async function listCodexProjects({ codexPath, processCwd, clientFactory } = {}) {
   const client = createClient({ clientFactory, codexPath, processCwd });
   try {
-    await initializeAppServerClient(client);
-    const projects = [];
-    let cursor = null;
-    let requestId = 2;
-    do {
-      const page = await client.request({
-        method: 'project/list',
-        id: requestId,
-        params: { cursor, limit: 100 },
-      });
-      requestId += 1;
-      if (Array.isArray(page?.data)) projects.push(...page.data);
-      cursor = page?.nextCursor ?? null;
-    } while (cursor !== null);
-    return projects;
+    try {
+      await initializeAppServerClient(client);
+      const projects = [];
+      const seenCursors = new Set();
+      let cursor = null;
+      let requestId = 2;
+      do {
+        const page = await client.request({
+          method: 'project/list',
+          id: requestId,
+          params: { cursor, limit: 100 },
+        });
+        requestId += 1;
+        const validPage = page && typeof page === 'object'
+          && Array.isArray(page.data)
+          && (page.nextCursor === null || typeof page.nextCursor === 'string');
+        if (!validPage) {
+          const error = new Error('Codex project catalog response invalid');
+          error.code = 'PROJECT_LIST_INVALID';
+          throw error;
+        }
+        projects.push(...page.data);
+        cursor = page.nextCursor;
+        if (cursor !== null) {
+          if (!cursor || seenCursors.has(cursor)) {
+            const error = new Error('Codex project catalog response invalid');
+            error.code = 'PROJECT_LIST_INVALID';
+            throw error;
+          }
+          seenCursors.add(cursor);
+        }
+      } while (cursor !== null);
+      return projects;
+    } catch (error) {
+      if (error?.code === 'PROJECT_LIST_INVALID') throw error;
+      const sanitized = new Error('Codex project catalog request failed');
+      sanitized.code = 'PROJECT_LIST_FAILED';
+      throw sanitized;
+    }
   } finally {
     closeClient(client);
   }
@@ -69,7 +93,6 @@ export function createProjectCatalog({ loader, ttlMs = 60_000, now = Date.now } 
         errorCategory = null;
         return projects.slice();
       } catch (error) {
-        warmed = true;
         errorCategory = 'project-refresh-failed';
         const sanitized = new Error('Codex project catalog refresh failed');
         sanitized.code = 'PROJECT_REFRESH_FAILED';
@@ -192,36 +215,144 @@ function resolvedDescendant(root, candidate) {
   return relative !== '' && !relative.startsWith('..') && !path.isAbsolute(relative);
 }
 
-async function cleanupOwnedWorkspace({ workspace, worktreeRoot, operationId, gitRunner }) {
-  if (!workspace || workspace.mode !== 'worktree') return false;
-  const expectedPath = path.resolve(worktreeRoot, operationId);
-  const actualPath = path.resolve(String(workspace.worktreePath ?? ''));
-  const ownsPath = workspace.operationId === operationId
-    && actualPath === expectedPath
-    && resolvedDescendant(worktreeRoot, actualPath);
-  const ownsBranch = workspace.operationId === operationId
-    && typeof workspace.branchName === 'string'
-    && workspace.branchName.startsWith('codex/discord-');
-  const sourceRoot = typeof workspace.sourceRoot === 'string' && workspace.sourceRoot.trim()
-    ? workspace.sourceRoot
-    : null;
-  if (!ownsPath || !ownsBranch || !sourceRoot) return false;
+function expandWorktreeRoot(worktreeRoot) {
+  const configured = String(worktreeRoot ?? '').trim();
+  if (!configured) throw new Error('Configured worktree root is required');
+  const codexHome = String(process.env.CODEX_HOME ?? '').trim();
+  if (/%CODEX_HOME%/i.test(configured) && !codexHome) {
+    throw new Error('Configured worktree root could not be expanded');
+  }
+  const expanded = configured.replace(/%CODEX_HOME%/gi, () => codexHome);
+  if (/%[^%]+%/.test(expanded)) throw new Error('Configured worktree root could not be expanded');
+  const normalized = path.win32.normalize(expanded);
+  if (!path.win32.isAbsolute(normalized)) throw new Error('Configured worktree root must be an absolute worktree root');
+  return normalized;
+}
 
-  let firstError = null;
+async function validateSavedProjectRoots(roots, fileSystem) {
+  for (const root of roots) {
+    try {
+      const info = await fileSystem.stat(root);
+      if (!info.isDirectory()) throw new Error('not a directory');
+    } catch {
+      const error = new Error('Saved project root is unavailable');
+      error.code = 'PROJECT_ROOT_UNAVAILABLE';
+      throw error;
+    }
+  }
+}
+
+async function hasGitMarker(root, fileSystem) {
+  let current = path.resolve(root);
+  for (;;) {
+    try {
+      await fileSystem.lstat(path.join(current, '.git'));
+      return true;
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
+    const parent = path.dirname(current);
+    if (parent === current) return false;
+    current = parent;
+  }
+}
+
+function sanitizedGitInspectionError() {
+  const error = new Error('Git workspace inspection failed');
+  error.code = 'GIT_INSPECTION_FAILED';
+  return error;
+}
+
+async function inspectSavedProjectGit({ sourceRoot, gitRunner, fileSystem }) {
   try {
-    await gitRunner({
-      command: 'git',
-      args: ['-C', sourceRoot, 'worktree', 'remove', '--force', actualPath],
+    await gitRunner({ command: 'git', args: ['--version'] });
+  } catch {
+    throw sanitizedGitInspectionError();
+  }
+
+  let markerPresent;
+  try {
+    markerPresent = await hasGitMarker(sourceRoot, fileSystem);
+  } catch {
+    throw sanitizedGitInspectionError();
+  }
+
+  try {
+    const result = await gitRunner({ command: 'git', args: ['-C', sourceRoot, 'rev-parse', '--show-toplevel'] });
+    const repositoryRoot = String(result?.stdout ?? '').trim();
+    if (!repositoryRoot || !path.win32.isAbsolute(repositoryRoot)) throw new Error('invalid repository root');
+    return { isRepo: true, repositoryRoot: path.win32.normalize(repositoryRoot) };
+  } catch {
+    if (!markerPresent) return { isRepo: false, repositoryRoot: null };
+    throw sanitizedGitInspectionError();
+  }
+}
+
+function parseWorktreePorcelain(output) {
+  const records = [];
+  let current = null;
+  for (const field of String(output ?? '').split('\0')) {
+    if (!field) continue;
+    if (field.startsWith('worktree ')) {
+      if (current) records.push(current);
+      current = { path: field.slice('worktree '.length), branch: null };
+    } else if (current && field.startsWith('branch ')) {
+      current.branch = field.slice('branch '.length);
+    }
+  }
+  if (current) records.push(current);
+  return records;
+}
+
+async function proveOwnedWorkspace({ workspace, worktreeRoot, operationId, gitRunner }) {
+  if (!workspace || workspace.mode !== 'worktree') return false;
+  let configuredRoot;
+  try {
+    configuredRoot = expandWorktreeRoot(worktreeRoot);
+  } catch {
+    return false;
+  }
+  const expectedPath = path.resolve(configuredRoot, operationId);
+  const actualPath = path.resolve(String(workspace.worktreePath ?? ''));
+  const repositoryRoot = String(workspace.repositoryRoot ?? '').trim();
+  const sourceRoot = String(workspace.sourceRoot ?? '').trim();
+  const branchName = String(workspace.branchName ?? '');
+  const structurallyOwned = workspace.operationId === operationId
+    && actualPath === expectedPath
+    && resolvedDescendant(configuredRoot, actualPath)
+    && path.win32.isAbsolute(repositoryRoot)
+    && path.win32.isAbsolute(sourceRoot)
+    && branchName.startsWith('codex/discord-');
+  if (!structurallyOwned) return false;
+
+  try {
+    const sourceProbe = await gitRunner({
+      command: 'git', args: ['-C', sourceRoot, 'rev-parse', '--show-toplevel'],
     });
-  } catch (error) {
-    firstError = error;
+    if (path.resolve(String(sourceProbe?.stdout ?? '').trim()) !== path.resolve(repositoryRoot)) return false;
+    const metadata = await gitRunner({
+      command: 'git', args: ['-C', repositoryRoot, 'worktree', 'list', '--porcelain', '-z'],
+    });
+    return parseWorktreePorcelain(metadata?.stdout).some((item) => (
+      path.resolve(item.path) === actualPath
+      && item.branch === `refs/heads/${branchName}`
+    ));
+  } catch {
+    return false;
   }
-  try {
-    await gitRunner({ command: 'git', args: ['-C', sourceRoot, 'branch', '-D', workspace.branchName] });
-  } catch (error) {
-    firstError ??= error;
-  }
-  if (firstError) throw firstError;
+}
+
+async function cleanupOwnedWorkspace({ workspace, worktreeRoot, operationId, gitRunner }) {
+  if (!await proveOwnedWorkspace({ workspace, worktreeRoot, operationId, gitRunner })) return false;
+  const actualPath = path.resolve(workspace.worktreePath);
+  await gitRunner({
+    command: 'git',
+    args: ['-C', workspace.repositoryRoot, 'worktree', 'remove', '--force', actualPath],
+  });
+  await gitRunner({
+    command: 'git',
+    args: ['-C', workspace.repositoryRoot, 'branch', '-D', workspace.branchName],
+  });
   return true;
 }
 
@@ -234,40 +365,44 @@ export async function prepareTaskWorkspace({
   worktreeRoot,
   operationId,
   gitRunner = runGitWithSpawn,
+  fileSystem = fs,
   now = new Date(),
+  onWorkspacePlanned = async () => {},
 } = {}) {
   if (!/^[A-Za-z0-9_-]+$/.test(String(operationId ?? ''))) throw new Error('Invalid operation ID');
   const roots = Array.isArray(selection?.roots) ? selection.roots.filter((root) => typeof root === 'string' && root.trim()) : [];
   if (roots.length === 0) throw new Error('Task selection has no valid roots');
 
   if (selection.kind === 'projectless') {
-    await fs.mkdir(roots[0], { recursive: true });
-    return {
+    const workspace = {
       mode: 'projectless',
       cwd: roots[0],
       runtimeWorkspaceRoots: [roots[0]],
       branchName: null,
       worktreePath: null,
       operationId,
-      cleanupBeforeThreadStart: noOpCleanup,
     };
+    await onWorkspacePlanned(workspace);
+    await fileSystem.mkdir(roots[0], { recursive: true });
+    return { ...workspace, cleanupBeforeThreadStart: noOpCleanup };
   }
 
-  if (!String(worktreeRoot ?? '').trim()) throw new Error('Configured worktree root is required');
+  const configuredWorktreeRoot = expandWorktreeRoot(worktreeRoot);
+  await validateSavedProjectRoots(roots, fileSystem);
 
   const sourceRoot = roots[0];
-  try {
-    await gitRunner({ command: 'git', args: ['-C', sourceRoot, 'rev-parse', '--show-toplevel'] });
-  } catch {
-    return {
+  const git = await inspectSavedProjectGit({ sourceRoot, gitRunner, fileSystem });
+  if (!git.isRepo) {
+    const workspace = {
       mode: 'local',
       cwd: sourceRoot,
       runtimeWorkspaceRoots: roots.slice(),
       branchName: null,
       worktreePath: null,
       operationId,
-      cleanupBeforeThreadStart: noOpCleanup,
     };
+    await onWorkspacePlanned(workspace);
+    return { ...workspace, cleanupBeforeThreadStart: noOpCleanup };
   }
 
   let baseRef;
@@ -279,18 +414,20 @@ export async function prepareTaskWorkspace({
     baseRef = String(result?.stdout ?? '').trim();
     if (!baseRef) throw new Error('Remote HEAD is empty');
   } catch {
-    const result = await gitRunner({ command: 'git', args: ['-C', sourceRoot, 'rev-parse', 'HEAD'] });
-    baseRef = String(result?.stdout ?? '').trim();
-    if (!baseRef) throw new Error('Current Git HEAD is empty');
+    try {
+      const result = await gitRunner({ command: 'git', args: ['-C', sourceRoot, 'rev-parse', 'HEAD'] });
+      baseRef = String(result?.stdout ?? '').trim();
+      if (!baseRef) throw new Error('Current Git HEAD is empty');
+    } catch {
+      const error = new Error('Git workspace preparation failed');
+      error.code = 'GIT_WORKSPACE_PREP_FAILED';
+      throw error;
+    }
   }
 
   const branchName = `codex/discord-${formatBranchTimestamp(now)}-${randomBytes(3).toString('hex')}`;
-  const worktreePath = path.resolve(worktreeRoot, operationId);
-  if (!resolvedDescendant(worktreeRoot, worktreePath)) throw new Error('Unsafe worktree path');
-  await gitRunner({
-    command: 'git',
-    args: ['-C', sourceRoot, 'worktree', 'add', '-b', branchName, worktreePath, baseRef],
-  });
+  const worktreePath = path.resolve(configuredWorktreeRoot, operationId);
+  if (!resolvedDescendant(configuredWorktreeRoot, worktreePath)) throw new Error('Unsafe worktree path');
   const workspace = {
     mode: 'worktree',
     cwd: worktreePath,
@@ -298,11 +435,29 @@ export async function prepareTaskWorkspace({
     branchName,
     worktreePath,
     sourceRoot,
+    repositoryRoot: git.repositoryRoot,
     operationId,
   };
+  await onWorkspacePlanned(workspace);
+  try {
+    await gitRunner({
+      command: 'git',
+      args: ['-C', sourceRoot, 'worktree', 'add', '-b', branchName, worktreePath, baseRef],
+    });
+  } catch {
+    await cleanupOwnedWorkspace({
+      workspace,
+      worktreeRoot: configuredWorktreeRoot,
+      operationId,
+      gitRunner,
+    }).catch(() => false);
+    const error = new Error('Git workspace preparation failed');
+    error.code = 'GIT_WORKSPACE_PREP_FAILED';
+    throw error;
+  }
   workspace.cleanupBeforeThreadStart = () => cleanupOwnedWorkspace({
     workspace,
-    worktreeRoot,
+    worktreeRoot: configuredWorktreeRoot,
     operationId,
     gitRunner,
   });
@@ -313,6 +468,22 @@ function taskCreationErrorCategory(error) {
   if (error?.code === 'PROJECT_REFRESH_FAILED') return 'project-refresh-failed';
   if (String(error?.code ?? '').startsWith('GIT_')) return 'git-failed';
   return 'task-create-failed';
+}
+
+function persistenceError() {
+  const error = new Error('Task creation state persistence failed');
+  error.code = 'STATE_PERSIST_FAILED';
+  error.persistenceFailure = true;
+  return error;
+}
+
+async function persistInteractionRecord({ state, interactionId, record, persistState }) {
+  state.createdTasksByInteraction[interactionId] = record;
+  try {
+    await persistState(state);
+  } catch {
+    throw persistenceError();
+  }
 }
 
 export async function startNewCodexTask({
@@ -392,10 +563,13 @@ export async function createNewTaskOnce({
   processCwd,
   clientFactory,
   gitRunner = runGitWithSpawn,
+  fileSystem = fs,
+  persistState,
   now = new Date(),
 } = {}) {
   if (!state || typeof state !== 'object') throw new TypeError('Task creation state is required');
   if (!interactionId) throw new Error('Interaction ID is required');
+  if (typeof persistState !== 'function') throw new TypeError('Task persistence boundary is required');
   state.createdTasksByInteraction ??= {};
   const recorded = state.createdTasksByInteraction[interactionId];
   if (recorded) {
@@ -411,12 +585,32 @@ export async function createNewTaskOnce({
   }
 
   const operation = (async () => {
-    state.createdTasksByInteraction[interactionId] = { status: 'creating' };
     let prepared = null;
     try {
-      prepared = await prepareTaskWorkspace({ selection, worktreeRoot, operationId: interactionId, gitRunner, now });
+      await persistInteractionRecord({
+        state, interactionId, record: { status: 'creating' }, persistState,
+      });
+      prepared = await prepareTaskWorkspace({
+        selection,
+        worktreeRoot,
+        operationId: interactionId,
+        gitRunner,
+        fileSystem,
+        now,
+        onWorkspacePlanned: async (workspace) => persistInteractionRecord({
+          state,
+          interactionId,
+          record: { status: 'creating', workspace: persistableWorkspace(workspace) },
+          persistState,
+        }),
+      });
       const persistentWorkspace = persistableWorkspace(prepared);
-      state.createdTasksByInteraction[interactionId] = { status: 'workspace-ready', workspace: persistentWorkspace };
+      await persistInteractionRecord({
+        state,
+        interactionId,
+        record: { status: 'workspace-ready', workspace: persistentWorkspace },
+        persistState,
+      });
       const started = await startNewCodexTask({
         selection,
         workspace: prepared,
@@ -426,12 +620,17 @@ export async function createNewTaskOnce({
         processCwd,
         clientFactory,
         onThreadCreated: async ({ threadId, taskName }) => {
-          state.createdTasksByInteraction[interactionId] = {
-            status: 'thread-created',
-            threadId,
-            taskName,
-            workspace: persistentWorkspace,
-          };
+          await persistInteractionRecord({
+            state,
+            interactionId,
+            record: {
+              status: 'thread-created',
+              threadId,
+              taskName,
+              workspace: persistentWorkspace,
+            },
+            persistState,
+          });
         },
       });
       const retainedWorkspace = { ...started.workspace, cleanupBeforeThreadStart: noOpCleanup };
@@ -442,10 +641,16 @@ export async function createNewTaskOnce({
         taskName: started.taskName,
         workspace: persistentWorkspace,
       };
-      state.createdTasksByInteraction[interactionId] = record;
+      await persistInteractionRecord({ state, interactionId, record, persistState });
       return { ...record, completion: started.completion, workspace: retainedWorkspace };
     } catch (error) {
       const current = state.createdTasksByInteraction[interactionId];
+      if (error?.persistenceFailure) {
+        if (!current?.threadId && prepared?.cleanupBeforeThreadStart) {
+          await prepared.cleanupBeforeThreadStart().catch(() => false);
+        }
+        throw error;
+      }
       if (error?.threadId || current?.threadId) {
         const record = {
           status: 'first-turn-failed',
@@ -454,7 +659,7 @@ export async function createNewTaskOnce({
           workspace: persistableWorkspace(error?.workspace ?? prepared ?? current.workspace),
           errorCategory: taskCreationErrorCategory(error),
         };
-        state.createdTasksByInteraction[interactionId] = record;
+        await persistInteractionRecord({ state, interactionId, record, persistState });
         return record;
       }
       let cleanupCategory = null;
@@ -465,11 +670,16 @@ export async function createNewTaskOnce({
           cleanupCategory = 'git-cleanup-failed';
         }
       }
-      state.createdTasksByInteraction[interactionId] = {
-        status: 'failed-before-thread',
-        workspace: persistableWorkspace(prepared),
-        errorCategory: cleanupCategory ?? taskCreationErrorCategory(error),
-      };
+      await persistInteractionRecord({
+        state,
+        interactionId,
+        record: {
+          status: 'failed-before-thread',
+          workspace: persistableWorkspace(prepared ?? current?.workspace),
+          errorCategory: cleanupCategory ?? taskCreationErrorCategory(error),
+        },
+        persistState,
+      });
       throw error;
     }
   })();
@@ -486,12 +696,21 @@ export async function recoverInterruptedTaskCreations({
   state,
   worktreeRoot,
   gitRunner = runGitWithSpawn,
+  persistState,
   nowMs = Date.now(),
 } = {}) {
+  if (!state || typeof state !== 'object') throw new TypeError('Task creation state is required');
+  if (typeof persistState !== 'function') throw new TypeError('Task persistence boundary is required');
   state.createdTasksByInteraction ??= {};
   const results = [];
   for (const [interactionId, record] of Object.entries(state.createdTasksByInteraction)) {
-    if (!['creating', 'workspace-ready'].includes(record?.status) || record?.threadId) continue;
+    if (!['creating', 'workspace-ready', 'recovering'].includes(record?.status) || record?.threadId) continue;
+    await persistInteractionRecord({
+      state,
+      interactionId,
+      record: { ...record, status: 'recovering', recoveryStartedAt: new Date(nowMs).toISOString() },
+      persistState,
+    });
     let cleaned = false;
     let errorCategory = null;
     if (record.workspace) {
@@ -506,12 +725,17 @@ export async function recoverInterruptedTaskCreations({
         errorCategory = 'git-cleanup-failed';
       }
     }
-    state.createdTasksByInteraction[interactionId] = {
-      ...record,
-      status: 'recovered-failed',
-      recoveredAt: new Date(nowMs).toISOString(),
-      ...(errorCategory ? { errorCategory } : {}),
-    };
+    await persistInteractionRecord({
+      state,
+      interactionId,
+      record: {
+        ...record,
+        status: 'recovered-failed',
+        recoveredAt: new Date(nowMs).toISOString(),
+        ...(errorCategory ? { errorCategory } : {}),
+      },
+      persistState,
+    });
     results.push({ interactionId, cleaned, status: 'recovered-failed', ...(errorCategory ? { errorCategory } : {}) });
   }
   return results;
