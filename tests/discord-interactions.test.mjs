@@ -396,6 +396,130 @@ test('callback 429 retry never exceeds the acknowledgement deadline and failures
   assert.equal(calls, 1);
 });
 
+test('callback retry budget includes slow retry_after response parsing', async () => {
+  let clock = 0;
+  let calls = 0;
+  const sleeps = [];
+  const client = createInteractionRestClient({
+    applicationId: '111',
+    now: () => clock,
+    callbackRetry: { maxElapsedMs: 2_800 },
+    sleepImpl: async (milliseconds) => { sleeps.push(milliseconds); clock += milliseconds; },
+    fetchImpl: async () => {
+      calls += 1;
+      return {
+        ok: false,
+        status: 429,
+        headers: new Headers(),
+        async json() {
+          clock = 2_400;
+          return { retry_after: 0.5 };
+        },
+      };
+    },
+  });
+
+  await assert.rejects(
+    () => client.callback({ id: '1', token: 'parse-secret' }, { type: 5, data: {} }),
+    /Discord interaction request failed: 429/,
+  );
+  assert.equal(calls, 1);
+  assert.deepEqual(sleeps, []);
+});
+
+test('callback rechecks elapsed time after an oversleep before sending a retry', async () => {
+  let clock = 0;
+  let calls = 0;
+  const sleeps = [];
+  const client = createInteractionRestClient({
+    applicationId: '111',
+    now: () => clock,
+    callbackRetry: { maxElapsedMs: 500 },
+    sleepImpl: async (milliseconds) => { sleeps.push(milliseconds); clock = 600; },
+    fetchImpl: async () => {
+      calls += 1;
+      return new Response(JSON.stringify({ retry_after: 0.25 }), {
+        status: 429,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    },
+  });
+
+  await assert.rejects(
+    () => client.callback({ id: '1', token: 'sleep-secret' }, { type: 5, data: {} }),
+    /Discord interaction request failed: 429/,
+  );
+  assert.equal(calls, 1);
+  assert.deepEqual(sleeps, [250]);
+});
+
+test('an explicit zero elapsed budget sends the initial request but disables every retry', async () => {
+  let calls = 0;
+  const sleeps = [];
+  const client = createInteractionRestClient({
+    applicationId: '111',
+    callbackRetry: { maxElapsedMs: 0 },
+    sleepImpl: async (milliseconds) => { sleeps.push(milliseconds); },
+    fetchImpl: async () => {
+      calls += 1;
+      return new Response(JSON.stringify({ retry_after: 0 }), {
+        status: 429,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    },
+  });
+
+  await assert.rejects(
+    () => client.callback({ id: '1', token: 'zero-secret' }, { type: 5, data: {} }),
+    /Discord interaction request failed: 429/,
+  );
+  assert.equal(calls, 1);
+  assert.deepEqual(sleeps, []);
+});
+
+test('a hanging abort-aware fetch is bounded, clears its timer, and reports only timeout', async () => {
+  const activeTimers = new Set();
+  let clearCalls = 0;
+  const setTimeoutImpl = (callback, milliseconds) => {
+    const timer = setTimeout(() => {
+      activeTimers.delete(timer);
+      callback();
+    }, milliseconds);
+    activeTimers.add(timer);
+    return timer;
+  };
+  const clearTimeoutImpl = (timer) => {
+    clearCalls += 1;
+    activeTimers.delete(timer);
+    clearTimeout(timer);
+  };
+  let receivedSignal;
+  const client = createInteractionRestClient({
+    applicationId: '111',
+    callbackRetry: { maxElapsedMs: 20 },
+    setTimeoutImpl,
+    clearTimeoutImpl,
+    fetchImpl: async (url, options) => {
+      receivedSignal = options.signal;
+      return new Promise((resolve, reject) => {
+        options.signal.addEventListener('abort', () => {
+          reject(new Error(`aborted ${url} token-hang-secret`));
+        }, { once: true });
+      });
+    },
+  });
+
+  await assert.rejects(
+    () => client.callback({ id: 'hang-id', token: 'token-hang-secret' }, { type: 5, data: {} }),
+    (error) => error.message === 'Discord interaction request failed: timeout'
+      && !/hang-id|token-hang-secret/iu.test(error.message),
+  );
+  assert.equal(receivedSignal instanceof AbortSignal, true);
+  assert.equal(receivedSignal.aborted, true);
+  assert.equal(activeTimers.size, 0);
+  assert.equal(clearCalls, 1);
+});
+
 test('webhook 429 retries are attempt-bounded and accept HTTP-date Retry-After', async () => {
   let clock = Date.parse('2026-09-01T00:00:00Z');
   const sleeps = [];

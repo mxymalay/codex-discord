@@ -53,13 +53,17 @@ function boundedInteger(value, fallback, minimum, maximum) {
 }
 
 function retryPolicy(policy, defaults) {
+  const configuredElapsed = Number(policy?.maxElapsedMs);
+  const maxElapsedMs = policy?.maxElapsedMs === undefined || !Number.isFinite(configuredElapsed)
+    ? defaults.maxElapsedMs
+    : Math.min(defaults.maxElapsedMs, Math.max(0, configuredElapsed));
   return {
     maxAttempts: boundedInteger(policy?.maxAttempts, defaults.maxAttempts, 1, defaults.maxAttempts),
-    maxElapsedMs: Math.min(defaults.maxElapsedMs, Math.max(0, Number(policy?.maxElapsedMs) || defaults.maxElapsedMs)),
+    maxElapsedMs,
   };
 }
 
-async function retryAfterMilliseconds(response, nowMs) {
+async function retryAfterMilliseconds(response, now) {
   try {
     const details = typeof response?.json === 'function' ? await response.json() : null;
     const seconds = Number(details?.retry_after);
@@ -71,41 +75,95 @@ async function retryAfterMilliseconds(response, nowMs) {
   const seconds = Number(header);
   if (String(header ?? '').trim() && Number.isFinite(seconds) && seconds >= 0) return seconds * 1_000;
   const date = Date.parse(String(header ?? ''));
-  return Number.isFinite(date) ? Math.max(0, date - nowMs) : null;
+  return Number.isFinite(date) ? Math.max(0, date - Number(now())) : null;
 }
 
-async function discordRequest(fetchImpl, url, method, body, { now, sleepImpl, policy }) {
+async function fetchAttempt(fetchImpl, url, method, body, {
+  remainingMs,
+  parseRetryAfter,
+  now,
+  setTimeoutImpl,
+  clearTimeoutImpl,
+}) {
+  const controller = new AbortController();
+  let timedOut = false;
+  let timeoutId;
+  const timeout = new Promise((_resolve, reject) => {
+    timeoutId = setTimeoutImpl(() => {
+      timedOut = true;
+      reject(new Error('Discord interaction request failed: timeout'));
+      controller.abort();
+    }, remainingMs);
+  });
+  const request = (async () => {
+    const response = await fetchImpl(url, {
+      method,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+    const status = Number(response?.status);
+    if (status === 429 && parseRetryAfter) {
+      return { response, retryAfterMs: await retryAfterMilliseconds(response, now) };
+    }
+    if (!isSuccessful(response) || status === 204) return { response, value: null };
+    try {
+      const value = typeof response?.json === 'function' ? await response.json() : null;
+      return { response, value };
+    } catch {
+      return { response, value: null };
+    }
+  })();
+  try {
+    return await Promise.race([request, timeout]);
+  } catch {
+    if (timedOut || controller.signal.aborted) {
+      throw new Error('Discord interaction request failed: timeout');
+    }
+    throw new Error('Discord interaction request failed: network');
+  } finally {
+    clearTimeoutImpl(timeoutId);
+  }
+}
+
+async function discordRequest(fetchImpl, url, method, body, {
+  now,
+  sleepImpl,
+  policy,
+  setTimeoutImpl,
+  clearTimeoutImpl,
+}) {
   const startedAt = Number(now());
   for (let attempt = 1; attempt <= policy.maxAttempts; attempt += 1) {
-    let response;
-    try {
-      response = await fetchImpl(url, {
-        method,
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
-    } catch {
-      throw new Error('Discord interaction request failed: network');
+    const elapsedBeforeRequest = Math.max(0, Number(now()) - startedAt);
+    if (attempt > 1 && elapsedBeforeRequest >= policy.maxElapsedMs) {
+      throw new Error('Discord interaction request failed: 429');
     }
-    if (Number(response?.status) === 429 && attempt < policy.maxAttempts) {
-      const current = Number(now());
-      const delay = await retryAfterMilliseconds(response, current);
-      const elapsed = Math.max(0, current - startedAt);
-      if (delay !== null && Number.isFinite(delay) && delay >= 0 && elapsed + delay <= policy.maxElapsedMs) {
-        await sleepImpl(delay);
-        continue;
+    const remainingMs = Math.max(0, policy.maxElapsedMs - elapsedBeforeRequest);
+    const result = await fetchAttempt(fetchImpl, url, method, body, {
+      remainingMs,
+      parseRetryAfter: attempt < policy.maxAttempts,
+      now,
+      setTimeoutImpl,
+      clearTimeoutImpl,
+    });
+    const status = Number(result.response?.status);
+    if (status === 429 && attempt < policy.maxAttempts) {
+      const delay = result.retryAfterMs;
+      const remainingAfterParse = policy.maxElapsedMs - Math.max(0, Number(now()) - startedAt);
+      if (delay === null || !Number.isFinite(delay) || delay < 0 || delay >= remainingAfterParse) {
+        throw new Error('Discord interaction request failed: 429');
       }
+      await sleepImpl(delay);
+      if (Math.max(0, Number(now()) - startedAt) >= policy.maxElapsedMs) {
+        throw new Error('Discord interaction request failed: 429');
+      }
+      continue;
     }
-    if (!isSuccessful(response)) {
-      throw new Error(`Discord interaction request failed: ${Number(response?.status) || 'unknown'}`);
+    if (!isSuccessful(result.response)) {
+      throw new Error(`Discord interaction request failed: ${status || 'unknown'}`);
     }
-    if (Number(response?.status) === 204) return null;
-    try {
-      if (typeof response?.json === 'function') return await response.json();
-    } catch {
-      return null;
-    }
-    return null;
+    return result.value;
   }
   throw new Error('Discord interaction request failed: retry-limit');
 }
@@ -120,6 +178,8 @@ export function createInteractionRestClient({
   fetchImpl = fetch,
   now = Date.now,
   sleepImpl = defaultSleep,
+  setTimeoutImpl = setTimeout,
+  clearTimeoutImpl = clearTimeout,
   callbackRetry,
   webhookRetry,
 } = {}) {
@@ -131,19 +191,19 @@ export function createInteractionRestClient({
       const id = encodeURIComponent(String(interaction?.id ?? ''));
       const token = encodeURIComponent(String(interaction?.token ?? ''));
       return discordRequest(fetchImpl, `${DISCORD_API}/interactions/${id}/${token}/callback`, 'POST', normalizeCallback(body), {
-        now, sleepImpl, policy: callbackPolicy,
+        now, sleepImpl, setTimeoutImpl, clearTimeoutImpl, policy: callbackPolicy,
       });
     },
     editOriginal(interaction, payload) {
       const token = encodeURIComponent(String(interaction?.token ?? ''));
       return discordRequest(fetchImpl, `${DISCORD_API}/webhooks/${appId}/${token}/messages/@original`, 'PATCH', mentionSafePayload(payload), {
-        now, sleepImpl, policy: webhookPolicy,
+        now, sleepImpl, setTimeoutImpl, clearTimeoutImpl, policy: webhookPolicy,
       });
     },
     followup(interaction, payload) {
       const token = encodeURIComponent(String(interaction?.token ?? ''));
       return discordRequest(fetchImpl, `${DISCORD_API}/webhooks/${appId}/${token}?wait=true`, 'POST', privatePayload(payload), {
-        now, sleepImpl, policy: webhookPolicy,
+        now, sleepImpl, setTimeoutImpl, clearTimeoutImpl, policy: webhookPolicy,
       });
     },
   };
