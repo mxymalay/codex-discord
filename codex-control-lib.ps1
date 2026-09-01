@@ -131,18 +131,15 @@ function ConvertTo-CodexDesktopProcessRecord {
     $rawCreationDate = Get-ControlProcessProperty -Process $Process -Name 'CreationDate'
     $processId = 0
     $parentProcessId = 0
-    if ($null -eq $rawProcessId -or -not [int]::TryParse(([string]$rawProcessId), [ref]$processId) -or $processId -le 0) {
-        return $null
-    }
-    $hasValidParentProcessId = $true
-    if ($null -ne $rawParentProcessId -and -not [int]::TryParse(([string]$rawParentProcessId), [ref]$parentProcessId)) {
-        $hasValidParentProcessId = $false
-    }
+    $hasValidProcessId = ($null -ne $rawProcessId -and [int]::TryParse(([string]$rawProcessId), [ref]$processId) -and $processId -gt 0)
+    $hasValidParentProcessId = ($null -ne $rawParentProcessId -and [int]::TryParse(([string]$rawParentProcessId), [ref]$parentProcessId) -and $parentProcessId -ge 0)
     $creationTimeUtc = ConvertTo-ControlCreationTime -Value $rawCreationDate
     $executablePath = [string](Get-ControlProcessProperty -Process $Process -Name 'ExecutablePath')
+    $canonicalExecutablePath = ConvertTo-CodexDesktopCanonicalPath -Path $executablePath
     return [pscustomobject]@{
         Process = $Process
         ProcessId = $processId
+        HasValidProcessId = $hasValidProcessId
         ParentProcessId = $parentProcessId
         HasValidParentProcessId = $hasValidParentProcessId
         Name = [string](Get-ControlProcessProperty -Process $Process -Name 'Name')
@@ -150,8 +147,8 @@ function ConvertTo-CodexDesktopProcessRecord {
         CreationDate = $rawCreationDate
         CreationTimeUtc = $creationTimeUtc
         HasCreationTime = ($null -ne $creationTimeUtc)
-        HasExecutablePath = (-not [string]::IsNullOrWhiteSpace($executablePath))
-        PackageRoot = Get-CodexDesktopPackageRoot -Path $executablePath
+        HasExecutablePath = ($null -ne $canonicalExecutablePath)
+        PackageRoot = Get-CodexDesktopPackageRoot -Path $canonicalExecutablePath
     }
 }
 
@@ -196,6 +193,9 @@ function Get-CodexDesktopProcessPlan {
 
     $byProcessId = @{}
     foreach ($record in $records) {
+        if (-not $record.HasValidProcessId) {
+            continue
+        }
         $key = [string]$record.ProcessId
         if ($byProcessId.ContainsKey($key)) {
             return New-UnverifiableCodexDesktopProcessPlan
@@ -206,7 +206,7 @@ function Get-CodexDesktopProcessPlan {
     $trustedCandidates = @($records | Where-Object {
         $_.Name -ieq 'ChatGPT.exe' -and (Test-CodexDesktopRootPath -Path $_.ExecutablePath)
     })
-    if (@($trustedCandidates | Where-Object { -not $_.HasCreationTime -or -not $_.HasValidParentProcessId }).Count -gt 0) {
+    if (@($trustedCandidates | Where-Object { -not $_.HasValidProcessId -or -not $_.HasCreationTime -or -not $_.HasValidParentProcessId -or -not $_.HasExecutablePath }).Count -gt 0) {
         return New-UnverifiableCodexDesktopProcessPlan
     }
 
@@ -251,7 +251,7 @@ function Get-CodexDesktopProcessPlan {
         $rootByProcessId[[string]$item.Record.ProcessId] = $item.RootProcessId
         $children = if ($childrenByParent.ContainsKey([string]$item.Record.ProcessId)) { @($childrenByParent[[string]$item.Record.ProcessId]) } else { @() }
         foreach ($child in @($children | Sort-Object ProcessId)) {
-            if (-not $item.Record.HasCreationTime -or -not $item.Record.HasValidParentProcessId -or -not $child.HasCreationTime -or -not $child.HasValidParentProcessId -or $child.CreationTimeUtc -le $item.Record.CreationTimeUtc) {
+            if (-not $item.Record.HasValidProcessId -or -not $item.Record.HasValidParentProcessId -or -not $item.Record.HasCreationTime -or -not $item.Record.HasExecutablePath -or -not $child.HasValidProcessId -or -not $child.HasValidParentProcessId -or -not $child.HasCreationTime -or -not $child.HasExecutablePath -or $child.CreationTimeUtc -le $item.Record.CreationTimeUtc) {
                 return New-UnverifiableCodexDesktopProcessPlan
             }
             if ($seen.Add($child.ProcessId)) {

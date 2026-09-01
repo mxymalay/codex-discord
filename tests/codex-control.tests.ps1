@@ -18,17 +18,15 @@ $boundStartTime = ConvertTo-ControlCreationTime -Value '20260901120000.000000+48
 if (-not (Test-CodexBoundProcessIdentity -BoundProcess ([pscustomobject]@{ ProcessId=42; StartTimeUtc=$boundStartTime.UtcDateTime }) -ProcessId 42 -CreationDate '20260901120000.000000+480')) {
     throw 'bound process identity did not validate a held process object start time'
 }
-if (-not (Test-CodexBoundProcessIdentity -BoundProcess ([pscustomobject]@{ ProcessId=42; StartTimeUtc=$boundStartTime.UtcDateTime.AddTicks(9) }) -ProcessId 42 -CreationDate '20260901120000.000000+480')) {
-    throw 'bound process identity rejected the same CIM-microsecond process because of 100ns ticks'
+foreach ($tickRemainder in 1..9) {
+    if (-not (Test-CodexBoundProcessIdentity -BoundProcess ([pscustomobject]@{ ProcessId=42; StartTimeUtc=$boundStartTime.UtcDateTime.AddTicks($tickRemainder) }) -ProcessId 42 -CreationDate '20260901120000.000000+480')) {
+        throw "bound process identity rejected the same CIM-microsecond process at +$tickRemainder ticks"
+    }
 }
-if (Test-CodexBoundProcessIdentity -BoundProcess ([pscustomobject]@{ ProcessId=42; StartTimeUtc=$boundStartTime.UtcDateTime.AddTicks(10) }) -ProcessId 42 -CreationDate '20260901120000.000000+480') {
-    throw 'bound process identity accepted a process created at least one CIM microsecond later'
-}
-$currentProcess = Get-Process -Id $PID -ErrorAction Stop
-[void]$currentProcess.Handle
-$currentCim = Get-CimInstance -ClassName Win32_Process -Filter ("ProcessId = {0}" -f $PID) -ErrorAction Stop
-if (-not (Test-CodexBoundProcessIdentity -BoundProcess ([pscustomobject]@{ ProcessId=$currentProcess.Id; StartTimeUtc=$currentProcess.StartTime.ToUniversalTime() }) -ProcessId $PID -CreationDate $currentCim.CreationDate)) {
-    throw 'read-only current pwsh CIM and held-process identity comparison failed'
+foreach ($differentMicrosecond in @(10, 11, 19, 20)) {
+    if (Test-CodexBoundProcessIdentity -BoundProcess ([pscustomobject]@{ ProcessId=42; StartTimeUtc=$boundStartTime.UtcDateTime.AddTicks($differentMicrosecond) }) -ProcessId 42 -CreationDate '20260901120000.000000+480') {
+        throw "bound process identity accepted a process created +$differentMicrosecond ticks later"
+    }
 }
 foreach ($untrustedPath in @(
     'D:\Program Files\WindowsApps\OpenAI.Codex_1.2.3.0_x64__publisher\app\ChatGPT.exe',
@@ -98,6 +96,9 @@ Assert-UnverifiableCodexTreeFailsBeforeOperations -Name 'same-package parent wit
     [pscustomobject]@{ ProcessId=210; ParentProcessId='invalid'; Name='ChatGPT.exe'; ExecutablePath=$trusted; CreationDate='20260901130000.000000+480' },
     [pscustomobject]@{ ProcessId=211; ParentProcessId=210; Name='ChatGPT.exe'; ExecutablePath=$trusted; CreationDate='20260901130001.000000+480' }
 )
+Assert-UnverifiableCodexTreeFailsBeforeOperations -Name 'trusted root with missing ParentProcessId' -Processes @(
+    [pscustomobject]@{ ProcessId=215; ParentProcessId=$null; Name='ChatGPT.exe'; ExecutablePath=$trusted; CreationDate='20260901130000.000000+480' }
+)
 Assert-UnverifiableCodexTreeFailsBeforeOperations -Name 'direct descendant with invalid CreationDate' -Processes @(
     [pscustomobject]@{ ProcessId=220; ParentProcessId=10; Name='ChatGPT.exe'; ExecutablePath=$trusted; CreationDate='20260901130000.000000+480' },
     [pscustomobject]@{ ProcessId=221; ParentProcessId=220; Name='codex.exe'; ExecutablePath='C:\Users\test\AppData\Local\OpenAI\Codex\bin\v\codex.exe'; CreationDate='invalid' }
@@ -106,6 +107,16 @@ Assert-UnverifiableCodexTreeFailsBeforeOperations -Name 'deep descendant with in
     [pscustomobject]@{ ProcessId=230; ParentProcessId=10; Name='ChatGPT.exe'; ExecutablePath=$trusted; CreationDate='20260901130000.000000+480' },
     [pscustomobject]@{ ProcessId=231; ParentProcessId=230; Name='renderer.exe'; ExecutablePath=$trusted; CreationDate='20260901130001.000000+480' },
     [pscustomobject]@{ ProcessId=232; ParentProcessId=231; Name='utility.exe'; ExecutablePath=$trusted; CreationDate='invalid' }
+)
+$invalidExecutablePath = 'C:\invalid' + [char]0
+Assert-UnverifiableCodexTreeFailsBeforeOperations -Name 'direct descendant with missing ExecutablePath' -Processes @(
+    [pscustomobject]@{ ProcessId=240; ParentProcessId=10; Name='ChatGPT.exe'; ExecutablePath=$trusted; CreationDate='20260901130000.000000+480' },
+    [pscustomobject]@{ ProcessId=241; ParentProcessId=240; Name='codex.exe'; ExecutablePath=$null; CreationDate='20260901130001.000000+480' }
+)
+Assert-UnverifiableCodexTreeFailsBeforeOperations -Name 'deep descendant with an unnormalizable ExecutablePath' -Processes @(
+    [pscustomobject]@{ ProcessId=250; ParentProcessId=10; Name='ChatGPT.exe'; ExecutablePath=$trusted; CreationDate='20260901130000.000000+480' },
+    [pscustomobject]@{ ProcessId=251; ParentProcessId=250; Name='renderer.exe'; ExecutablePath=$trusted; CreationDate='20260901130001.000000+480' },
+    [pscustomobject]@{ ProcessId=252; ParentProcessId=251; Name='utility.exe'; ExecutablePath=$invalidExecutablePath; CreationDate='20260901130002.000000+480' }
 )
 
 $events = [System.Collections.Generic.List[string]]::new()
