@@ -1,0 +1,15 @@
+{
+  "enabled": true,
+  "provider": "discord-bot",
+  "quotaNotifications": true,
+  "discordApplicationId": "111111111111111111",
+  "discordGuildId": "222222222222222222",
+  "discordAllowedUserId": "333333333333333333",
+  "discordTaskChannelId": "444444444444444444",
+  "discordConfirmationChannelId": "555555555555555555",
+  "discordQuotaChannelId": "666666666666666666",
+  "discordTokenPath": ".\\discord-token.dpapi",
+  "discordCodexPath": "codex",
+  "discordProjectlessRoot": "%USERPROFILE%\\Documents\\Codex\\Discord Tasks",
+  "discordWorktreeRoot": "%CODEX_HOME%\\worktrees\\discord"
+}

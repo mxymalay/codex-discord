@@ -1,0 +1,14 @@
+config.json
+discord-token.dpapi
+*.log
+discord-inbox-state.json
+discord-message-map.json
+discord-task-index.json
+discord-gateway-state.json
+quota-state.json
+rollout-watcher-state.json
+task-delivery-state.json
+.rollout-notification-*.json
+*.tmp
+node_modules/
+coverage/
