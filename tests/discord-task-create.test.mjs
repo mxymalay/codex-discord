@@ -609,6 +609,7 @@ test('the default Git runner sanitizes probe environment and classifies only the
   };
   const environment = {
     PATH: 'C:\\Git\\cmd',
+    DISCORD_BRIDGE_KEEP: 'preserved',
     gIt_DiR: 'C:\\attacker',
     Git_Work_Tree: 'C:\\attacker-tree',
     git_COMMON_dir: 'C:\\attacker-common',
@@ -617,6 +618,15 @@ test('the default Git runner sanitizes probe environment and classifies only the
     Git_Index_File: 'C:\\attacker-index',
     git_namespace: 'attacker',
     Git_Shallow_File: 'C:\\attacker-shallow',
+    git_Index_Version: '2',
+    Git_Config_Parameters: "'core.worktree'='C:\\attacker-tree'",
+    gIt_CoNfIg_CoUnT: '1',
+    Git_Config_Key_0: 'core.worktree',
+    git_config_value_0: 'C:\\attacker-tree',
+    Git_Config_Global: 'C:\\attacker-global',
+    git_config_SYSTEM: 'C:\\attacker-system',
+    Git_Config_NoSystem: '0',
+    gIt_TrAcE: 'C:\\attacker-trace',
     Git_Ceiling_Directories: 'C:\\plain',
     git_Discovery_Across_Filesystem: 'false',
     lC_aLl: 'zh_CN.UTF-8',
@@ -634,18 +644,17 @@ test('the default Git runner sanitizes probe environment and classifies only the
   for (const options of invocations) {
     assert.equal(options.shell, false);
     const environmentKeys = Object.keys(options.env);
-    for (const name of [
-      'GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_OBJECT_DIRECTORY',
-      'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_INDEX_FILE', 'GIT_NAMESPACE',
-      'GIT_SHALLOW_FILE', 'GIT_CEILING_DIRECTORIES', 'GIT_DISCOVERY_ACROSS_FILESYSTEM',
-    ]) assert.equal(environmentKeys.some((key) => key.toUpperCase() === name), false,
-      `${name} must be filtered case-insensitively`);
+    assert.deepEqual(environmentKeys.filter((key) => key.toUpperCase().startsWith('GIT_')), [
+      'GIT_TERMINAL_PROMPT',
+    ]);
     assert.deepEqual(environmentKeys.filter((key) => key.toUpperCase() === 'LC_ALL'), ['LC_ALL']);
     assert.deepEqual(environmentKeys.filter((key) => key.toUpperCase() === 'LANG'), ['LANG']);
     assert.deepEqual(environmentKeys.filter((key) => key.toUpperCase() === 'GIT_TERMINAL_PROMPT'), ['GIT_TERMINAL_PROMPT']);
     assert.equal(options.env.LC_ALL, 'C');
     assert.equal(options.env.LANG, 'C');
     assert.equal(options.env.GIT_TERMINAL_PROMPT, '0');
+    assert.equal(options.env.PATH, 'C:\\Git\\cmd');
+    assert.equal(options.env.DISCORD_BRIDGE_KEEP, 'preserved');
   }
 });
 

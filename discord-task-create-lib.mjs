@@ -184,18 +184,11 @@ export function resolveProjectSelection({ projects, selectionId, projectlessRoot
   };
 }
 
-const CONTROLLED_GIT_ENV_DENYLIST = new Set([
-  'GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE',
-  'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_GRAFT_FILE',
-  'GIT_REPLACE_REF_BASE', 'GIT_NAMESPACE', 'GIT_SHALLOW_FILE', 'GIT_QUARANTINE_PATH',
-  'GIT_CEILING_DIRECTORIES', 'GIT_DISCOVERY_ACROSS_FILESYSTEM', 'GIT_PREFIX', 'GIT_SUPER_PREFIX',
-  'LC_ALL', 'LANG', 'GIT_TERMINAL_PROMPT',
-]);
-
 function controlledGitEnvironment(environment) {
-  const sanitized = Object.fromEntries(Object.entries(environment).filter(([name]) => (
-    !CONTROLLED_GIT_ENV_DENYLIST.has(name.toUpperCase())
-  )));
+  const sanitized = Object.fromEntries(Object.entries(environment).filter(([name]) => {
+    const normalized = name.toUpperCase();
+    return !normalized.startsWith('GIT_') && normalized !== 'LC_ALL' && normalized !== 'LANG';
+  }));
   Object.assign(sanitized, { LC_ALL: 'C', LANG: 'C', GIT_TERMINAL_PROMPT: '0' });
   return sanitized;
 }
