@@ -179,6 +179,19 @@ function makeDependencies(overrides = {}) {
   return { dependencies, responses, edits, events, taskIndex };
 }
 
+async function submitContinuationModal(router, responses, {
+  threadId = 'root-1', text = '继续处理该任务', interactionId = 'continue-submit-active-writer',
+} = {}) {
+  await router.handle(commandInteraction('继续任务', { 任务: threadId }));
+  const modal = responses.shift();
+  assert.equal(modal.type, 9);
+  await router.handle(modalSubmit(modal.data.custom_id, text, {
+    fieldId: '继续内容', id: interactionId,
+  }));
+  const deferred = responses.shift();
+  assert.equal(deferred.type, 5);
+}
+
 test('task autocomplete returns at most 25 authorized in-memory root tasks without detail reads', async () => {
   const detailReads = [];
   const { dependencies, responses, edits } = makeDependencies({
@@ -827,6 +840,335 @@ test('continue UI reports an uncertain external start without claiming failure',
   }]);
   assert.match(rendered, /启动结果不确定/);
   assert.equal(rendered.includes('状态：失败'), false);
+});
+
+test('active-writer continuation shows a five-minute message-bound takeover recommendation', async () => {
+  const uiState = new Map();
+  const currentIndex = { tasks: [
+    task(1, { status: 'running', rolloutPath: 'C:\\private\\root-1.jsonl' }),
+    task(2, { status: 'confirmation-required', rolloutPath: 'C:\\private\\root-2.jsonl' }),
+  ] };
+  const { dependencies, responses, edits } = makeDependencies({
+    uiState,
+    refreshTaskIndex: async () => currentIndex,
+    getCodexControlStatus: async () => ({
+      ok: true, desktop: { running: true, path: 'C:\\private\\ChatGPT.exe' },
+    }),
+    dispatchContinuation: async () => ({
+      status: 'queued', reason: 'active-writer', queueId: 'queue-private-1',
+    }),
+  });
+  const router = createInteractionRouter(dependencies);
+
+  await submitContinuationModal(router, responses);
+
+  assert.match(edits[0].content, /已安全排队/);
+  assert.match(edits[0].embeds[0].description, /门店任务 1（正在执行，目标任务）/);
+  assert.deepEqual(edits[0].components[0].components.map((button) => [button.label, button.style]), [
+    ['退出 Codex 并立即继续', 4], ['保持排队', 2],
+  ]);
+  const takeoverState = [...uiState.values()].find((state) => state.kind === 'takeover-continue');
+  assert.equal(takeoverState.queueId, 'queue-private-1');
+  assert.equal(takeoverState.targetThreadId, 'root-1');
+  assert.equal(takeoverState.userId, '333');
+  assert.equal(takeoverState.guildId, '222');
+  assert.equal(takeoverState.messageId, 'takeover-message-1');
+  assert.equal(takeoverState.expiresAt, NOW + 5 * 60_000);
+  const serialized = JSON.stringify(edits[0]);
+  assert.equal(serialized.includes('queue-private-1'), false);
+  assert.equal(serialized.includes('root-1'), false);
+  assert.equal(serialized.includes('private\\'), false);
+});
+
+test('untrusted desktop or task state keeps active-writer work queued without destructive controls', async (t) => {
+  const cases = [
+    {
+      name: 'desktop stopped',
+      refreshTaskIndex: async () => ({ tasks: [task(1, { status: 'running' })] }),
+      getCodexControlStatus: async () => ({ ok: true, desktop: { running: false } }),
+    },
+    {
+      name: 'desktop status unavailable',
+      refreshTaskIndex: async () => ({ tasks: [task(1, { status: 'running' })] }),
+      getCodexControlStatus: async () => { throw new Error('private status detail'); },
+    },
+    {
+      name: 'task index unavailable',
+      refreshTaskIndex: async () => { throw new Error('C:\\private\\sessions'); },
+      getCodexControlStatus: async () => ({ ok: true, desktop: { running: true } }),
+    },
+  ];
+  for (const entry of cases) {
+    await t.test(entry.name, async () => {
+      const uiState = new Map();
+      const { dependencies, responses, edits } = makeDependencies({
+        uiState,
+        refreshTaskIndex: entry.refreshTaskIndex,
+        getCodexControlStatus: entry.getCodexControlStatus,
+        dispatchContinuation: async () => ({
+          status: 'queued', reason: 'active-writer', queueId: 'queue-hidden',
+        }),
+      });
+
+      await submitContinuationModal(createInteractionRouter(dependencies), responses, {
+        interactionId: `continue-${entry.name}`,
+      });
+
+      assert.match(edits[0].content, /已安全排队/);
+      assert.match(edits[0].content, /其他 CLI|插件/);
+      assert.match(edits[0].content, /保持排队|继续排队/);
+      assert.equal(edits[0].components?.length ?? 0, 0);
+      assert.equal([...uiState.values()].some((state) => state.kind === 'takeover-continue'), false);
+      assert.equal(JSON.stringify(edits[0]).includes('private'), false);
+    });
+  }
+});
+
+test('keep queued consumes only its exact takeover state through a deferred component update', async () => {
+  const uiState = new Map();
+  let stopCalls = 0;
+  let retryCalls = 0;
+  const currentIndex = { tasks: [task(1, { status: 'running' })] };
+  const { dependencies, responses, edits } = makeDependencies({
+    uiState,
+    refreshTaskIndex: async () => currentIndex,
+    getCodexControlStatus: async () => ({ ok: true, desktop: { running: true } }),
+    stopCodexDesktop: async () => { stopCalls += 1; return { ok: true }; },
+    retryContinuation: async () => { retryCalls += 1; return { status: 'started' }; },
+    dispatchContinuation: async () => ({ status: 'queued', reason: 'active-writer', queueId: 'queue-keep' }),
+  });
+  const router = createInteractionRouter(dependencies);
+  await submitContinuationModal(router, responses);
+  const keepId = edits[0].components[0].components[1].custom_id;
+
+  await router.handle(componentInteraction(keepId, { id: 'keep-queued' }));
+
+  assert.equal(responses[0].type, 6);
+  assert.equal(Object.hasOwn(responses[0], 'data'), false);
+  assert.match(edits.at(-1).content, /保持排队/);
+  assert.match(edits.at(-1).content, /继续队列/);
+  assert.equal(edits.at(-1).components.length, 0);
+  assert.equal(stopCalls, 0);
+  assert.equal(retryCalls, 0);
+  assert.equal([...uiState.values()].some((state) => state.kind === 'takeover-continue'), false);
+});
+
+test('confirmed takeover is tenant and message bound, stops once, and retries only its queue id once', async () => {
+  const uiState = new Map();
+  const stopped = [];
+  const retriedQueueIds = [];
+  const currentIndex = { tasks: [task(1, { status: 'running' })] };
+  const { dependencies, responses, edits } = makeDependencies({
+    uiState,
+    refreshTaskIndex: async () => currentIndex,
+    getCodexControlStatus: async () => ({ ok: true, desktop: { running: true } }),
+    stopCodexDesktop: async () => { stopped.push('stop'); return { ok: true, stoppedProcessCount: 1 }; },
+    retryContinuation: async (queueId) => {
+      retriedQueueIds.push(queueId);
+      return { status: 'started', queueId, turnId: 'turn-private-12345678' };
+    },
+    dispatchContinuation: async () => ({ status: 'queued', reason: 'active-writer', queueId: 'queue-exact' }),
+  });
+  const router = createInteractionRouter(dependencies);
+  await submitContinuationModal(router, responses);
+  const continueId = edits[0].components[0].components[0].custom_id;
+
+  await router.handle(componentInteraction(continueId, { userId: '444' }));
+  await router.handle(componentInteraction(continueId, { messageId: 'wrong-message' }));
+  assert.deepEqual(stopped, []);
+  assert.deepEqual(retriedQueueIds, []);
+  assert.equal([...uiState.values()].some((state) => state.kind === 'takeover-continue'), true);
+
+  await Promise.all([
+    router.handle(componentInteraction(continueId, { id: 'takeover-valid' })),
+    router.handle(componentInteraction(continueId, { id: 'takeover-redelivery' })),
+  ]);
+
+  assert.deepEqual(stopped, ['stop']);
+  assert.deepEqual(retriedQueueIds, ['queue-exact']);
+  assert.equal(responses.some((body) => body.type === 6), true);
+  assert.match(edits.at(-1).content, /已开始继续执行/);
+  assert.match(edits.at(-1).content, /…12345678/);
+  assert.equal(edits.at(-1).content.includes('turn-private'), false);
+  assert.equal([...uiState.values()].some((state) => state.kind === 'takeover-continue'), false);
+});
+
+test('a desktop that exits after preview is idempotent success and still retries the bound queue once', async () => {
+  let desktopRunning = true;
+  let stopCalls = 0;
+  const retriedQueueIds = [];
+  const currentIndex = { tasks: [task(1, { status: 'running' })] };
+  const { dependencies, responses, edits } = makeDependencies({
+    refreshTaskIndex: async () => currentIndex,
+    getCodexControlStatus: async () => ({ ok: true, desktop: { running: desktopRunning } }),
+    stopCodexDesktop: async () => { stopCalls += 1; return { ok: true }; },
+    retryContinuation: async (queueId) => {
+      retriedQueueIds.push(queueId);
+      return { status: 'started', queueId, turnId: 'turn-after-exit' };
+    },
+    dispatchContinuation: async () => ({ status: 'queued', reason: 'active-writer', queueId: 'queue-after-exit' }),
+  });
+  const router = createInteractionRouter(dependencies);
+  await submitContinuationModal(router, responses);
+  const continueId = edits[0].components[0].components[0].custom_id;
+  desktopRunning = false;
+
+  await router.handle(componentInteraction(continueId, { id: 'desktop-already-gone' }));
+
+  assert.equal(stopCalls, 0);
+  assert.deepEqual(retriedQueueIds, ['queue-after-exit']);
+  assert.match(edits.at(-1).content, /已开始继续执行/);
+});
+
+test('a failed takeover component defer consumes that state and releases the shared exit lock', async () => {
+  const uiState = new Map();
+  let failNextComponentDefer = true;
+  let stopCalls = 0;
+  let retryCalls = 0;
+  const currentIndex = { tasks: [task(1, { status: 'running' })] };
+  const { dependencies, responses, edits } = makeDependencies({
+    uiState,
+    refreshTaskIndex: async () => currentIndex,
+    getCodexControlStatus: async () => ({ ok: true, desktop: { running: true } }),
+    stopCodexDesktop: async () => { stopCalls += 1; return { ok: true }; },
+    retryContinuation: async () => { retryCalls += 1; return { status: 'started' }; },
+    dispatchContinuation: async (_request) => ({
+      status: 'queued', reason: 'active-writer', queueId: `queue-defer-${edits.length}`,
+    }),
+  });
+  dependencies.respond = async (body) => {
+    responses.push(body);
+    if (body.type === 6 && failNextComponentDefer) {
+      failNextComponentDefer = false;
+      throw new Error('offline callback failure');
+    }
+  };
+  const router = createInteractionRouter(dependencies);
+  await submitContinuationModal(router, responses, { interactionId: 'defer-failure-first' });
+  const failedId = edits[0].components[0].components[0].custom_id;
+
+  await assert.rejects(
+    router.handle(componentInteraction(failedId, { id: 'failed-component-defer' })),
+    /offline callback failure/u,
+  );
+  assert.equal(stopCalls, 0);
+  assert.equal(retryCalls, 0);
+  assert.equal([...uiState.values()].some((state) => state.kind === 'takeover-continue'), false);
+
+  responses.length = 0;
+  await submitContinuationModal(router, responses, { interactionId: 'defer-failure-recovery' });
+  const recoveredId = edits.at(-1).components[0].components[0].custom_id;
+  await router.handle(componentInteraction(recoveredId, { id: 'valid-after-defer-failure' }));
+  assert.equal(stopCalls, 1);
+  assert.equal(retryCalls, 1);
+});
+
+test('takeover does not stop or retry when fresh safety inspection or desktop exit is unconfirmed', async (t) => {
+  for (const mode of ['status-unavailable', 'index-unavailable', 'stop-failed']) {
+    await t.test(mode, async () => {
+      let phase = 'preview';
+      let stopCalls = 0;
+      let retryCalls = 0;
+      const currentIndex = { tasks: [task(1, { status: 'running' })] };
+      const { dependencies, responses, edits } = makeDependencies({
+        refreshTaskIndex: async () => {
+          if (phase === 'confirm' && mode === 'index-unavailable') throw new Error('private index error');
+          return currentIndex;
+        },
+        getCodexControlStatus: async () => {
+          if (phase === 'confirm' && mode === 'status-unavailable') throw new Error('private status error');
+          return { ok: true, desktop: { running: true } };
+        },
+        stopCodexDesktop: async () => {
+          stopCalls += 1;
+          return { ok: mode !== 'stop-failed' };
+        },
+        retryContinuation: async () => { retryCalls += 1; return { status: 'started' }; },
+        dispatchContinuation: async () => ({
+          status: 'queued', reason: 'active-writer', queueId: `queue-${mode}`,
+        }),
+      });
+      const router = createInteractionRouter(dependencies);
+      await submitContinuationModal(router, responses, { interactionId: `safety-${mode}` });
+      const continueId = edits[0].components[0].components[0].custom_id;
+      phase = 'confirm';
+
+      await router.handle(componentInteraction(continueId, { id: `safety-confirm-${mode}` }));
+
+      assert.equal(stopCalls, mode === 'stop-failed' ? 1 : 0);
+      assert.equal(retryCalls, 0);
+      assert.match(edits.at(-1).content, /保持排队|已安全排队|不会提供强制退出/);
+      assert.equal(edits.at(-1).components.length, 0);
+      assert.equal(JSON.stringify(edits.at(-1)).includes('private'), false);
+    });
+  }
+});
+
+test('a new active task blocks takeover and republishes a fresh exact-queue preview', async () => {
+  const uiState = new Map();
+  let currentIndex = { tasks: [task(1, { status: 'running' })] };
+  let stopCalls = 0;
+  let retryCalls = 0;
+  const { dependencies, responses, edits } = makeDependencies({
+    uiState,
+    refreshTaskIndex: async () => currentIndex,
+    getCodexControlStatus: async () => ({ ok: true, desktop: { running: true } }),
+    stopCodexDesktop: async () => { stopCalls += 1; return { ok: true }; },
+    retryContinuation: async () => { retryCalls += 1; return { status: 'started' }; },
+    dispatchContinuation: async () => ({ status: 'queued', reason: 'active-writer', queueId: 'queue-snapshot' }),
+  });
+  const router = createInteractionRouter(dependencies);
+  await submitContinuationModal(router, responses);
+  const oldId = edits[0].components[0].components[0].custom_id;
+
+  currentIndex = { tasks: [
+    task(1, { status: 'running' }),
+    task(9, { status: 'confirmation-required', taskName: '刚出现的任务' }),
+  ] };
+  await router.handle(componentInteraction(oldId, { id: 'stale-snapshot' }));
+
+  assert.equal(stopCalls, 0);
+  assert.equal(retryCalls, 0);
+  assert.equal(responses[0].type, 6);
+  assert.match(edits.at(-1).embeds[0].description, /检测到新活动任务/);
+  assert.match(edits.at(-1).embeds[0].description, /刚出现的任务/);
+  const replacement = [...uiState.values()].find((state) => state.kind === 'takeover-continue');
+  assert.equal(replacement.queueId, 'queue-snapshot');
+  assert.equal(replacement.targetThreadId, 'root-1');
+  assert.equal(replacement.messageId, 'takeover-message-1');
+  assert.notEqual(edits.at(-1).components[0].components[0].custom_id, oldId);
+});
+
+test('takeover reports queued, uncertain, and failed exact retries without claiming completion', async (t) => {
+  const cases = [
+    { result: { status: 'queued', reason: 'active-writer' }, expected: /仍被占用|继续排队/ },
+    { result: { status: 'uncertain', reason: 'start-outcome-uncertain' }, expected: /结果不确定|不会自动重试/ },
+    { result: { status: 'failed', reason: 'resume-failed' }, expected: /立即继续失败|没有成功/ },
+  ];
+  for (const [index, entry] of cases.entries()) {
+    await t.test(entry.result.status, async () => {
+      const currentIndex = { tasks: [task(1, { status: 'running' })] };
+      const { dependencies, responses, edits } = makeDependencies({
+        refreshTaskIndex: async () => currentIndex,
+        getCodexControlStatus: async () => ({ ok: true, desktop: { running: true } }),
+        stopCodexDesktop: async () => ({ ok: true }),
+        retryContinuation: async () => entry.result,
+        dispatchContinuation: async () => ({
+          status: 'queued', reason: 'active-writer', queueId: `queue-outcome-${index}`,
+        }),
+      });
+      const router = createInteractionRouter(dependencies);
+      await submitContinuationModal(router, responses, { interactionId: `outcome-${index}` });
+      const continueId = edits[0].components[0].components[0].custom_id;
+
+      await router.handle(componentInteraction(continueId, { id: `outcome-click-${index}` }));
+
+      assert.match(edits.at(-1).content, entry.expected);
+      assert.equal(edits.at(-1).content.includes('resume-failed'), false);
+      assert.equal(edits.at(-1).content.includes('queue-outcome'), false);
+      assert.equal(edits.at(-1).components.length, 0);
+    });
+  }
 });
 
 test('continue queue renders safe summaries and atomically cancels then refreshes', async () => {

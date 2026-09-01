@@ -135,6 +135,81 @@ test('production interaction wiring refreshes the shared index and uses only bou
   }
 });
 
+test('production takeover retry reloads only the exact queued record through tracked resources and replies', async () => {
+  let interactionDependencies;
+  const starts = [];
+  const replies = [];
+  const trackedResources = [];
+  let trackedRestCalls = 0;
+  const production = bridgeModule.createProductionBridgeDependencies({
+    runOnce: true,
+    startContinuationImpl: async (options) => {
+      starts.push(options);
+      options.trackActiveResource({ kind: 'continuation', turnId: 'turn-exact' });
+      await options.sendReply({ channelId: 'channel-1', content: 'tracked reply' });
+      return { status: 'started', queueId: options.request.queueId, turnId: 'turn-exact' };
+    },
+    sendDiscordReplyImpl: async (payload) => { replies.push(payload); },
+    createInteractionRestClientImpl: () => ({ callback: async () => {}, editOriginal: async () => ({ id: 'message-1' }) }),
+    createInteractionRouterImpl: (dependencies) => {
+      interactionDependencies = dependencies;
+      return { handle: async () => {} };
+    },
+  });
+  const inboxState = createEmptyInboxState();
+  const first = enqueueContinuation(inboxState, {
+    ...createContinuationRequest({ source: 'slash', requestId: 'retry-other', threadId: 'root-other', text: 'other' }),
+    encryptedText: 'cipher-other',
+  });
+  const exact = enqueueContinuation(inboxState, {
+    ...createContinuationRequest({ source: 'slash', requestId: 'retry-exact', threadId: 'root-exact', text: 'exact' }),
+    encryptedText: 'cipher-exact',
+  });
+  const terminal = enqueueContinuation(inboxState, {
+    ...createContinuationRequest({ source: 'slash', requestId: 'retry-terminal', threadId: 'root-terminal', text: 'done' }),
+    encryptedText: 'cipher-terminal', status: 'failed',
+  });
+  const context = {
+    config: {
+      ...config,
+      discordApplicationId: '111111111111111111',
+      discordWorktreeRoot: 'C:\\safe\\worktrees',
+      discordProjectlessRoot: 'C:\\safe\\projectless',
+    },
+    token: 'test-token',
+    executables: { codexPath: 'codex.exe', powershellPath: 'pwsh.exe' },
+    taskIndex: { version: 1, generatedAt: null, tasks: [] },
+    inboxState,
+    inboxReadOnly: false,
+    projectCatalog: {},
+    trackDiscordRest: async (operation) => { trackedRestCalls += 1; return operation(); },
+    trackActiveResource: (resource) => { trackedResources.push(resource); return resource; },
+    getSystemStatus: () => ({}),
+    recordActivity: () => {},
+    publishHealth: () => {},
+  };
+  await production.createInteractionHandler(context);
+
+  const result = await interactionDependencies.retryContinuation(exact.queueId);
+
+  assert.equal(result.status, 'started');
+  assert.equal(starts.length, 1);
+  assert.strictEqual(starts[0].state, inboxState);
+  assert.strictEqual(starts[0].request, inboxState.pendingContinuations[exact.queueId]);
+  assert.notStrictEqual(starts[0].request, first);
+  assert.deepEqual(trackedResources, [{ kind: 'continuation', turnId: 'turn-exact' }]);
+  assert.equal(trackedRestCalls, 1);
+  assert.deepEqual(replies, [{ token: 'test-token', channelId: 'channel-1', content: 'tracked reply' }]);
+
+  assert.deepEqual(await interactionDependencies.retryContinuation('missing-queue'), {
+    status: 'failed', reason: 'not-found',
+  });
+  assert.deepEqual(await interactionDependencies.retryContinuation(terminal.queueId), {
+    status: 'failed', reason: 'not-found',
+  });
+  assert.equal(starts.length, 1);
+});
+
 test('production index refreshes serialize an older scan before a fresh takeover snapshot without stopping on a new task', async () => {
   const oldBuild = deferred();
   const callbacks = [];
@@ -1558,6 +1633,8 @@ test('dispatch queues an active writer, retries delivery, and preserves legacy r
   assert.equal(listContinuations(state).length, 1);
   assert.equal(Object.values(state.pendingContinuations).some((item) => Object.hasOwn(item, 'text')), false);
   assert.match(acknowledgements[0].content, /已排队/);
+  assert.match(acknowledgements[0].content, /其他写入者/);
+  assert.equal(acknowledgements[0].content.includes('桌面端占用'), false);
 
   const delivered = await dispatchContinuation(listContinuations(state)[0], dependencies);
   assert.equal(delivered.status, 'started');
@@ -1565,6 +1642,82 @@ test('dispatch queues an active writer, retries delivery, and preserves legacy r
   assert.equal(listContinuations(state)[0].status, 'delivered');
   assert.match(acknowledgements[1].content, /排队回复现已送达/);
   assert.equal(persisted.length >= 2, true);
+});
+
+test('an active-writer downgrade durably records its structured blocking reason', async () => {
+  const state = createEmptyInboxState();
+  const snapshots = [];
+  const request = createContinuationRequest({
+    source: 'slash', requestId: 'active-writer-reason', threadId: 'root-1', text: 'continue',
+  });
+
+  const result = await dispatchContinuation(request, {
+    state,
+    encryptText: async () => 'opaque-ciphertext',
+    persistState: async (snapshot) => { snapshots.push(structuredClone(snapshot)); },
+    resumeCodexThread: async () => { throw new Error('thread already has an active writer'); },
+  });
+
+  assert.deepEqual(
+    { status: result.status, reason: result.reason },
+    { status: 'queued', reason: 'active-writer' },
+  );
+  assert.equal(listContinuations(state)[0].blockedReason, 'active-writer');
+  assert.equal(listContinuations(snapshots.at(-1))[0].blockedReason, 'active-writer');
+});
+
+test('claiming a blocked continuation clears the stale active-writer reason before resume', async () => {
+  const state = createEmptyInboxState();
+  const queued = enqueueContinuation(state, {
+    ...createContinuationRequest({ source: 'slash', requestId: 'clear-blocked-on-claim', threadId: 'root-1', text: 'continue' }),
+    encryptedText: 'opaque-ciphertext',
+  });
+  queued.blockedReason = 'active-writer';
+
+  const result = await dispatchContinuation(queued, {
+    state,
+    decryptText: async () => 'continue',
+    persistState: async () => {},
+    resumeCodexThread: async () => {
+      assert.equal(Object.hasOwn(state.pendingContinuations[queued.queueId], 'blockedReason'), false);
+      return { turnId: 'turn-cleared', completion: Promise.resolve({ turn: { status: 'completed' } }) };
+    },
+  });
+
+  assert.equal(result.status, 'started');
+  assert.equal(Object.hasOwn(state.pendingContinuations[queued.queueId], 'blockedReason'), false);
+});
+
+test('state migration removes active-writer reasons from non-queued continuation states', () => {
+  const state = createEmptyInboxState();
+  const failed = enqueueContinuation(state, {
+    ...createContinuationRequest({ source: 'slash', requestId: 'stale-blocked-failed', threadId: 'root-1', text: 'continue' }),
+    encryptedText: 'opaque-ciphertext', status: 'failed',
+  });
+  failed.blockedReason = 'active-writer';
+
+  migrateInboxState(state);
+
+  assert.equal(Object.hasOwn(state.pendingContinuations[failed.queueId], 'blockedReason'), false);
+});
+
+test('a failed retry cannot retain a stale active-writer reason', async () => {
+  const state = createEmptyInboxState();
+  const queued = enqueueContinuation(state, {
+    ...createContinuationRequest({ source: 'slash', requestId: 'clear-blocked-on-failure', threadId: 'root-1', text: 'continue' }),
+    encryptedText: 'opaque-ciphertext',
+  });
+  queued.blockedReason = 'active-writer';
+
+  const result = await dispatchContinuation(queued, {
+    state,
+    decryptText: async () => 'continue',
+    persistState: async () => {},
+    resumeCodexThread: async () => { throw new Error('task not found'); },
+  });
+
+  assert.equal(result.status, 'failed');
+  assert.equal(Object.hasOwn(state.pendingContinuations[queued.queueId], 'blockedReason'), false);
 });
 
 test('a queued retry that cannot resume becomes failed instead of claiming delivery', async () => {

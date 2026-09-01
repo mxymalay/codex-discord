@@ -72,7 +72,7 @@ function validContinuationEntry(key, value, { allowLegacyPlaintext = false } = {
     'channelId', 'replyToMessageId', 'referencedMessageId', 'mapping', 'createdAt',
     'queuedAt', 'lastAttemptAt', 'attempts', 'status', 'submittingAt', 'submittedAt',
     'uncertainAt', 'confirmedAt', 'ackClaimedAt', 'deliveredAt', 'cancelledAt',
-    'failedAt', 'failureReason', 'turnId',
+    'failedAt', 'failureReason', 'blockedReason', 'turnId',
   ]);
   if (allowLegacyPlaintext) allowed.add('text');
   const timestamps = [
@@ -88,6 +88,7 @@ function validContinuationEntry(key, value, { allowLegacyPlaintext = false } = {
     timestamps.slice(2).every(isOptionalTimestamp) &&
     ['cwd', 'encryptedText', 'summary', 'channelId', 'replyToMessageId',
       'referencedMessageId', 'failureReason', 'turnId'].every((field) => isOptionalString(value[field])) &&
+    (value.blockedReason === undefined || value.blockedReason === 'active-writer') &&
     (!allowLegacyPlaintext || isOptionalString(value.text)) && validMapping(value.mapping);
 }
 
@@ -398,6 +399,9 @@ export function migrateInboxState(candidate) {
   state.pendingContinuations = state.pendingContinuations && typeof state.pendingContinuations === 'object'
     ? state.pendingContinuations
     : {};
+  for (const pending of Object.values(state.pendingContinuations)) {
+    if (pending?.status !== 'queued') delete pending.blockedReason;
+  }
   state.processedInteractions = Array.isArray(state.processedInteractions)
     ? state.processedInteractions.slice(-MAX_PROCESSED_INTERACTIONS)
     : [];
@@ -506,6 +510,7 @@ export function recoverContinuationAttempts(state, now = new Date().toISOString(
     if (item?.status === 'resuming') {
       item.status = 'queued';
       item.failureReason = undefined;
+      delete item.blockedReason;
       if (item.source === 'slash') {
         recordProcessedInteraction(state, item.requestId, { status: 'queued', queueId: item.queueId }, now);
       }
@@ -513,6 +518,7 @@ export function recoverContinuationAttempts(state, now = new Date().toISOString(
       item.status = 'start-uncertain';
       item.uncertainAt = String(now);
       item.failureReason = 'start-outcome-uncertain';
+      delete item.blockedReason;
       if (item.source === 'slash') {
         recordProcessedInteraction(state, item.requestId, {
           status: 'uncertain', queueId: item.queueId, reason: 'start-outcome-uncertain',
@@ -520,6 +526,7 @@ export function recoverContinuationAttempts(state, now = new Date().toISOString(
       }
     } else if (item?.status === 'acknowledging') {
       item.status = 'confirmed-start';
+      delete item.blockedReason;
     }
   }
   pruneContinuationHistory(state);
@@ -532,6 +539,7 @@ export function markContinuationDelivered(state, queueId, now = new Date().toISO
   if (item.status === 'cancelled') return { status: 'cancelled', queueId: item.queueId };
   item.status = 'delivered';
   item.deliveredAt = String(now);
+  delete item.blockedReason;
   pruneContinuationHistory(state);
   return item;
 }
@@ -675,7 +683,9 @@ export async function dispatchContinuation(request, dependencies = {}) {
       if (['confirmed-start', 'delivered'].includes(existing.status)) {
         return { status: 'started', queueId: existing.queueId, turnId: existing.turnId };
       }
-      if (existing.status === 'queued') return { status: 'queued', queueId: existing.queueId };
+      if (existing.status === 'queued') {
+        return { status: 'queued', queueId: existing.queueId, reason: existing.blockedReason };
+      }
       return { status: 'failed', queueId: existing.queueId, reason: ['resuming', 'submitting', 'attempting', 'start-submitted', 'acknowledging'].includes(existing.status) ? 'attempt-in-progress' : existing.failureReason ?? existing.status };
     }
     const processed = source === 'slash' ? processedInteraction(state, requestId) : null;
@@ -768,6 +778,7 @@ export async function dispatchContinuation(request, dependencies = {}) {
           return;
         }
         current.status = 'resuming';
+        delete current.blockedReason;
         current.lastAttemptAt = now;
         current.attempts = Number(current.attempts ?? 0) + 1;
         if (source === 'slash') recordProcessedInteraction(state, requestId, { status: 'resuming', queueId: current.queueId }, now);
@@ -847,7 +858,10 @@ export async function dispatchContinuation(request, dependencies = {}) {
         await persistMutation(state, dependencies.persistState, () => {
           const queued = state.pendingContinuations[existing.queueId];
           queued.status = 'queued';
-          if (source === 'slash') recordProcessedInteraction(state, requestId, { status: 'queued', queueId: queued.queueId }, now);
+          queued.blockedReason = 'active-writer';
+          if (source === 'slash') recordProcessedInteraction(state, requestId, {
+            status: 'queued', queueId: queued.queueId, reason: 'active-writer',
+          }, now);
         }, [existing.queueId]);
       } catch {
         await withInboxStateLock(state, () => {
@@ -859,12 +873,12 @@ export async function dispatchContinuation(request, dependencies = {}) {
         });
         return { status: 'failed', queueId: existing.queueId, reason: 'state-persist-failed' };
       }
-      const result = { status: 'queued', queueId: existing.queueId };
+      const result = { status: 'queued', queueId: existing.queueId, reason: 'active-writer' };
       if (!wasQueuedRequest) {
         await acknowledgeContinuation(
           dependencies,
           normalized,
-          '⏳ 已排队：原 Codex 任务目前正被桌面端占用；任务释放后会自动送达，无需再次回复。',
+          '⏳ 已排队：原 Codex 任务目前正被其他写入者占用；任务释放后会自动送达，无需再次回复。',
         ).catch(() => {});
       }
       return result;
@@ -876,6 +890,7 @@ export async function dispatchContinuation(request, dependencies = {}) {
           uncertain.status = 'start-uncertain';
           uncertain.uncertainAt = now;
           uncertain.failureReason = 'start-outcome-uncertain';
+          delete uncertain.blockedReason;
           if (source === 'slash') recordProcessedInteraction(state, requestId, {
             status: 'uncertain', queueId: uncertain.queueId, reason: 'start-outcome-uncertain',
           }, now);
@@ -891,6 +906,7 @@ export async function dispatchContinuation(request, dependencies = {}) {
         failed.status = 'failed';
         failed.failedAt = now;
         failed.failureReason = 'resume-failed';
+        delete failed.blockedReason;
         if (source === 'slash') recordProcessedInteraction(state, requestId, { status: 'failed', queueId: failed.queueId, reason: 'resume-failed' }, now);
       }, [existing.queueId]);
     } catch {
@@ -905,6 +921,7 @@ export async function dispatchContinuation(request, dependencies = {}) {
     await persistMutation(state, dependencies.persistState, () => {
       const confirmed = state.pendingContinuations[existing.queueId];
       confirmed.status = source === 'slash' ? 'delivered' : 'confirmed-start';
+      delete confirmed.blockedReason;
       confirmed.confirmedAt = now;
       if (source === 'slash') confirmed.deliveredAt = now;
       confirmed.turnId = turnId;

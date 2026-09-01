@@ -880,6 +880,8 @@ export function createProductionBridgeDependencies({
   runCodexControlActionImpl = runCodexControlAction,
   createInteractionRestClientImpl = createInteractionRestClient,
   createInteractionRouterImpl = createInteractionRouter,
+  startContinuationImpl = startContinuation,
+  sendDiscordReplyImpl = sendDiscordReply,
 } = {}) {
   let taskIndexCommitTail = Promise.resolve();
   const enqueueTaskIndexOperation = (operation) => {
@@ -985,6 +987,18 @@ export function createProductionBridgeDependencies({
       const rest = createInteractionRestClientImpl({ applicationId: context.config.discordApplicationId });
       const readQuota = () => readJsonFile(quotaStatePath, { observedAt: null, limits: [] });
       const api = (route) => context.trackDiscordRest(() => discordRequest({ token: context.token, route }));
+      const trackedReply = (payload) => context.trackDiscordRest(() => sendDiscordReplyImpl({
+        token: context.token,
+        ...payload,
+      }));
+      const continuePersistedRequest = (request) => startContinuationImpl({
+        token: context.token,
+        config: context.config,
+        state: context.inboxState,
+        request,
+        trackActiveResource: context.trackActiveResource,
+        sendReply: trackedReply,
+      });
       const healthDependencies = {
         config: context.config,
         loadToken: () => loadDiscordToken({ toolDir, powershellPath: context.executables.powershellPath }),
@@ -1043,14 +1057,17 @@ export function createProductionBridgeDependencies({
         }),
         dispatchContinuation: async (request) => {
           try {
-            return await startContinuation({
-              token: context.token,
-              config: context.config,
-              state: context.inboxState,
-              request,
-              trackActiveResource: context.trackActiveResource,
-              sendReply: (payload) => context.trackDiscordRest(() => sendDiscordReply({ token: context.token, ...payload })),
-            });
+            return await continuePersistedRequest(request);
+          } finally {
+            context.publishHealth?.();
+          }
+        },
+        retryContinuation: async (queueId) => {
+          const item = listContinuations(context.inboxState).find((entry) =>
+            entry.queueId === String(queueId) && entry.status === 'queued');
+          if (!item) return { status: 'failed', reason: 'not-found' };
+          try {
+            return await continuePersistedRequest(item);
           } finally {
             context.publishHealth?.();
           }
