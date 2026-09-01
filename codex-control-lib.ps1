@@ -360,6 +360,7 @@ function New-CodexControlOperations {
             [void]$process.Handle
             return [pscustomobject]@{ ProcessId=$process.Id; StartTimeUtc=$process.StartTime.ToUniversalTime(); Process=$process }
         }
+        CloseBridgeProcess = { param($BoundProcess) $BoundProcess.Process.Dispose() }
         StopRuntimeTree = {
             param([Parameter(Mandatory)][object]$BoundProcess)
             $BoundProcess.Process.Kill($true)
@@ -387,7 +388,7 @@ function New-CodexControlOperations {
         OpenBridgeJob = { param([string]$ToolDir) Initialize-BridgeJobNative; $h=[CodexBridgeJobNative]::OpenJobObject(0xC,$false,(Get-BridgeJobName $ToolDir)); if($h -eq [IntPtr]::Zero){throw 'bridge-job-open-failed'}; [pscustomobject]@{Handle=$h} }
         TestBridgeJobMembership = { param($Job,$Bound) $v=$false; if(-not [CodexBridgeJobNative]::IsProcessInJob($Bound.Process.Handle,$Job.Handle,[ref]$v)){throw 'bridge-job-membership-failed'}; $v }
         TerminateBridgeJob = { param($Job) if(-not [CodexBridgeJobNative]::TerminateJobObject($Job.Handle,1)){throw 'bridge-job-terminate-failed'} }
-        GetBridgeJobActiveProcesses = { param($Job) $a=New-Object CodexBridgeJobNative+Accounting; if(-not [CodexBridgeJobNative]::QueryInformationJobObject($Job.Handle,1,[ref]$a,[Runtime.InteropServices.Marshal]::SizeOf($a),[IntPtr]::Zero)){throw 'bridge-job-query-failed'}; [int]$a.active }
+        GetBridgeJobActiveProcesses = { param($Job) $a=New-Object CodexBridgeJobNative+Accounting; if(-not [CodexBridgeJobNative]::QueryInformationJobObject($Job.Handle,1,[ref]$a,[Runtime.InteropServices.Marshal]::SizeOf($a),[IntPtr]::Zero)){throw 'bridge-job-query-failed'}; [int]$a.ActiveProcesses }
         CloseBridgeJob = { param($Job) Close-BridgeJob $Job.Handle }
     }
 }
@@ -408,6 +409,7 @@ function Stop-CodexBridgeRuntime {
         [Parameter(Mandatory)][object]$Runtime,
         [Parameter(Mandatory)][hashtable]$Operations,
         [string]$ToolDir,
+        [scriptblock]$BeforeTerminate,
         [ValidateRange(1,30000)][int]$TimeoutMilliseconds = 5000
     )
 
@@ -422,6 +424,7 @@ function Stop-CodexBridgeRuntime {
             $job=& $Operations.OpenBridgeJob $ToolDir
             try {
                 if(-not (& $Operations.TestBridgeJobMembership $job $bound)){return [pscustomobject]@{ok=$false;errorCategory='runtime-job-membership-failed'}}
+                if ($null -ne $BeforeTerminate) { & $BeforeTerminate }
                 & $Operations.TerminateBridgeJob $job
                 $deadline=[Environment]::TickCount64+$TimeoutMilliseconds
                 do { if((& $Operations.GetBridgeJobActiveProcesses $job) -eq 0){break}; if([Environment]::TickCount64 -ge $deadline){return [pscustomobject]@{ok=$false;errorCategory='runtime-stop-timeout'}}; if($Operations.ContainsKey('Sleep')){& $Operations.Sleep 10} } while($true)
@@ -443,6 +446,7 @@ function Stop-CodexBridgeRuntime {
         return [pscustomobject]@{ ok=$true }
     }
     catch { return [pscustomobject]@{ ok=$false; errorCategory='runtime-stop-failed' } }
+    finally { if ($null -ne $bound -and $Operations.ContainsKey('CloseBridgeProcess')) { & $Operations.CloseBridgeProcess $bound } }
 }
 
 function Get-CodexBridgeServiceStatus {
@@ -465,9 +469,10 @@ function Get-CodexBridgeServiceStatus {
         else {
             $candidate = Read-BridgeRuntimeIdentityCandidate -Path (Join-Path $ToolDir 'discord-bridge-runtime.json') -ToolDir $ToolDir
             if ($null -ne $candidate -and $Operations.ContainsKey('OpenBridgeProcess') -and $Operations.OpenBridgeProcess -is [scriptblock]) {
-                try {
-                    $bound = & $Operations.OpenBridgeProcess ([int]$candidate.processId)
-                    if (Test-CodexBridgeBoundRuntimeIdentity -BoundProcess $bound -Runtime $candidate) { $runtime = $candidate }
+            try {
+                $bound = & $Operations.OpenBridgeProcess ([int]$candidate.processId)
+                try { if (Test-CodexBridgeBoundRuntimeIdentity -BoundProcess $bound -Runtime $candidate) { $runtime = $candidate } }
+                finally { if ($Operations.ContainsKey('CloseBridgeProcess')) { & $Operations.CloseBridgeProcess $bound } }
                 }
                 catch {}
             }
@@ -524,7 +529,7 @@ function Invoke-CodexBridgeServiceAction {
                 }
             }
             'stop-temporary' {
-                if ($status.runtime -and $status.runtime.mode -eq 'scheduled') { & $Operations.StopTask }
+                if ($status.runtime -and $status.runtime.mode -eq 'scheduled') { if($Operations.ContainsKey('OpenBridgeJob')){$stopped=Stop-CodexBridgeRuntime -Runtime $status.runtime -Operations $Operations -ToolDir $ToolDir -BeforeTerminate { & $Operations.StopTask } -TimeoutMilliseconds ($PollAttempts*[Math]::Max(1,$PollMilliseconds));if(-not $stopped.ok){return New-ServiceActionFailure $stopped.errorCategory}}else{& $Operations.StopTask} }
                 elseif ($status.running) {
                     if ($Operations.ContainsKey('StopRuntimeTree')) { $stopped = Stop-CodexBridgeRuntime -Runtime $status.runtime -Operations $Operations -ToolDir $ToolDir -TimeoutMilliseconds ($PollAttempts * [Math]::Max(1,$PollMilliseconds)); if (-not $stopped.ok) { return New-ServiceActionFailure $stopped.errorCategory } }
                     else { & $Operations.StopRuntime $status.runtime }
@@ -542,7 +547,7 @@ function Invoke-CodexBridgeServiceAction {
             }
             'disable-long-term' {
                 if ($status.taskInstalled) { & $Operations.DisableTask }
-                if ($status.runtime -and $status.runtime.mode -eq 'scheduled') { & $Operations.StopTask }
+                if ($status.runtime -and $status.runtime.mode -eq 'scheduled') { if($Operations.ContainsKey('OpenBridgeJob')){$stopped=Stop-CodexBridgeRuntime -Runtime $status.runtime -Operations $Operations -ToolDir $ToolDir -BeforeTerminate { & $Operations.StopTask } -TimeoutMilliseconds ($PollAttempts*[Math]::Max(1,$PollMilliseconds));if(-not $stopped.ok){return New-ServiceActionFailure $stopped.errorCategory}}else{& $Operations.StopTask} }
                 elseif ($status.running) {
                     if ($Operations.ContainsKey('StopRuntimeTree')) { $stopped = Stop-CodexBridgeRuntime -Runtime $status.runtime -Operations $Operations -ToolDir $ToolDir -TimeoutMilliseconds ($PollAttempts * [Math]::Max(1,$PollMilliseconds)); if (-not $stopped.ok) { return New-ServiceActionFailure $stopped.errorCategory } }
                     else { & $Operations.StopRuntime $status.runtime }

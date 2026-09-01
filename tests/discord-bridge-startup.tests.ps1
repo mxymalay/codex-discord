@@ -7,6 +7,18 @@ $ErrorActionPreference = 'Stop'
 $sourceRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $sourceRoot 'discord-bridge-startup.ps1')
 
+Initialize-BridgeJobNative
+if ([IntPtr]::Size -eq 8 -and (([Runtime.InteropServices.Marshal]::SizeOf([type]'CodexBridgeJobNative+Basic') -ne 64) -or ([Runtime.InteropServices.Marshal]::SizeOf([type]'CodexBridgeJobNative+Io') -ne 48) -or ([Runtime.InteropServices.Marshal]::SizeOf([type]'CodexBridgeJobNative+Extended') -ne 144) -or ([Runtime.InteropServices.Marshal]::SizeOf([type]'CodexBridgeJobNative+Accounting') -ne 48))) { throw 'Job Object ABI layout is invalid on x64' }
+$emptyJob = [CodexBridgeJobNative]::CreateJobObject([IntPtr]::Zero, ('Local\CodexBridgeAbiTest-' + [guid]::NewGuid().ToString('N')))
+try {
+    if ($emptyJob -eq [IntPtr]::Zero) { throw 'could not create safe empty Job Object' }
+    $extended = New-Object CodexBridgeJobNative+Extended; $extended.basic.LimitFlags = 0x2000
+    if (-not [CodexBridgeJobNative]::SetInformationJobObject($emptyJob, 9, [ref]$extended, [Runtime.InteropServices.Marshal]::SizeOf($extended))) { throw 'empty Job Object rejected extended limit ABI' }
+    $accounting = New-Object CodexBridgeJobNative+Accounting
+    if (-not [CodexBridgeJobNative]::QueryInformationJobObject($emptyJob, 1, [ref]$accounting, [Runtime.InteropServices.Marshal]::SizeOf($accounting), [IntPtr]::Zero) -or $accounting.ActiveProcesses -ne 0) { throw 'empty Job Object accounting ABI is invalid' }
+}
+finally { if ($emptyJob -ne [IntPtr]::Zero) { [CodexBridgeJobNative]::CloseHandle($emptyJob) | Out-Null } }
+
 $definition = Get-DiscordBridgeTaskDefinition `
     -ToolDir 'G:\tools\mobile-notify' `
     -PowerShellPath 'C:\Program Files\PowerShell\7\pwsh.exe'
