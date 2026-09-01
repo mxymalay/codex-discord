@@ -15,6 +15,35 @@ function Get-ControlPathHash {
     }
 }
 
+function Initialize-BridgeJobNative {
+    if ('CodexBridgeJobNative' -as [type]) { return }
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class CodexBridgeJobNative {
+ [StructLayout(LayoutKind.Sequential)] public struct Basic { public long a,b; public uint flags; public UIntPtr min,max; public uint affinity,priority,scheduling; }
+ [StructLayout(LayoutKind.Sequential)] public struct Io { public ulong a,b,c,d,e,f; }
+ [StructLayout(LayoutKind.Sequential)] public struct Extended { public Basic basic; public Io io; public UIntPtr process,job; public UIntPtr peakProcess,peakJob; }
+ [StructLayout(LayoutKind.Sequential)] public struct Accounting { public long a,b; public uint active,total,terminated; public UIntPtr reserved; }
+ [DllImport("kernel32.dll",SetLastError=true,CharSet=CharSet.Unicode)] public static extern IntPtr CreateJobObject(IntPtr a,string n);
+ [DllImport("kernel32.dll",SetLastError=true,CharSet=CharSet.Unicode)] public static extern IntPtr OpenJobObject(uint access,bool inherit,string n);
+ [DllImport("kernel32.dll",SetLastError=true)] public static extern bool SetInformationJobObject(IntPtr j,int c,ref Extended i,int l);
+ [DllImport("kernel32.dll",SetLastError=true)] public static extern bool QueryInformationJobObject(IntPtr j,int c,out Accounting i,int l,IntPtr r);
+ [DllImport("kernel32.dll",SetLastError=true)] public static extern bool AssignProcessToJobObject(IntPtr j,IntPtr p);
+ [DllImport("kernel32.dll",SetLastError=true)] public static extern bool IsProcessInJob(IntPtr p,IntPtr j,out bool v);
+ [DllImport("kernel32.dll",SetLastError=true)] public static extern bool TerminateJobObject(IntPtr j,uint e);
+ [DllImport("kernel32.dll",SetLastError=true)] public static extern bool CloseHandle(IntPtr h);
+}
+'@
+}
+function Get-BridgeJobName { param([Parameter(Mandatory)][string]$ToolDir) return ('Local\CodexDiscordBridgeJob-' + (Get-ControlPathHash $ToolDir)) }
+function New-BridgeSupervisorJob {
+ param([Parameter(Mandatory)][string]$ToolDir,[Parameter(Mandatory)][System.Diagnostics.Process]$Process)
+ Initialize-BridgeJobNative; $job=[CodexBridgeJobNative]::CreateJobObject([IntPtr]::Zero,(Get-BridgeJobName $ToolDir)); if($job -eq [IntPtr]::Zero){throw 'bridge-job-create-failed'}
+ try { $info=New-Object CodexBridgeJobNative+Extended; $info.basic.flags=0x2000; if(-not [CodexBridgeJobNative]::SetInformationJobObject($job,9,[ref]$info,[Runtime.InteropServices.Marshal]::SizeOf($info))){throw 'bridge-job-configure-failed'}; [void]$Process.Handle; if(-not [CodexBridgeJobNative]::AssignProcessToJobObject($job,$Process.Handle)){throw 'bridge-job-assign-failed'}; return $job } catch { [CodexBridgeJobNative]::CloseHandle($job)|Out-Null; throw }
+}
+function Close-BridgeJob { param([IntPtr]$Handle) if($Handle -ne [IntPtr]::Zero){[CodexBridgeJobNative]::CloseHandle($Handle)|Out-Null} }
+
 function ConvertTo-BridgeRuntimeTimeUtc {
     [CmdletBinding()]
     param([AllowNull()][object]$Value)

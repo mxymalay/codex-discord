@@ -378,6 +378,33 @@ try {
         WaitForRuntimeRelease = { param($milliseconds) $true }
     } -TimeoutMilliseconds 1
     if ($childStop.ok -or $childStop.errorCategory -ne 'runtime-stop-timeout') { throw 'a live child after root exit was accepted as a complete stop' }
+
+    $jobEvents = [System.Collections.Generic.List[string]]::new()
+    $jobMismatch = Stop-CodexBridgeRuntime -Runtime ([pscustomobject]@{ processId=708; creationTimeUtc='2026-09-01T13:00:00.0000000Z'; mode='temporary' }) -Operations @{
+        OpenBridgeProcess = { param($id) [pscustomobject]@{ ProcessId=708; StartTimeUtc='2026-09-01T13:00:00.0000000Z'; Process=[pscustomobject]@{} } }
+        OpenBridgeJob = { param($toolDir) [pscustomobject]@{ Handle='job' } }
+        TestBridgeJobMembership = { param($job,$bound) $false }
+        TerminateBridgeJob = { param($job) $jobEvents.Add('terminate') }
+        GetBridgeJobActiveProcesses = { param($job) 0 }
+        WaitForRuntimeRelease = { param($milliseconds) $true }
+        CloseBridgeJob = { param($job) $jobEvents.Add('close') }
+        Sleep = { param($milliseconds) }
+    } -ToolDir $reviewRuntimeRoot -TimeoutMilliseconds 1
+    if ($jobMismatch.ok -or $jobMismatch.errorCategory -ne 'runtime-job-membership-failed' -or $jobEvents -contains 'terminate') { throw 'job membership mismatch did not fail before termination' }
+
+    $lateChildState = @{ active=1; starts=0 }
+    $lateChildOps = @{
+        OpenBridgeProcess = { param($id) [pscustomobject]@{ ProcessId=709; StartTimeUtc='2026-09-01T13:00:00.0000000Z'; Process=[pscustomobject]@{} } }
+        OpenBridgeJob = { param($toolDir) [pscustomobject]@{ Handle='job' } }
+        TestBridgeJobMembership = { param($job,$bound) $true }
+        TerminateBridgeJob = { param($job) }
+        GetBridgeJobActiveProcesses = { param($job) $lateChildState.active }
+        WaitForRuntimeRelease = { param($milliseconds) $true }
+        CloseBridgeJob = { param($job) }
+        Sleep = { param($milliseconds) }
+    }
+    $lateChildStop = Stop-CodexBridgeRuntime -Runtime ([pscustomobject]@{ processId=709; creationTimeUtc='2026-09-01T13:00:00.0000000Z'; mode='temporary' }) -Operations $lateChildOps -ToolDir $reviewRuntimeRoot -TimeoutMilliseconds 1
+    if ($lateChildStop.ok -or $lateChildStop.errorCategory -ne 'runtime-stop-timeout') { throw 'a child joining the job after validation did not block handoff' }
 }
 finally {
     Remove-Item -LiteralPath $reviewRuntimeRoot -Recurse -Force -ErrorAction SilentlyContinue
