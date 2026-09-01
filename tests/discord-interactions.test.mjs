@@ -499,17 +499,28 @@ test('callback rechecks elapsed time after an oversleep before sending a retry',
 
 test('an explicit zero elapsed budget sends the initial request but disables every retry', async () => {
   let calls = 0;
+  let parseCalls = 0;
+  let timerCalls = 0;
   const sleeps = [];
   const client = createInteractionRestClient({
     applicationId: '111',
     callbackRetry: { maxElapsedMs: 0 },
+    setTimeoutImpl: (callback, milliseconds) => {
+      timerCalls += 1;
+      return setTimeout(callback, milliseconds);
+    },
     sleepImpl: async (milliseconds) => { sleeps.push(milliseconds); },
     fetchImpl: async () => {
       calls += 1;
-      return new Response(JSON.stringify({ retry_after: 0 }), {
+      return {
+        ok: false,
         status: 429,
-        headers: { 'Content-Type': 'application/json' },
-      });
+        headers: new Headers({ 'Content-Type': 'application/json' }),
+        async json() {
+          parseCalls += 1;
+          return { retry_after: 0 };
+        },
+      };
     },
   });
 
@@ -518,6 +529,8 @@ test('an explicit zero elapsed budget sends the initial request but disables eve
     /Discord interaction request failed: 429/,
   );
   assert.equal(calls, 1);
+  assert.equal(parseCalls, 0);
+  assert.equal(timerCalls, 0);
   assert.deepEqual(sleeps, []);
 });
 

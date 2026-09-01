@@ -126,6 +126,29 @@ async function fetchAttempt(fetchImpl, url, method, body, {
   }
 }
 
+async function untimedInitialRequest(fetchImpl, url, method, body) {
+  let response;
+  try {
+    response = await fetchImpl(url, {
+      method,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+  } catch {
+    throw new Error('Discord interaction request failed: network');
+  }
+  const status = Number(response?.status);
+  if (!isSuccessful(response)) {
+    throw new Error(`Discord interaction request failed: ${status || 'unknown'}`);
+  }
+  if (status === 204) return null;
+  try {
+    return typeof response?.json === 'function' ? await response.json() : null;
+  } catch {
+    return null;
+  }
+}
+
 async function discordRequest(fetchImpl, url, method, body, {
   now,
   sleepImpl,
@@ -133,6 +156,9 @@ async function discordRequest(fetchImpl, url, method, body, {
   setTimeoutImpl,
   clearTimeoutImpl,
 }) {
+  if (policy.maxElapsedMs === 0) {
+    return untimedInitialRequest(fetchImpl, url, method, body);
+  }
   const startedAt = Number(now());
   for (let attempt = 1; attempt <= policy.maxAttempts; attempt += 1) {
     const elapsedBeforeRequest = Math.max(0, Number(now()) - startedAt);
