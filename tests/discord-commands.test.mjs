@@ -169,3 +169,15 @@ test('supports direct user interactions and private mention-safe responses', asy
     allowed_mentions: { parse: [] },
   });
 });
+
+test('private response helper overrides caller-supplied public flags and mention policy', () => {
+  assert.deepEqual(ephemeral({
+    content: '@everyone',
+    flags: 0,
+    allowed_mentions: { parse: ['everyone', 'users', 'roles'] },
+  }), {
+    content: '@everyone',
+    flags: 64,
+    allowed_mentions: { parse: [] },
+  });
+});
