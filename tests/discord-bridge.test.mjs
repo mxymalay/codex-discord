@@ -245,6 +245,49 @@ test('corrupt inbox is preserved while an isolated read-only bridge still starts
   }
 });
 
+test('restart preserves a valid projectless created-task workspace without corrupt recovery', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-projectless-inbox-'));
+  const inboxPath = path.join(root, 'discord-inbox-state.json');
+  const interactionId = 'projectless-created-task';
+  const createdTask = {
+    status: 'started',
+    threadId: 'thread-projectless',
+    turnId: 'turn-projectless',
+    taskName: 'Projectless task',
+    workspace: {
+      mode: 'projectless',
+      cwd: 'C:\\tasks',
+      runtimeWorkspaceRoots: ['C:\\tasks'],
+      operationId: interactionId,
+    },
+  };
+  const persisted = {
+    ...createEmptyInboxState(),
+    createdTasksByInteraction: { [interactionId]: createdTask },
+  };
+
+  try {
+    await fs.writeFile(inboxPath, JSON.stringify(persisted), 'utf8');
+    const bridgeModule = await import('../discord-bridge.mjs');
+    const logCategories = [];
+    const loaded = await bridgeModule.loadInboxStateWithRecovery({
+      inboxPath,
+      encryptText: async () => { throw new Error('valid v2 state must not require legacy migration'); },
+      persistState: async () => {},
+      writeLog: async (category) => { logCategories.push(category); },
+    });
+
+    assert.deepEqual(logCategories, []);
+    assert.deepEqual(loaded.state.createdTasksByInteraction[interactionId], createdTask);
+    assert.equal(loaded.readOnly, false);
+    assert.equal(loaded.errorCategory, null);
+    const backups = (await fs.readdir(root)).filter((entry) => entry.includes('.corrupt-'));
+    assert.equal(backups.length, 0);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 test('persistent Node and PowerShell guard logs keep only stable operational fields', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-stable-logs-'));
   const nodeLogPath = path.join(root, 'discord-bridge.log');

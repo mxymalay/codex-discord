@@ -105,7 +105,7 @@ function validWorkspace(value) {
     'mode', 'cwd', 'runtimeWorkspaceRoots', 'branchName', 'worktreePath', 'operationId',
     'sourceRoot', 'repositoryRoot',
   ]);
-  return isRecord(value) && hasOnlyKeys(value, allowed) && ['local', 'worktree'].includes(value.mode) &&
+  return isRecord(value) && hasOnlyKeys(value, allowed) && ['local', 'worktree', 'projectless'].includes(value.mode) &&
     isNonEmptyString(value.cwd) && Array.isArray(value.runtimeWorkspaceRoots) &&
     value.runtimeWorkspaceRoots.every(isNonEmptyString) && isOptionalString(value.branchName) &&
     isOptionalString(value.worktreePath) && isNonEmptyString(value.operationId) &&
