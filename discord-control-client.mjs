@@ -147,7 +147,7 @@ function sanitizeHealth(status) {
 }
 
 /** Atomically replace a same-directory, sanitized bridge health snapshot. */
-export async function writeBridgeHealthAtomicLegacy(targetPath, status, { fsImpl = fs, signal, shouldCommit = () => !signal?.aborted, bypassQueue = false } = {}) {
+async function writeBridgeHealthAtomicLegacy(targetPath, status, { fsImpl = fs, signal, shouldCommit = () => !signal?.aborted, bypassQueue = false } = {}) {
   const canCommit = () => !signal?.aborted && shouldCommit();
   if (!canCommit()) return;
   const queueKey = path.resolve(targetPath);
@@ -207,11 +207,11 @@ function launchOrdinary(state) {
   const request = state.pendingOrdinary;
   if (!request || state.activeOrdinary) return;
   state.pendingOrdinary = null; state.activeOrdinary = request;
-  prepareWrite(request, state).catch(() => {}).finally(() => { request.resolve(); state.activeOrdinary = null; launchOrdinary(state); });
+  prepareWrite(request, state).then(request.resolve, request.reject).finally(() => { state.activeOrdinary = null; launchOrdinary(state); });
 }
 export function writeBridgeHealthAtomic(targetPath, status, { fsImpl = fs, signal, shouldCommit = () => !signal?.aborted, bypassQueue = false } = {}) {
   const state = stateFor(targetPath);
-  const request = { targetPath, status, fsImpl, signal, shouldCommit, resolve: null };
-  if (bypassQueue) return prepareWrite(request, state).catch(() => {});
-  return new Promise((resolve) => { request.resolve = resolve; if (state.pendingOrdinary) state.pendingOrdinary.resolve(); state.pendingOrdinary = request; launchOrdinary(state); });
+  const request = { targetPath, status, fsImpl, signal, shouldCommit, resolve: null, reject: null };
+  if (bypassQueue) return prepareWrite(request, state);
+  return new Promise((resolve, reject) => { request.resolve = resolve; request.reject = reject; if (state.pendingOrdinary) state.pendingOrdinary.resolve({ coalesced: true }); state.pendingOrdinary = request; launchOrdinary(state); });
 }

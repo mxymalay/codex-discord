@@ -707,12 +707,12 @@ async function startContinuation({ token, config, state, request, trackActiveRes
   return outcome;
 }
 
-async function retryPendingTurns({ token, config, state, onRetry = () => {}, trackActiveResource }) {
+async function retryPendingTurns({ token, config, state, onRetry = () => {}, trackActiveResource, sendReply }) {
   const now = Date.now();
   for (const pending of listRetryableContinuations(state)) {
     const lastAttempt = Date.parse(String(pending.lastAttemptAt ?? ''));
     if (Number.isFinite(lastAttempt) && now - lastAttempt < pendingRetryIntervalMs) continue;
-    await startContinuation({ token, config, state, request: pending, trackActiveResource });
+    await startContinuation({ token, config, state, request: pending, trackActiveResource, sendReply });
     onRetry();
   }
 }
@@ -955,6 +955,7 @@ function createProductionBridgeDependencies({ runOnce = false } = {}) {
       const config = context.config;
       const token = context.token;
       const state = context.inboxState;
+      const trackedReply = (payload) => context.trackDiscordRest(() => sendDiscordReply({ token, ...payload }));
       const channelIds = [String(config.discordTaskChannelId), String(config.discordConfirmationChannelId)];
       const rolloutState = await readRolloutWatcherState(rolloutWatcherStatePath, { sessionsRoot });
       context.rolloutState = rolloutState;
@@ -1014,6 +1015,7 @@ function createProductionBridgeDependencies({ runOnce = false } = {}) {
                 state,
                 onRetry: () => context.recordActivity('lastQueueRetryAt'),
                 trackActiveResource: context.trackActiveResource,
+                sendReply: trackedReply,
               });
             } catch {
               context.setLatestErrorCategory('queue-retry-failed');
@@ -1033,7 +1035,7 @@ function createProductionBridgeDependencies({ runOnce = false } = {}) {
                     return await startContinuation({
                       ...payload,
                       trackActiveResource: context.trackActiveResource,
-                      sendReply: (reply) => context.trackDiscordRest(() => sendDiscordReply({ token, ...reply })),
+                      sendReply: trackedReply,
                     });
                   } finally {
                     context.publishHealth?.();
