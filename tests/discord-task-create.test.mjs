@@ -1091,30 +1091,48 @@ test('task creation shares the inbox commit queue with cursor updates and prunes
   assert.equal(Object.keys(state.createdTasksByInteraction).length <= 2_000, true);
 });
 
-test('failed started persistence restores the exact thread-created live record', async () => {
+test('failed started persistence observes rejected completion cleanup without hiding the persistence error', async () => {
   const state = {};
   let threadCreatedRecord = null;
   const appServerMethods = [];
+  let rejectWaitForTurn;
   const appServer = fakeAppServer(appServerMethods, {
     'thread/start': { thread: { id: 'thread-started-rollback', name: 'Task' } },
     'turn/start': { turn: { id: 'turn-started-rollback' } },
   });
-  appServer.waitForTurn = () => new Promise(() => {});
-  await assert.rejects(() => createNewTaskOnce({
-    state, interactionId: 'startedrollback1',
-    selection: { kind: 'projectless', projectId: null, projectName: '无项目', roots: ['C:\\tasks'] },
-    text: 'started rollback', fileSystem: { mkdir: async () => {} },
-    persistState: async (current) => {
-      const record = current.createdTasksByInteraction.startedrollback1;
-      if (record.status === 'thread-created') threadCreatedRecord = record;
-      if (record.status === 'started') throw new Error('final write failed');
-    },
-    clientFactory: () => appServer,
-  }), /state persistence failed/);
+  appServer.waitForTurn = () => new Promise((resolve, reject) => { rejectWaitForTurn = reject; });
+  const close = appServer.close;
+  appServer.close = () => {
+    close();
+    rejectWaitForTurn(new Error('private App Server transport failure C:\\secret'));
+  };
+  const unhandled = [];
+  const onUnhandled = (error) => unhandled.push(error);
+  process.on('unhandledRejection', onUnhandled);
+  try {
+    await assert.rejects(() => createNewTaskOnce({
+      state, interactionId: 'startedrollback1',
+      selection: { kind: 'projectless', projectId: null, projectName: '无项目', roots: ['C:\\tasks'] },
+      text: 'started rollback', fileSystem: { mkdir: async () => {} },
+      persistState: async (current) => {
+        const record = current.createdTasksByInteraction.startedrollback1;
+        if (record.status === 'thread-created') threadCreatedRecord = record;
+        if (record.status === 'started') throw new Error('final write failed');
+      },
+      clientFactory: () => appServer,
+    }), (error) => {
+      assert.equal(error.message, 'Task creation state persistence failed');
+      return true;
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(unhandled, []);
+  } finally {
+    process.off('unhandledRejection', onUnhandled);
+  }
   assert.deepEqual(state.createdTasksByInteraction.startedrollback1, threadCreatedRecord);
   assert.equal(state.createdTasksByInteraction.startedrollback1.status, 'thread-created');
   assert.equal(state.createdTasksByInteraction.startedrollback1.threadId, 'thread-started-rollback');
-  assert.equal(appServerMethods.includes('close'), true);
+  assert.equal(appServerMethods.filter((method) => method === 'close').length, 1);
 
   let externalCalls = 0;
   const duplicate = await createNewTaskOnce({

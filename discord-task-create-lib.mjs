@@ -894,7 +894,10 @@ export async function createNewTaskOnce({
         workspace: retainedWorkspace,
       };
     } catch (error) {
-      started?.close?.();
+      if (started) {
+        Promise.resolve(started.completion).catch(() => {});
+        started.close?.();
+      }
       const current = state.createdTasksByInteraction[interactionId];
       if (error?.persistenceFailure) {
         throw error;
