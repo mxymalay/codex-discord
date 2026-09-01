@@ -1,8 +1,15 @@
 import { randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
+import { StringDecoder } from 'node:string_decoder';
 
 const indexVersion = 1;
+const defaultReadLimits = Object.freeze({
+  wholeFileBytes: 16 * 1024 * 1024,
+  headBytes: 1 * 1024 * 1024,
+  tailBytes: 4 * 1024 * 1024,
+  sidebarChunkBytes: 64 * 1024,
+});
 const taskRecordFields = [
   'threadId', 'projectId', 'projectName', 'taskName', 'status', 'createdAt',
   'lastActivityAt', 'startedAt', 'completedAt', 'runtimeMs', 'rolloutPath',
@@ -23,6 +30,20 @@ function parseJsonLines(content) {
       return [];
     }
   });
+}
+
+function boundedPositiveInteger(value, fallback) {
+  const numeric = Math.floor(Number(value));
+  return Number.isSafeInteger(numeric) && numeric > 0 ? Math.min(numeric, fallback) : fallback;
+}
+
+function normalizedReadLimits(readLimits) {
+  return {
+    wholeFileBytes: boundedPositiveInteger(readLimits?.wholeFileBytes, defaultReadLimits.wholeFileBytes),
+    headBytes: boundedPositiveInteger(readLimits?.headBytes, defaultReadLimits.headBytes),
+    tailBytes: boundedPositiveInteger(readLimits?.tailBytes, defaultReadLimits.tailBytes),
+    sidebarChunkBytes: boundedPositiveInteger(readLimits?.sidebarChunkBytes, defaultReadLimits.sidebarChunkBytes),
+  };
 }
 
 function validTime(value) {
@@ -78,37 +99,56 @@ export function isUserRootSession(meta, sidebarEntry) {
   return true;
 }
 
-async function readOptionalJson(filePath, fallback) {
+async function readOptionalJson(filePath, fallback, fileSystem = fs) {
   if (!filePath) return structuredClone(fallback);
   try {
-    return JSON.parse(await fs.readFile(filePath, 'utf8'));
+    return JSON.parse(await fileSystem.readFile(filePath, 'utf8'));
   } catch {
     return structuredClone(fallback);
   }
 }
 
-async function readSidebarEntries(sessionIndexPath) {
-  let content;
+async function readSidebarEntries(sessionIndexPath, fileSystem, chunkBytes) {
+  let handle;
   try {
-    content = await fs.readFile(sessionIndexPath, 'utf8');
+    handle = await fileSystem.open(sessionIndexPath, 'r');
   } catch (error) {
     if (error?.code === 'ENOENT') return new Map();
     throw error;
   }
   const byId = new Map();
-  for (const entry of parseJsonLines(content)) {
-    const id = stringOrNull(entry?.id);
-    if (id) byId.set(identityKey(id), entry);
+  const decoder = new StringDecoder('utf8');
+  const buffer = Buffer.alloc(chunkBytes);
+  let pending = '';
+  try {
+    while (true) {
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
+      if (bytesRead === 0) break;
+      const text = pending + decoder.write(buffer.subarray(0, bytesRead));
+      const lines = text.split(/\r?\n/u);
+      pending = lines.pop() ?? '';
+      for (const entry of parseJsonLines(lines.join('\n'))) {
+        const id = stringOrNull(entry?.id);
+        if (id) byId.set(identityKey(id), entry);
+      }
+    }
+    pending += decoder.end();
+    for (const entry of parseJsonLines(pending)) {
+      const id = stringOrNull(entry?.id);
+      if (id) byId.set(identityKey(id), entry);
+    }
+  } finally {
+    await handle.close();
   }
   return byId;
 }
 
-async function listRolloutFiles(sessionsRoot) {
+async function listRolloutFiles(sessionsRoot, fileSystem) {
   const result = [];
   async function visit(directory) {
     let entries;
     try {
-      entries = await fs.readdir(directory, { withFileTypes: true });
+      entries = await fileSystem.readdir(directory, { withFileTypes: true });
     } catch (error) {
       if (error?.code === 'ENOENT') return;
       throw error;
@@ -121,6 +161,58 @@ async function listRolloutFiles(sessionsRoot) {
   }
   if (sessionsRoot) await visit(sessionsRoot);
   return result.sort((left, right) => left.localeCompare(right));
+}
+
+function standardRolloutThreadId(rolloutPath) {
+  const match = path.basename(rolloutPath).match(
+    /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/iu,
+  );
+  return stringOrNull(match?.[1]);
+}
+
+async function readBytes(filePath, start, length, fileSystem) {
+  if (length <= 0) return Buffer.alloc(0);
+  const handle = await fileSystem.open(filePath, 'r');
+  const buffer = Buffer.alloc(length);
+  let total = 0;
+  try {
+    while (total < length) {
+      const { bytesRead } = await handle.read(buffer, total, length - total, start + total);
+      if (bytesRead === 0) break;
+      total += bytesRead;
+    }
+  } finally {
+    await handle.close();
+  }
+  return buffer.subarray(0, total);
+}
+
+async function readHeadRegion(filePath, offset, limits, fileSystem) {
+  const length = Math.min(offset, limits.headBytes);
+  const raw = await readBytes(filePath, 0, length, fileSystem);
+  if (length >= offset) return { entries: parseJsonLines(raw.toString('utf8')), parsedEnd: raw.length };
+  const lastNewline = raw.lastIndexOf(0x0a);
+  const parsedEnd = lastNewline < 0 ? 0 : lastNewline + 1;
+  return { entries: parseJsonLines(raw.subarray(0, parsedEnd).toString('utf8')), parsedEnd };
+}
+
+async function readBoundedEntries(filePath, offset, limits, fileSystem, headRegion) {
+  if (offset <= limits.wholeFileBytes) {
+    const content = await readBytes(filePath, 0, offset, fileSystem);
+    return { entries: parseJsonLines(content.toString('utf8')), middleSkipped: false };
+  }
+  const head = headRegion ?? await readHeadRegion(filePath, offset, limits, fileSystem);
+  const nominalTailStart = Math.max(0, offset - limits.tailBytes);
+  const tailStart = Math.max(head.parsedEnd, nominalTailStart);
+  let tail = await readBytes(filePath, tailStart, offset - tailStart, fileSystem);
+  if (tailStart > head.parsedEnd) {
+    const firstNewline = tail.indexOf(0x0a);
+    tail = firstNewline < 0 ? Buffer.alloc(0) : tail.subarray(firstNewline + 1);
+  }
+  return {
+    entries: [...head.entries, ...parseJsonLines(tail.toString('utf8'))],
+    middleSkipped: true,
+  };
 }
 
 function newestMappings(messageMap) {
@@ -188,7 +280,7 @@ function worktreeMetadata(meta, worktreeRoot) {
   return { worktreePath: path.resolve(candidatePath), worktreeBranch: branch };
 }
 
-function buildRecord({ entries, rolloutPath, offset, sidebarEntry, previous, nowMs, worktreeRoot, latestMapping }) {
+function buildRecord({ entries, middleSkipped, rolloutPath, offset, sidebarEntry, previous, nowMs, worktreeRoot, latestMapping }) {
   const metadataEntry = entries.find((entry) => entry?.type === 'session_meta' && entry?.payload);
   const meta = metadataEntry?.payload;
   if (!isUserRootSession(meta, sidebarEntry)) return null;
@@ -247,6 +339,7 @@ function buildRecord({ entries, rolloutPath, offset, sidebarEntry, previous, now
     status = 'running';
   }
   if ([...turns.keys()].some((turnId) => turnId !== activeTurnId)) runtimeComplete = false;
+  if (middleSkipped) runtimeComplete = false;
 
   const mappingEvent = String(latestMapping?.mapping?.eventName ?? '');
   const mappingIsCurrent = latestMapping && (latestMapping.mappedAt == null || statusChangedMs == null || latestMapping.mappedAt >= statusChangedMs);
@@ -277,6 +370,38 @@ function buildRecord({ entries, rolloutPath, offset, sidebarEntry, previous, now
   };
 }
 
+function durableRecord(record) {
+  return Object.fromEntries(taskRecordFields
+    .filter((field) => Object.hasOwn(record ?? {}, field))
+    .map((field) => [field, record[field]]));
+}
+
+function refreshedPreviousRecord(previous, sidebarEntry, latestMapping) {
+  const retained = durableRecord(previous);
+  const sidebarCreatedMs = validTime(sidebarEntry?.created_at ?? sidebarEntry?.createdAt);
+  const sidebarUpdatedMs = validTime(sidebarEntry?.updated_at ?? sidebarEntry?.updatedAt);
+  const previousCreatedMs = validTime(retained.createdAt);
+  const previousActivityMs = validTime(retained.lastActivityAt);
+  retained.taskName = stringOrNull(sidebarEntry?.thread_name ?? sidebarEntry?.threadName ?? sidebarEntry?.name) ??
+    retained.taskName ?? '未命名任务';
+  const project = projectMetadata(null, sidebarEntry, retained);
+  retained.projectId = project.projectId;
+  retained.projectName = project.projectName;
+  retained.createdAt = isoTime(sidebarCreatedMs == null ? previousCreatedMs :
+    (previousCreatedMs == null ? sidebarCreatedMs : Math.min(sidebarCreatedMs, previousCreatedMs)));
+  retained.lastActivityAt = isoTime(sidebarUpdatedMs == null ? previousActivityMs :
+    (previousActivityMs == null ? sidebarUpdatedMs : Math.max(sidebarUpdatedMs, previousActivityMs)));
+
+  const mappingEvent = String(latestMapping?.mapping?.eventName ?? '');
+  const statusChangedMs = Math.max(validTime(retained.completedAt) ?? 0, validTime(retained.startedAt) ?? 0) || null;
+  const mappingIsCurrent = latestMapping &&
+    (latestMapping.mappedAt == null || statusChangedMs == null || latestMapping.mappedAt >= statusChangedMs);
+  if (mappingIsCurrent && mappingEvent === 'user-task-confirmation-required' && retained.status !== 'running') {
+    retained.status = 'confirmation-required';
+  }
+  return retained;
+}
+
 export async function buildTaskIndex({
   sessionsRoot,
   sessionIndexPath,
@@ -284,41 +409,75 @@ export async function buildTaskIndex({
   previousIndex = emptyIndex(),
   nowMs = Date.now(),
   discordWorktreeRoot,
+  readLimits,
+  fileSystem = fs,
 }) {
-  const sidebarEntries = await readSidebarEntries(sessionIndexPath);
-  const messageMap = await readOptionalJson(messageMapPath, { version: 1, messages: {} });
+  const limits = normalizedReadLimits(readLimits);
+  const sidebarEntries = await readSidebarEntries(sessionIndexPath, fileSystem, limits.sidebarChunkBytes);
+  const messageMap = await readOptionalJson(messageMapPath, { version: 1, messages: {} }, fileSystem);
   const mappings = newestMappings(messageMap);
   const previousById = new Map((previousIndex?.tasks ?? []).map((record) => [identityKey(record.threadId), record]));
+  const previousByPath = new Map((previousIndex?.tasks ?? []).flatMap((record) => {
+    const rolloutPath = stringOrNull(record?.rolloutPath);
+    return rolloutPath ? [[path.resolve(rolloutPath), record]] : [];
+  }));
   const worktreeRoot = configuredWorktreeRoot(discordWorktreeRoot, previousIndex);
   const recordsById = new Map();
 
-  for (const rolloutPath of await listRolloutFiles(sessionsRoot)) {
-    let content;
+  for (const rolloutPath of await listRolloutFiles(sessionsRoot, fileSystem)) {
+    const filenameThreadId = standardRolloutThreadId(rolloutPath);
+    let threadId = filenameThreadId;
+    let key = identityKey(threadId);
+    let sidebarEntry = sidebarEntries.get(key);
+    let previous = filenameThreadId ? previousById.get(key) : previousByPath.get(path.resolve(rolloutPath));
+    if (!filenameThreadId && previous) sidebarEntry = sidebarEntries.get(identityKey(previous.threadId));
+    if (filenameThreadId && !sidebarEntry) continue;
     try {
-      content = await fs.readFile(rolloutPath, 'utf8');
+      const stat = await fileSystem.stat(rolloutPath);
+      const offset = Number(stat.size);
+      let headRegion;
+      if (!filenameThreadId) {
+        headRegion = await readHeadRegion(rolloutPath, offset, limits, fileSystem);
+        const meta = headRegion.entries.find((entry) => entry?.type === 'session_meta')?.payload;
+        threadId = stringOrNull(meta?.id);
+        if (!threadId) continue;
+        key = identityKey(threadId);
+        sidebarEntry = sidebarEntries.get(key);
+        if (!sidebarEntry) continue;
+        previous = previousById.get(key) ?? (identityKey(previous?.threadId) === key ? previous : undefined);
+      }
+      if (previous && path.resolve(String(previous.rolloutPath ?? '')) === path.resolve(rolloutPath) &&
+          Number(previous.offset) === offset) {
+        recordsById.set(key, refreshedPreviousRecord(previous, sidebarEntry, mappings.get(key)));
+        continue;
+      }
+      const parsed = await readBoundedEntries(rolloutPath, offset, limits, fileSystem, headRegion);
+      const record = buildRecord({
+        entries: parsed.entries,
+        middleSkipped: parsed.middleSkipped,
+        rolloutPath,
+        offset,
+        sidebarEntry,
+        previous,
+        nowMs: Number(nowMs),
+        worktreeRoot,
+        latestMapping: mappings.get(key),
+      });
+      if (!record) continue;
+      key = identityKey(record.threadId);
+      const current = recordsById.get(key);
+      if (!current || (validTime(record.lastActivityAt) ?? 0) > (validTime(current.lastActivityAt) ?? 0)) {
+        recordsById.set(key, record);
+      }
     } catch (error) {
-      if (error?.code === 'ENOENT') continue;
-      throw error;
-    }
-    const entries = parseJsonLines(content);
-    const meta = entries.find((entry) => entry?.type === 'session_meta')?.payload;
-    const threadId = stringOrNull(meta?.id);
-    if (!threadId) continue;
-    const record = buildRecord({
-      entries,
-      rolloutPath,
-      offset: Buffer.byteLength(content),
-      sidebarEntry: sidebarEntries.get(identityKey(threadId)),
-      previous: previousById.get(identityKey(threadId)),
-      nowMs: Number(nowMs),
-      worktreeRoot,
-      latestMapping: mappings.get(identityKey(threadId)),
-    });
-    if (!record) continue;
-    const key = identityKey(threadId);
-    const current = recordsById.get(key);
-    if (!current || (validTime(record.lastActivityAt) ?? 0) > (validTime(current.lastActivityAt) ?? 0)) {
-      recordsById.set(key, record);
+      if (previous && sidebarEntry &&
+          path.resolve(String(previous.rolloutPath ?? '')) === path.resolve(rolloutPath)) {
+        recordsById.set(identityKey(previous.threadId), refreshedPreviousRecord(
+          previous,
+          sidebarEntry,
+          mappings.get(identityKey(previous.threadId)),
+        ));
+      }
     }
   }
 
@@ -326,9 +485,7 @@ export async function buildTaskIndex({
     if (recordsById.has(key)) continue;
     const previous = previousById.get(key);
     if (!previous) continue;
-    const retained = Object.fromEntries(taskRecordFields
-      .filter((field) => Object.hasOwn(previous, field))
-      .map((field) => [field, previous[field]]));
+    const retained = durableRecord(previous);
     if (!stringOrNull(retained.threadId)) continue;
     recordsById.set(key, retained);
   }
@@ -338,17 +495,24 @@ export async function buildTaskIndex({
   return { version: indexVersion, generatedAt: new Date(Number(nowMs)).toISOString(), tasks };
 }
 
-async function readRecordEntries(record) {
-  const content = await fs.readFile(String(record?.rolloutPath ?? ''), 'utf8');
-  const offset = Math.max(0, Math.min(Buffer.byteLength(content), Number(record?.offset ?? Buffer.byteLength(content))));
-  const bounded = Buffer.from(content, 'utf8').subarray(0, offset).toString('utf8');
-  return parseJsonLines(bounded);
+async function readRecordEntries(record, { fileSystem = fs, readLimits } = {}) {
+  const rolloutPath = String(record?.rolloutPath ?? '');
+  const stat = await fileSystem.stat(rolloutPath);
+  const fileSize = Number(stat.size);
+  const requestedOffset = Number(record?.offset ?? fileSize);
+  const offset = Math.max(0, Math.min(fileSize, Number.isFinite(requestedOffset) ? requestedOffset : fileSize));
+  return (await readBoundedEntries(
+    rolloutPath,
+    offset,
+    normalizedReadLimits(readLimits),
+    fileSystem,
+  )).entries;
 }
 
-export async function readTaskDetail(record) {
+export async function readTaskDetail(record, options = {}) {
   let entries;
   try {
-    entries = await readRecordEntries(record);
+    entries = await readRecordEntries(record, options);
   } catch {
     return {
       ...record,
@@ -407,7 +571,7 @@ function taskSummary(record, matchScore) {
   return summary;
 }
 
-export async function searchTasks({ index, keyword, limit = 10 }) {
+export async function searchTasks({ index, keyword, limit = 10, fileSystem = fs, readLimits }) {
   const query = normalizeSearch(keyword);
   if (!query) return [];
   const maximum = Math.min(10, Math.max(0, Math.floor(Number(limit) || 0)));
@@ -419,10 +583,17 @@ export async function searchTasks({ index, keyword, limit = 10 }) {
     let score = taskName === query ? 400 : (taskName.includes(query) ? 300 : 0);
     if (!score && projectName.includes(query)) score = 200;
     if (!score) {
-      const key = `${path.resolve(String(record?.rolloutPath ?? ''))}\u0000${Number(record?.offset ?? 0)}`;
+      const limits = normalizedReadLimits(readLimits);
+      const key = [
+        path.resolve(String(record?.rolloutPath ?? '')),
+        Number(record?.offset ?? 0),
+        limits.wholeFileBytes,
+        limits.headBytes,
+        limits.tailBytes,
+      ].join('\u0000');
       let body = detailSearchCache.get(key);
       if (body === undefined) {
-        const detail = await readTaskDetail(record);
+        const detail = await readTaskDetail(record, { fileSystem, readLimits: limits });
         if (detail.contentAvailable) {
           body = normalizeSearch(`${detail.taskText}\n${detail.resultText}`);
           detailSearchCache.set(key, body);

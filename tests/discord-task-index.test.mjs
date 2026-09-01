@@ -60,6 +60,33 @@ async function fixture() {
   };
 }
 
+const forcedBoundedReadLimits = {
+  wholeFileBytes: 768,
+  headBytes: 512,
+  tailBytes: 640,
+  sidebarChunkBytes: 17,
+};
+
+function observingFileSystem({ onOpen, onReadFile } = {}) {
+  return new Proxy(fs, {
+    get(target, property) {
+      if (property === 'open') {
+        return async (...args) => {
+          onOpen?.(...args);
+          return target.open(...args);
+        };
+      }
+      if (property === 'readFile') {
+        return async (...args) => {
+          onReadFile?.(...args);
+          return target.readFile(...args);
+        };
+      }
+      return Reflect.get(target, property);
+    },
+  });
+}
+
 test('accepts only matching sidebar user roots', () => {
   const sidebar = { id: 'root-1' };
   assert.equal(isUserRootSession({ id: 'root-1' }, sidebar), true);
@@ -80,6 +107,267 @@ test('root eligibility fails closed on empty IDs and compares dispatcher identit
   assert.equal(isUserRootSession({ id: 'ROOT-A', session_id: 'root-a', thread_source: 'USER' }, { id: 'root-a' }), true);
   assert.equal(isUserRootSession({ id: 'ROOT-A', session_id: 'other', thread_source: 'USER' }, { id: 'root-a' }), false);
   assert.equal(isUserRootSession({ id: 'ROOT-A', thread_source: 'SUBAGENT' }, { id: 'root-a' }), false);
+});
+
+test('indexes forced-large rollouts from bounded head and tail reads without claiming an exact runtime', async () => {
+  const paths = await fixture();
+  const threadId = '019cdef0-1234-7890-abcd-1234567890ab';
+  const rolloutPath = paths.rollout(`2026-09-01T00-00-00-${threadId}`);
+  let rolloutWholeReads = 0;
+  const fileSystem = observingFileSystem({
+    onReadFile(filePath) {
+      if (path.resolve(String(filePath)) === path.resolve(rolloutPath)) rolloutWholeReads += 1;
+    },
+  });
+  try {
+    await writeJsonl(paths.sessionIndexPath, [{ id: threadId, thread_name: '有界索引任务' }]);
+    await writeJsonl(rolloutPath, [
+      meta(threadId, { project_id: 'bounded-project', project_name: 'Bounded Project' }),
+      event('2026-09-01T00:01:00.000Z', 'task_started', { turn_id: 'turn-head' }),
+      event('2026-09-01T00:01:01.000Z', 'user_message', { message: '头部任务内容' }),
+      event('2026-09-01T00:02:00.000Z', 'agent_message', { message: 'x'.repeat(2_000) }),
+      event('2026-09-01T00:06:00.000Z', 'task_complete', { turn_id: 'turn-head', last_agent_message: '尾部最终结果' }),
+    ]);
+
+    const index = await buildTaskIndex({
+      ...paths,
+      fileSystem,
+      readLimits: forcedBoundedReadLimits,
+      nowMs: Date.parse('2026-09-01T00:07:00.000Z'),
+    });
+
+    assert.equal(index.tasks.length, 1);
+    assert.equal(index.tasks[0].threadId, threadId);
+    assert.equal(index.tasks[0].projectId, 'bounded-project');
+    assert.equal(index.tasks[0].status, 'completed');
+    assert.equal(index.tasks[0].completedAt, '2026-09-01T00:06:00.000Z');
+    assert.equal(index.tasks[0].runtimeMs, null);
+    assert.equal(index.tasks[0].offset, (await fs.stat(rolloutPath)).size);
+    assert.equal(rolloutWholeReads, 0);
+  } finally {
+    await fs.rm(paths.root, { recursive: true, force: true });
+  }
+});
+
+test('forced-large detail and search expose bounded head and tail content but not middle-only content', async () => {
+  const paths = await fixture();
+  const rolloutPath = paths.rollout('bounded-detail');
+  const middleOnlyRolloutPath = paths.rollout('bounded-middle-only');
+  let rolloutWholeReads = 0;
+  const fileSystem = observingFileSystem({
+    onReadFile(filePath) {
+      if ([rolloutPath, middleOnlyRolloutPath].map((item) => path.resolve(item)).includes(path.resolve(String(filePath)))) {
+        rolloutWholeReads += 1;
+      }
+    },
+  });
+  try {
+    await writeJsonl(rolloutPath, [
+      meta('bounded-detail'),
+      responseMessage('2026-09-01T00:01:00.000Z', 'user', 'HEAD-ONLY-NEEDLE original task'),
+      responseMessage('2026-09-01T00:02:00.000Z', 'assistant', `MIDDLE-ONLY-NEEDLE ${'x'.repeat(2_000)}`, 'commentary'),
+      responseMessage('2026-09-01T00:03:00.000Z', 'assistant', 'TAIL-ONLY-NEEDLE final result', 'final_answer'),
+    ]);
+    await writeJsonl(middleOnlyRolloutPath, [
+      meta('bounded-middle-only'),
+      event('2026-09-01T00:00:30.000Z', 'agent_message', { message: 'x'.repeat(1_000) }),
+      responseMessage('2026-09-01T00:02:00.000Z', 'user', 'MIDDLE-ONLY-NEEDLE hidden task'),
+      event('2026-09-01T00:02:30.000Z', 'agent_message', { message: 'y'.repeat(1_000) }),
+      event('2026-09-01T00:03:00.000Z', 'task_started', { turn_id: 'tail-turn' }),
+    ]);
+    const record = {
+      threadId: 'bounded-detail',
+      taskName: 'bounded detail',
+      projectName: 'Bridge',
+      rolloutPath,
+      offset: (await fs.stat(rolloutPath)).size,
+    };
+    const middleOnlyRecord = {
+      threadId: 'bounded-middle-only',
+      taskName: 'bounded middle',
+      projectName: 'Bridge',
+      rolloutPath: middleOnlyRolloutPath,
+      offset: (await fs.stat(middleOnlyRolloutPath)).size,
+    };
+    const detail = await readTaskDetail(record, { fileSystem, readLimits: forcedBoundedReadLimits });
+    assert.equal(detail.taskText, 'HEAD-ONLY-NEEDLE original task');
+    assert.equal(detail.resultText, 'TAIL-ONLY-NEEDLE final result');
+
+    const index = { version: 1, generatedAt: null, tasks: [record, middleOnlyRecord] };
+    assert.deepEqual(await searchTasks({ index, keyword: 'MIDDLE-ONLY-NEEDLE', fileSystem, readLimits: forcedBoundedReadLimits }), []);
+    assert.deepEqual(
+      (await searchTasks({ index, keyword: 'HEAD-ONLY-NEEDLE', fileSystem, readLimits: forcedBoundedReadLimits })).map((item) => item.threadId),
+      ['bounded-detail'],
+    );
+    assert.deepEqual(
+      (await searchTasks({ index, keyword: 'TAIL-ONLY-NEEDLE', fileSystem, readLimits: forcedBoundedReadLimits })).map((item) => item.threadId),
+      ['bounded-detail'],
+    );
+    assert.equal(rolloutWholeReads, 0);
+  } finally {
+    await fs.rm(paths.root, { recursive: true, force: true });
+  }
+});
+
+test('reuses an unchanged previous record without opening its rollout body and refreshes sidebar and notification overlays', async () => {
+  const paths = await fixture();
+  const threadId = '019cdef0-4321-7890-abcd-1234567890ab';
+  const rolloutPath = paths.rollout(`2026-09-01T00-00-00-${threadId}`);
+  const openedPaths = [];
+  const fileSystem = observingFileSystem({
+    onOpen(filePath) {
+      openedPaths.push(path.resolve(String(filePath)));
+    },
+  });
+  try {
+    await writeJsonl(paths.sessionIndexPath, [{
+      id: threadId,
+      thread_name: '当前侧边栏标题',
+      updated_at: '2026-09-01T00:10:00.000Z',
+    }]);
+    await writeJsonl(rolloutPath, [
+      meta(threadId, { project_id: 'body-project', project_name: 'Body Project' }),
+      event('2026-09-01T00:04:00.000Z', 'task_started', { turn_id: 'body-turn' }),
+      event('2026-09-01T00:05:00.000Z', 'task_failed', { turn_id: 'body-turn' }),
+    ]);
+    await fs.writeFile(paths.messageMapPath, JSON.stringify({ version: 1, messages: {
+      '101': {
+        threadId,
+        eventName: 'user-task-confirmation-required',
+        createdAt: '2026-09-01T00:11:00.000Z',
+      },
+    } }), 'utf8');
+    const size = (await fs.stat(rolloutPath)).size;
+    const previous = {
+      threadId,
+      projectId: 'previous-project',
+      projectName: 'Previous Project',
+      taskName: '旧标题',
+      status: 'completed',
+      createdAt: '2026-09-01T00:00:00.000Z',
+      lastActivityAt: '2026-09-01T00:02:00.000Z',
+      startedAt: '2026-09-01T00:01:00.000Z',
+      completedAt: '2026-09-01T00:02:00.000Z',
+      runtimeMs: 60_000,
+      rolloutPath,
+      offset: size,
+      worktreePath: null,
+      worktreeBranch: null,
+    };
+
+    const index = await buildTaskIndex({
+      ...paths,
+      fileSystem,
+      readLimits: forcedBoundedReadLimits,
+      previousIndex: { version: 1, generatedAt: previous.lastActivityAt, tasks: [previous] },
+      nowMs: Date.parse('2026-09-01T00:12:00.000Z'),
+    });
+
+    assert.equal(index.tasks[0].projectId, 'previous-project');
+    assert.equal(index.tasks[0].taskName, '当前侧边栏标题');
+    assert.equal(index.tasks[0].lastActivityAt, '2026-09-01T00:10:00.000Z');
+    assert.equal(index.tasks[0].status, 'confirmation-required');
+    assert.equal(openedPaths.includes(path.resolve(paths.sessionIndexPath)), true);
+    assert.equal(openedPaths.includes(path.resolve(rolloutPath)), false);
+  } finally {
+    await fs.rm(paths.root, { recursive: true, force: true });
+  }
+});
+
+test('streams sidebar lines and skips standard-filename rollouts absent from the current sidebar before body reads', async () => {
+  const paths = await fixture();
+  const sidebarId = '019cdef0-aaaa-7890-abcd-1234567890ab';
+  const excludedId = '019cdef0-bbbb-7890-abcd-1234567890ab';
+  const sidebarRollout = paths.rollout(`2026-09-01T00-00-00-${sidebarId}`);
+  const excludedRollout = paths.rollout(`2026-09-01T00-00-00-${excludedId}`);
+  const openedPaths = [];
+  const wholeReadPaths = [];
+  const fileSystem = observingFileSystem({
+    onOpen(filePath) {
+      openedPaths.push(path.resolve(String(filePath)));
+    },
+    onReadFile(filePath) {
+      wholeReadPaths.push(path.resolve(String(filePath)));
+    },
+  });
+  try {
+    await writeJsonl(paths.sessionIndexPath, [
+      { id: sidebarId, thread_name: '旧的流式标题' },
+      { id: sidebarId.toUpperCase(), thread_name: '当前流式标题' },
+    ], '{ invalid sidebar line\n');
+    await writeJsonl(sidebarRollout, [meta(sidebarId)]);
+    await writeJsonl(excludedRollout, [meta(excludedId), event('2026-09-01T00:01:00.000Z', 'user_message', {
+      message: '此非侧边栏正文不应读取',
+    })]);
+
+    const index = await buildTaskIndex({
+      ...paths,
+      fileSystem,
+      readLimits: forcedBoundedReadLimits,
+      nowMs: Date.parse('2026-09-01T00:02:00.000Z'),
+    });
+
+    assert.deepEqual(index.tasks.map((item) => item.threadId), [sidebarId]);
+    assert.equal(index.tasks[0].taskName, '当前流式标题');
+    assert.equal(openedPaths.includes(path.resolve(paths.sessionIndexPath)), true);
+    assert.equal(openedPaths.includes(path.resolve(sidebarRollout)), true);
+    assert.equal(openedPaths.includes(path.resolve(excludedRollout)), false);
+    assert.equal(wholeReadPaths.includes(path.resolve(paths.sessionIndexPath)), false);
+    assert.equal(wholeReadPaths.includes(path.resolve(sidebarRollout)), false);
+    assert.equal(wholeReadPaths.includes(path.resolve(excludedRollout)), false);
+  } finally {
+    await fs.rm(paths.root, { recursive: true, force: true });
+  }
+});
+
+test('keeps rebuilding when one rollout becomes unreadable and retains its matching prior record', async () => {
+  const paths = await fixture();
+  const unreadableId = '019cdef0-cccc-7890-abcd-1234567890ab';
+  const healthyId = '019cdef0-dddd-7890-abcd-1234567890ab';
+  const unreadableRollout = paths.rollout('unreadable-fallback-name');
+  const healthyRollout = paths.rollout(`2026-09-01T00-00-00-${healthyId}`);
+  const fileSystem = new Proxy(fs, {
+    get(target, property) {
+      if (property !== 'open') return Reflect.get(target, property);
+      return async (filePath, ...args) => {
+        if (path.resolve(String(filePath)) === path.resolve(unreadableRollout)) {
+          const error = new Error('fixture rollout is unreadable');
+          error.code = 'EACCES';
+          throw error;
+        }
+        return target.open(filePath, ...args);
+      };
+    },
+  });
+  try {
+    await writeJsonl(paths.sessionIndexPath, [
+      { id: unreadableId, thread_name: '不可读任务的新标题' },
+      { id: healthyId, thread_name: '健康任务' },
+    ]);
+    await writeJsonl(unreadableRollout, [meta(unreadableId)]);
+    await writeJsonl(healthyRollout, [meta(healthyId)]);
+    const prior = {
+      threadId: unreadableId,
+      taskName: '不可读任务的旧标题',
+      status: 'completed',
+      lastActivityAt: '2026-09-01T00:01:00.000Z',
+      rolloutPath: unreadableRollout,
+      offset: 1,
+    };
+
+    const index = await buildTaskIndex({
+      ...paths,
+      fileSystem,
+      previousIndex: { version: 1, generatedAt: prior.lastActivityAt, tasks: [prior] },
+      nowMs: Date.parse('2026-09-01T00:02:00.000Z'),
+    });
+
+    assert.deepEqual(index.tasks.map((item) => item.threadId).sort(), [healthyId, unreadableId].sort());
+    assert.equal(index.tasks.find((item) => item.threadId === unreadableId).taskName, '不可读任务的新标题');
+    assert.equal(index.tasks.find((item) => item.threadId === unreadableId).status, 'completed');
+  } finally {
+    await fs.rm(paths.root, { recursive: true, force: true });
+  }
 });
 
 test('indexes sidebar user roots, uses the last sidebar title, and excludes every non-root form', async () => {
@@ -370,6 +658,24 @@ test('reads first task, latest completed result, and page-safe Markdown on deman
     assert.match(detail.markdown, /## 原始任务\n修复 \*\*支付\*\* 通知/);
     assert.match(detail.markdown, /## 最新结果\n最终结果/);
     assert.equal(detail.markdown.includes('@everyone'), false);
+  } finally {
+    await fs.rm(paths.root, { recursive: true, force: true });
+  }
+});
+
+test('keeps normal-file detail behavior when a legacy record has a null offset', async () => {
+  const paths = await fixture();
+  try {
+    const rolloutPath = paths.rollout('null-offset-detail');
+    await writeJsonl(rolloutPath, [
+      meta('null-offset-detail'),
+      responseMessage('2026-09-01T00:01:00.000Z', 'user', '空 offset 仍读取正常小文件'),
+      responseMessage('2026-09-01T00:02:00.000Z', 'assistant', '兼容结果', 'final_answer'),
+    ]);
+
+    const detail = await readTaskDetail({ threadId: 'null-offset-detail', rolloutPath, offset: null });
+    assert.equal(detail.taskText, '空 offset 仍读取正常小文件');
+    assert.equal(detail.resultText, '兼容结果');
   } finally {
     await fs.rm(paths.root, { recursive: true, force: true });
   }
