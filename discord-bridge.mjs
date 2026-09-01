@@ -340,6 +340,14 @@ export function createBridgeApplication(dependencies = {}) {
         context.setLatestErrorCategory('startup-failed');
         await context.gateway?.stop?.().catch(() => {});
         healthController?.abort();
+        healthGeneration++;
+        healthController = new AbortController();
+        healthLifecycle = 'stopping';
+        healthFinalAllowed = true;
+        healthPublication = Promise.resolve();
+        await safePublishHealth({ forceFinal: true });
+        await Promise.resolve(dependencies.invalidateHealth?.()).catch(() => {});
+        healthFinalAllowed = false;
         healthLifecycle = 'stopped';
         throw error;
       }
@@ -1095,6 +1103,7 @@ function createProductionBridgeDependencies({ runOnce = false } = {}) {
       }, { signal, shouldCommit, bypassQueue: Boolean(forceFinal) });
     },
     logHealthFailure: (category) => log(category),
+    invalidateHealth: () => fs.rm(bridgeHealthPath, { force: true }),
   };
 }
 

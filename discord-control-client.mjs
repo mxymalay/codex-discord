@@ -187,7 +187,7 @@ export function getBridgeHealthWriterStats(targetPath) {
 function stateFor(targetPath) {
   const key = path.resolve(targetPath);
   let state = healthWriters.get(key);
-  if (!state || !Object.hasOwn(state, 'commitTail')) { state = { activeOrdinary: null, pendingOrdinary: null, commitTail: Promise.resolve() }; healthWriters.set(key, state); }
+  if (!state || !Object.hasOwn(state, 'commitTail')) { state = { key, activeOrdinary: null, pendingOrdinary: null, commitTail: Promise.resolve() }; healthWriters.set(key, state); }
   return state;
 }
 async function cleanTemp(fsImpl, temporaryPath) { try { if (fsImpl.rm) await fsImpl.rm(temporaryPath, { force: true }); else await fsImpl.unlink?.(temporaryPath); } catch {} }
@@ -207,7 +207,7 @@ function launchOrdinary(state) {
   const request = state.pendingOrdinary;
   if (!request || state.activeOrdinary) return;
   state.pendingOrdinary = null; state.activeOrdinary = request;
-  prepareWrite(request, state).then(request.resolve, request.reject).finally(() => { state.activeOrdinary = null; launchOrdinary(state); });
+  prepareWrite(request, state).then(request.resolve, request.reject).finally(() => { state.activeOrdinary = null; launchOrdinary(state); if (!state.activeOrdinary && !state.pendingOrdinary) state.commitTail.finally(() => { if (!state.activeOrdinary && !state.pendingOrdinary && healthWriters.get(state.key) === state) healthWriters.delete(state.key); }); });
 }
 export function writeBridgeHealthAtomic(targetPath, status, { fsImpl = fs, signal, shouldCommit = () => !signal?.aborted, bypassQueue = false } = {}) {
   const state = stateFor(targetPath);
