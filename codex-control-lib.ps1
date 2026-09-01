@@ -87,6 +87,41 @@ function Get-ControlProcessProperty {
     return $property.Value
 }
 
+function ConvertTo-ControlCreationTime {
+    [CmdletBinding()]
+    param([AllowNull()][object]$Value)
+
+    if ($Value -is [DateTimeOffset]) {
+        return $Value.ToUniversalTime()
+    }
+    if ($Value -is [DateTime]) {
+        return ([DateTimeOffset]$Value).ToUniversalTime()
+    }
+    $text = [string]$Value
+    if ($text -notmatch '\A(?<stamp>\d{14})\.(?<microseconds>\d{6})(?<sign>[+-])(?<offset>\d{3})\z') {
+        return $null
+    }
+    try {
+        $localTime = [DateTime]::ParseExact(
+            ($Matches.stamp + '.' + $Matches.microseconds),
+            'yyyyMMddHHmmss.ffffff',
+            [System.Globalization.CultureInfo]::InvariantCulture,
+            [System.Globalization.DateTimeStyles]::None
+        )
+        $offsetMinutes = [int]$Matches.offset
+        if ($offsetMinutes -gt 840) {
+            return $null
+        }
+        if ($Matches.sign -eq '-') {
+            $offsetMinutes = -$offsetMinutes
+        }
+        return ([DateTimeOffset]::new($localTime, [TimeSpan]::FromMinutes($offsetMinutes))).ToUniversalTime()
+    }
+    catch {
+        return $null
+    }
+}
+
 function ConvertTo-CodexDesktopProcessRecord {
     [CmdletBinding()]
     param([Parameter(Mandatory)][object]$Process)
@@ -99,10 +134,13 @@ function ConvertTo-CodexDesktopProcessRecord {
     if ($null -eq $rawProcessId -or -not [int]::TryParse(([string]$rawProcessId), [ref]$processId) -or $processId -le 0) {
         return $null
     }
+    $hasValidParentProcessId = $true
     if ($null -ne $rawParentProcessId -and -not [int]::TryParse(([string]$rawParentProcessId), [ref]$parentProcessId)) {
-        return $null
+        $hasValidParentProcessId = $false
     }
-    if ($null -eq $rawCreationDate -or [string]::IsNullOrWhiteSpace([string]$rawCreationDate)) {
+    $creationTimeUtc = ConvertTo-ControlCreationTime -Value $rawCreationDate
+    $executablePath = [string](Get-ControlProcessProperty -Process $Process -Name 'ExecutablePath')
+    if (-not $hasValidParentProcessId) {
         return $null
     }
 
@@ -111,9 +149,12 @@ function ConvertTo-CodexDesktopProcessRecord {
         ProcessId = $processId
         ParentProcessId = $parentProcessId
         Name = [string](Get-ControlProcessProperty -Process $Process -Name 'Name')
-        ExecutablePath = [string](Get-ControlProcessProperty -Process $Process -Name 'ExecutablePath')
-        CreationDate = [string]$rawCreationDate
-        PackageRoot = Get-CodexDesktopPackageRoot -Path ([string](Get-ControlProcessProperty -Process $Process -Name 'ExecutablePath'))
+        ExecutablePath = $executablePath
+        CreationDate = $rawCreationDate
+        CreationTimeUtc = $creationTimeUtc
+        HasCreationTime = ($null -ne $creationTimeUtc)
+        HasExecutablePath = (-not [string]::IsNullOrWhiteSpace($executablePath))
+        PackageRoot = Get-CodexDesktopPackageRoot -Path $executablePath
     }
 }
 
@@ -152,11 +193,21 @@ function Get-CodexDesktopProcessPlan {
     }
 
     $roots = @($records | Where-Object {
-        $_.Name -ieq 'ChatGPT.exe' -and
-        (Test-CodexDesktopRootPath -Path $_.ExecutablePath) -and
-        (-not $byProcessId.ContainsKey([string]$_.ParentProcessId) -or
-            $null -eq $byProcessId[[string]$_.ParentProcessId].PackageRoot -or
-            -not $byProcessId[[string]$_.ParentProcessId].PackageRoot.Equals($_.PackageRoot, [System.StringComparison]::OrdinalIgnoreCase))
+        if ($_.Name -ine 'ChatGPT.exe' -or -not $_.HasCreationTime -or -not (Test-CodexDesktopRootPath -Path $_.ExecutablePath)) {
+            return $false
+        }
+        $parentKey = [string]$_.ParentProcessId
+        if (-not $byProcessId.ContainsKey($parentKey)) {
+            return $true
+        }
+        $parent = $byProcessId[$parentKey]
+        if (-not $parent.HasExecutablePath) {
+            return $false
+        }
+        if ($null -ne $parent.PackageRoot -and $parent.PackageRoot.Equals($_.PackageRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $false
+        }
+        return $true
     } | Sort-Object ProcessId)
     if ($roots.Count -eq 0) {
         return New-EmptyCodexDesktopProcessPlan
@@ -185,6 +236,9 @@ function Get-CodexDesktopProcessPlan {
         $rootByProcessId[[string]$item.Record.ProcessId] = $item.RootProcessId
         $children = if ($childrenByParent.ContainsKey([string]$item.Record.ProcessId)) { @($childrenByParent[[string]$item.Record.ProcessId]) } else { @() }
         foreach ($child in @($children | Sort-Object ProcessId)) {
+            if (-not $item.Record.HasCreationTime -or -not $child.HasCreationTime -or $child.CreationTimeUtc -le $item.Record.CreationTimeUtc) {
+                continue
+            }
             if ($seen.Add($child.ProcessId)) {
                 $queue.Enqueue([pscustomobject]@{ Record=$child; Depth=($item.Depth + 1); RootProcessId=$item.RootProcessId })
             }
@@ -220,31 +274,63 @@ function New-CodexControlOperations {
                 }
             })
         }
-        RequestClose = {
-            param([int]$ProcessId, [string]$CreationDate)
-            $current = Get-CimInstance -ClassName Win32_Process -Filter ("ProcessId = {0}" -f $ProcessId) -ErrorAction SilentlyContinue
-            if ($null -eq $current -or [string]$current.CreationDate -cne $CreationDate) {
-                return $false
+        OpenProcess = {
+            param([int]$ProcessId)
+            $process = Get-Process -Id $ProcessId -ErrorAction Stop
+            [void]$process.Handle
+            return [pscustomobject]@{
+                ProcessId = $process.Id
+                StartTimeUtc = $process.StartTime.ToUniversalTime()
+                Process = $process
             }
+        }
+        RequestClose = {
+            param([Parameter(Mandatory)][object]$BoundProcess)
             try {
-                return [bool]((Get-Process -Id $ProcessId -ErrorAction Stop).CloseMainWindow())
+                return [bool]$BoundProcess.Process.CloseMainWindow()
             }
             catch {
                 return $false
             }
         }
         StopProcess = {
-            param([int]$ProcessId, [string]$CreationDate)
-            $current = Get-CimInstance -ClassName Win32_Process -Filter ("ProcessId = {0}" -f $ProcessId) -ErrorAction SilentlyContinue
-            if ($null -eq $current -or [string]$current.CreationDate -cne $CreationDate) {
-                throw 'process-revalidation-failed'
-            }
-            Stop-Process -Id $ProcessId -Force -ErrorAction Stop
+            param([Parameter(Mandatory)][object]$BoundProcess)
+            $BoundProcess.Process.Kill()
         }
         Sleep = {
             param([int]$Milliseconds)
             Start-Sleep -Milliseconds $Milliseconds
         }
+    }
+}
+
+function Test-CodexBoundProcessIdentity {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][object]$BoundProcess,
+        [Parameter(Mandatory)][int]$ProcessId,
+        [Parameter(Mandatory)][object]$CreationDate
+    )
+
+    $boundProcessId = Get-ControlProcessProperty -Process $BoundProcess -Name 'ProcessId'
+    $boundCreationDate = Get-ControlProcessProperty -Process $BoundProcess -Name 'CreationDate'
+    if ($null -eq $boundProcessId -or [int]$boundProcessId -ne $ProcessId) {
+        return $false
+    }
+    if ($null -ne $boundCreationDate) {
+        return ([string]$boundCreationDate -ceq $CreationDate)
+    }
+
+    $startTimeUtc = Get-ControlProcessProperty -Process $BoundProcess -Name 'StartTimeUtc'
+    $expectedTimeUtc = ConvertTo-ControlCreationTime -Value $CreationDate
+    if ($null -eq $startTimeUtc -or $null -eq $expectedTimeUtc) {
+        return $false
+    }
+    try {
+        return ([DateTimeOffset]$startTimeUtc).ToUniversalTime().Ticks -eq $expectedTimeUtc.Ticks
+    }
+    catch {
+        return $false
     }
 }
 
@@ -255,7 +341,7 @@ function Stop-CodexDesktop {
         [ValidateRange(0,10000)][int]$GraceMilliseconds = 3000
     )
 
-    foreach ($requiredOperation in @('GetProcesses', 'RequestClose', 'StopProcess', 'Sleep')) {
+    foreach ($requiredOperation in @('GetProcesses', 'OpenProcess', 'RequestClose', 'StopProcess', 'Sleep')) {
         if (-not $Operations.ContainsKey($requiredOperation) -or $Operations[$requiredOperation] -isnot [scriptblock]) {
             return [pscustomobject]@{ ok=$false; errorCategory='invalid-control-operations' }
         }
@@ -268,7 +354,11 @@ function Stop-CodexDesktop {
             return [pscustomobject]@{ ok=$true; alreadyStopped=$true; stoppedProcessCount=0 }
         }
         foreach ($root in @($beforePlan.Roots)) {
-            [void](& $Operations.RequestClose $root.ProcessId $beforePlan.CreationTimes[[int]$root.ProcessId])
+            $boundRoot = & $Operations.OpenProcess $root.ProcessId
+            if (-not (Test-CodexBoundProcessIdentity -BoundProcess $boundRoot -ProcessId $root.ProcessId -CreationDate $beforePlan.CreationTimes[[int]$root.ProcessId])) {
+                return [pscustomobject]@{ ok=$false; errorCategory='process-revalidation-failed'; stoppedProcessCount=0 }
+            }
+            [void](& $Operations.RequestClose $boundRoot)
         }
         [void](& $Operations.Sleep $GraceMilliseconds)
 
@@ -298,7 +388,11 @@ function Stop-CodexDesktop {
             if ($survivingRootIds -notcontains [int]$afterPlan.RootByProcessId[[string]$processId]) {
                 continue
             }
-            [void](& $Operations.StopProcess $processId $afterPlan.CreationTimes[[int]$processId])
+            $boundProcess = & $Operations.OpenProcess $processId
+            if (-not (Test-CodexBoundProcessIdentity -BoundProcess $boundProcess -ProcessId $processId -CreationDate $afterPlan.CreationTimes[[int]$processId])) {
+                return [pscustomobject]@{ ok=$false; errorCategory='process-revalidation-failed'; stoppedProcessCount=$stoppedCount }
+            }
+            [void](& $Operations.StopProcess $boundProcess)
             $stoppedCount++
         }
         return [pscustomobject]@{ ok=$true; alreadyStopped=$false; stoppedProcessCount=$stoppedCount }
