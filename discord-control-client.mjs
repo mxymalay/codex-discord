@@ -147,7 +147,7 @@ function sanitizeHealth(status) {
 }
 
 /** Atomically replace a same-directory, sanitized bridge health snapshot. */
-export async function writeBridgeHealthAtomic(targetPath, status, { fsImpl = fs, signal, shouldCommit = () => !signal?.aborted, bypassQueue = false } = {}) {
+export async function writeBridgeHealthAtomicLegacy(targetPath, status, { fsImpl = fs, signal, shouldCommit = () => !signal?.aborted, bypassQueue = false } = {}) {
   const canCommit = () => !signal?.aborted && shouldCommit();
   if (!canCommit()) return;
   const queueKey = path.resolve(targetPath);
@@ -180,6 +180,38 @@ export async function writeBridgeHealthAtomic(targetPath, status, { fsImpl = fs,
 }
 
 export function getBridgeHealthWriterStats(targetPath) {
-  const pending = healthWriters.get(path.resolve(targetPath));
-  return { activePreparations: pending ? 1 : 0, pendingOrdinary: pending ? 1 : 0 };
+  const state = healthWriters.get(path.resolve(targetPath));
+  return { activePreparations: state?.activeOrdinary ? 1 : 0, pendingOrdinary: state?.pendingOrdinary ? 1 : 0 };
+}
+
+function stateFor(targetPath) {
+  const key = path.resolve(targetPath);
+  let state = healthWriters.get(key);
+  if (!state || !Object.hasOwn(state, 'commitTail')) { state = { activeOrdinary: null, pendingOrdinary: null, commitTail: Promise.resolve() }; healthWriters.set(key, state); }
+  return state;
+}
+async function cleanTemp(fsImpl, temporaryPath) { try { if (fsImpl.rm) await fsImpl.rm(temporaryPath, { force: true }); else await fsImpl.unlink?.(temporaryPath); } catch {} }
+async function prepareWrite(request, state) {
+  const canCommit = () => !request.signal?.aborted && request.shouldCommit();
+  if (!canCommit()) return;
+  const temp = path.join(path.dirname(request.targetPath), `.${path.basename(request.targetPath)}.${process.pid}.${randomUUID()}.tmp`);
+  try {
+    await request.fsImpl.writeFile(temp, `${JSON.stringify(sanitizeHealth(request.status))}\n`, 'utf8');
+    if (!canCommit()) return;
+    const prior = state.commitTail;
+    state.commitTail = prior.catch(() => {}).then(async () => { if (canCommit()) await request.fsImpl.rename(temp, request.targetPath); });
+    await state.commitTail;
+  } finally { await cleanTemp(request.fsImpl, temp); }
+}
+function launchOrdinary(state) {
+  const request = state.pendingOrdinary;
+  if (!request || state.activeOrdinary) return;
+  state.pendingOrdinary = null; state.activeOrdinary = request;
+  prepareWrite(request, state).catch(() => {}).finally(() => { request.resolve(); state.activeOrdinary = null; launchOrdinary(state); });
+}
+export function writeBridgeHealthAtomic(targetPath, status, { fsImpl = fs, signal, shouldCommit = () => !signal?.aborted, bypassQueue = false } = {}) {
+  const state = stateFor(targetPath);
+  const request = { targetPath, status, fsImpl, signal, shouldCommit, resolve: null };
+  if (bypassQueue) return prepareWrite(request, state).catch(() => {});
+  return new Promise((resolve) => { request.resolve = resolve; if (state.pendingOrdinary) state.pendingOrdinary.resolve(); state.pendingOrdinary = request; launchOrdinary(state); });
 }

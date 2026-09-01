@@ -318,8 +318,8 @@ export function createBridgeApplication(dependencies = {}) {
       healthLifecycle = 'starting';
       healthFinalAllowed = false;
       context.healthGeneration = healthGeneration;
-      await prepare(false);
       try {
+        await prepare(false);
         await registerAndVerify();
         context.taskIndex = await dependencies.loadTaskIndex(context);
         recordActivity('lastIndexUpdateAt');
@@ -339,6 +339,8 @@ export function createBridgeApplication(dependencies = {}) {
       } catch (error) {
         context.setLatestErrorCategory('startup-failed');
         await context.gateway?.stop?.().catch(() => {});
+        healthController?.abort();
+        healthLifecycle = 'stopped';
         throw error;
       }
     },
@@ -347,7 +349,7 @@ export function createBridgeApplication(dependencies = {}) {
     },
     async stop() {
       if (stopPromise) return stopPromise;
-      if (!started && !context.gateway && !context.legacyPollers) return undefined;
+      if (!started && !context.gateway && !context.legacyPollers && ['inactive', 'stopped'].includes(healthLifecycle)) return undefined;
       acceptingResources = false;
       context.isStopping = true;
       healthController?.abort();
@@ -581,7 +583,7 @@ async function saveState(state) {
   await writeJsonAtomic(inboxStatePath, state);
 }
 
-function trackContinuationCompletion(started, request, token, trackActiveResource) {
+function trackContinuationCompletion(started, request, token, trackActiveResource, sendReply = (payload) => sendDiscordReply({ token, ...payload })) {
   const tracked = started.completion
       .then(async (params) => {
         const status = String(params?.turn?.status ?? 'unknown');
@@ -593,7 +595,7 @@ function trackContinuationCompletion(started, request, token, trackActiveResourc
         })[status] ?? 'turn-finished';
         await log(category, { threadId: request.threadId, turnId: started.turnId });
         if (status === 'failed' && request.source === 'reply') {
-          await sendDiscordReply({
+          await sendReply({
             token,
             channelId: request.channelId,
             replyToMessageId: request.replyToMessageId,
@@ -675,7 +677,7 @@ export async function finalizeContinuationOutcome({
   return { ...result, durable, stopChannelScan: !durable };
 }
 
-async function startContinuation({ token, config, state, request, trackActiveResource }) {
+async function startContinuation({ token, config, state, request, trackActiveResource, sendReply = (payload) => sendDiscordReply({ token, ...payload }) }) {
   const mappedCwd = await existingDirectory(String(request.cwd ?? ''));
   const input = { ...request, cwd: mappedCwd ?? undefined };
   const result = await dispatchContinuation(input, {
@@ -685,12 +687,12 @@ async function startContinuation({ token, config, state, request, trackActiveRes
     encryptText: (text) => encryptPendingReplyText({ toolDir, powershellPath: config.discordPowerShellPath, text }),
     decryptText: (encryptedText) => decryptPendingReplyText({ toolDir, powershellPath: config.discordPowerShellPath, ciphertext: encryptedText }),
     persistState: saveState,
-    sendReply: (payload) => sendDiscordReply({ token, ...payload }),
+    sendReply,
     trackCompletion: (started, normalized) => trackContinuationCompletion(
-      started, normalized, token, trackActiveResource,
+      started, normalized, token, trackActiveResource, sendReply,
     ),
   });
-  const outcome = await finalizeContinuationOutcome({ result, state, request, token });
+  const outcome = await finalizeContinuationOutcome({ result, state, request, token, sendReply });
   const category = ({
     started: 'continuation-started',
     queued: 'continuation-queued',
@@ -914,6 +916,7 @@ function createProductionBridgeDependencies({ runOnce = false } = {}) {
               state: context.inboxState,
               request,
               trackActiveResource: context.trackActiveResource,
+              sendReply: (payload) => context.trackDiscordRest(() => sendDiscordReply({ token: context.token, ...payload })),
             });
           } finally {
             context.publishHealth?.();
@@ -1030,6 +1033,7 @@ function createProductionBridgeDependencies({ runOnce = false } = {}) {
                     return await startContinuation({
                       ...payload,
                       trackActiveResource: context.trackActiveResource,
+                      sendReply: (reply) => context.trackDiscordRest(() => sendDiscordReply({ token, ...reply })),
                     });
                   } finally {
                     context.publishHealth?.();
