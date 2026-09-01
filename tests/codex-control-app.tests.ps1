@@ -345,6 +345,18 @@ namespace CodexDiscordControl
     Assert-FullPathEqual $shortcut.WorkingDirectory $installRoot 'shortcut working directory is stale'
     Assert-True ([string]::IsNullOrWhiteSpace($shortcut.Arguments)) 'shortcut injects unexpected arguments'
 
+    $verifiedBundleHashes = @{
+        exe = (Get-FileHash -LiteralPath $installedExe).Hash
+        backend = (Get-FileHash -LiteralPath $installedBackend).Hash
+        library = (Get-FileHash -LiteralPath $installedLibrary).Hash
+    }
+    Remove-Item -LiteralPath $shortcutPath -Force
+    & $installScript -ToolDir $installRoot -DesktopPath $desktopRoot -SourceRoot $stagedSource -ShortcutOnly | Out-Null
+    Assert-True (Test-Path -LiteralPath $shortcutPath -PathType Leaf) 'shortcut-only install did not recreate the shortcut'
+    Assert-True ((Get-FileHash -LiteralPath $installedExe).Hash -eq $verifiedBundleHashes.exe) 'shortcut-only install rebuilt or replaced the verified executable'
+    Assert-True ((Get-FileHash -LiteralPath $installedBackend).Hash -eq $verifiedBundleHashes.backend) 'shortcut-only install replaced the verified backend'
+    Assert-True ((Get-FileHash -LiteralPath $installedLibrary).Hash -eq $verifiedBundleHashes.library) 'shortcut-only install replaced the verified backend library'
+
     Remove-Item -LiteralPath $installedExe -Force
     Remove-Item -LiteralPath $shortcutPath -Force
     & $installScript -ToolDir $installRoot -DesktopPath $desktopRoot -SourceRoot $stagedSource | Out-Null

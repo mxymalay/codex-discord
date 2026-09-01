@@ -2191,10 +2191,16 @@ test('a newly active main task invalidates the old confirmation and requires a f
   assert.match(edits.at(-1).content, /已退出/);
 });
 
-test('help names all eleven commands and explains workspace routing and offline limitation', () => {
+test('help names all eleven commands and explains takeover, routing, control modes, and offline limits', () => {
   const help = renderHelp();
   for (const commandName of COMMAND_NAMES) assert.match(help, new RegExp(`/${commandName}`));
   assert.match(help, /工作树/);
   assert.match(help, /无项目/);
-  assert.match(help, /电脑.*离线.*不可执行|离线.*命令.*不可执行/);
+  assert.match(help, /退出Codex[\s\S]{0,300}(?:中断|风险)[\s\S]{0,300}确认/);
+  assert.match(help, /active-writer|写入者占用/);
+  assert.match(help, /临时开启[\s\S]{0,500}临时停止[\s\S]{0,500}长期开启[\s\S]{0,500}长期停用/);
+  assert.match(help, /临时(?:开启|停止)[\s\S]{0,300}不改变[\s\S]{0,300}长期/);
+  assert.match(help, /Discord[\s\S]{0,300}(?:新建|继续)[\s\S]{0,300}原频道[\s\S]{0,300}(?:commentary|工具进度|进度)/i);
+  assert.match(help, /登录[\s\S]{0,200}(?:唤醒|休眠)[\s\S]{0,200}(?:联网|网络)/);
+  assert.match(help, /Codex 桌面端[\s\S]{0,200}(?:关闭|退出)/);
 });

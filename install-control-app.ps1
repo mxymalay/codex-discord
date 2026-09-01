@@ -3,6 +3,7 @@ param(
     [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$SourceRoot,
     [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$ToolDir,
     [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$DesktopPath,
+    [switch]$ShortcutOnly,
     [ValidateSet('none','after-executable','after-backend','after-library','before-shortcut')]
     [string]$FailureInjectionStep = 'none'
 )
@@ -69,14 +70,19 @@ function Remove-ControlStage {
 $source = Resolve-ControlDirectory -Path $SourceRoot -Label 'SourceRoot'
 $tool = Resolve-ControlDirectory -Path $ToolDir -Label 'ToolDir'
 $desktop = Resolve-ControlDirectory -Path $DesktopPath -Label 'DesktopPath'
-$requiredSources = @(
-    (Join-Path $source 'control-app\CodexDiscordControl.cs'),
-    (Join-Path $source 'build-control-app.ps1'),
-    (Join-Path $source 'codex-control.ps1'),
-    (Join-Path $source 'codex-control-lib.ps1')
-)
+$requiredSources = if ($ShortcutOnly) {
+    @((Join-Path $tool 'CodexDiscordControl.exe'))
+}
+else {
+    @(
+        (Join-Path $source 'control-app\CodexDiscordControl.cs'),
+        (Join-Path $source 'build-control-app.ps1'),
+        (Join-Path $source 'codex-control.ps1'),
+        (Join-Path $source 'codex-control-lib.ps1')
+    )
+}
 foreach ($required in $requiredSources) {
-    if (-not (Test-Path -LiteralPath $required -PathType Leaf)) { throw 'SourceRoot is missing a required control file' }
+    if (-not (Test-Path -LiteralPath $required -PathType Leaf)) { throw 'Control app installation is missing a required file' }
 }
 
 $transactionId = [guid]::NewGuid().ToString('N')
@@ -94,11 +100,13 @@ $records = [System.Collections.Generic.List[object]]::new()
 $succeeded = $false
 
 try {
-    New-Item -ItemType Directory -Path $stageDirectory | Out-Null
-    & (Join-Path $source 'build-control-app.ps1') -OutputDirectory $stageDirectory | Out-Null
-    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $stagedExecutable -PathType Leaf)) { throw 'Control app build failed' }
-    [System.IO.File]::Copy((Join-Path $source 'codex-control.ps1'), $stagedBackend, $false)
-    [System.IO.File]::Copy((Join-Path $source 'codex-control-lib.ps1'), $stagedLibrary, $false)
+    if (-not $ShortcutOnly) {
+        New-Item -ItemType Directory -Path $stageDirectory | Out-Null
+        & (Join-Path $source 'build-control-app.ps1') -OutputDirectory $stageDirectory | Out-Null
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $stagedExecutable -PathType Leaf)) { throw 'Control app build failed' }
+        [System.IO.File]::Copy((Join-Path $source 'codex-control.ps1'), $stagedBackend, $false)
+        [System.IO.File]::Copy((Join-Path $source 'codex-control-lib.ps1'), $stagedLibrary, $false)
+    }
 
     $shell = New-Object -ComObject WScript.Shell
     $shortcut = $shell.CreateShortcut($stagedShortcut)
@@ -110,12 +118,14 @@ try {
     $shortcut.Save()
     if (-not (Test-Path -LiteralPath $stagedShortcut -PathType Leaf)) { throw 'Shortcut staging failed' }
 
-    $records.Add((Install-ControlTransactionFile -StagedPath $stagedExecutable -DestinationPath $executablePath -BackupPath (Join-Path $tool ('.CodexDiscordControl.' + $transactionId + '.backup.exe'))))
-    Invoke-ControlFailureInjection -Step 'after-executable'
-    $records.Add((Install-ControlTransactionFile -StagedPath $stagedBackend -DestinationPath $backendPath -BackupPath (Join-Path $tool ('.codex-control.' + $transactionId + '.backup.ps1'))))
-    Invoke-ControlFailureInjection -Step 'after-backend'
-    $records.Add((Install-ControlTransactionFile -StagedPath $stagedLibrary -DestinationPath $libraryPath -BackupPath (Join-Path $tool ('.codex-control-lib.' + $transactionId + '.backup.ps1'))))
-    Invoke-ControlFailureInjection -Step 'after-library'
+    if (-not $ShortcutOnly) {
+        $records.Add((Install-ControlTransactionFile -StagedPath $stagedExecutable -DestinationPath $executablePath -BackupPath (Join-Path $tool ('.CodexDiscordControl.' + $transactionId + '.backup.exe'))))
+        Invoke-ControlFailureInjection -Step 'after-executable'
+        $records.Add((Install-ControlTransactionFile -StagedPath $stagedBackend -DestinationPath $backendPath -BackupPath (Join-Path $tool ('.codex-control.' + $transactionId + '.backup.ps1'))))
+        Invoke-ControlFailureInjection -Step 'after-backend'
+        $records.Add((Install-ControlTransactionFile -StagedPath $stagedLibrary -DestinationPath $libraryPath -BackupPath (Join-Path $tool ('.codex-control-lib.' + $transactionId + '.backup.ps1'))))
+        Invoke-ControlFailureInjection -Step 'after-library'
+    }
     Invoke-ControlFailureInjection -Step 'before-shortcut'
     $records.Add((Install-ControlTransactionFile -StagedPath $stagedShortcut -DestinationPath $shortcutPath -BackupPath (Join-Path $desktop ('.Codex Discord 控制台.' + $transactionId + '.backup.lnk'))))
     $succeeded = $true
