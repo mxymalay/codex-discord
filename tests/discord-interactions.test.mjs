@@ -7,6 +7,7 @@ import {
   createInteractionRouter,
   paginateMarkdown,
   renderHelp,
+  renderContinuationQueue,
   renderQuota,
   renderSearchResults,
   renderSystemStatus,
@@ -69,7 +70,7 @@ function modalSubmit(customId, text, overrides = {}) {
     ...identity(overrides.userId, overrides.guildId),
     data: {
       custom_id: customId,
-      components: [{ components: [{ custom_id: '任务内容', value: text }] }],
+      components: [{ components: [{ custom_id: overrides.fieldId ?? '任务内容', value: text }] }],
     },
   };
 }
@@ -150,6 +151,9 @@ function makeDependencies(overrides = {}) {
     getQuotaState: overrides.getQuotaState ?? (async () => null),
     getSystemStatus: overrides.getSystemStatus ?? (() => ({ gateway: { state: 'ready' } })),
     getQueue: overrides.getQueue ?? (() => []),
+    dispatchContinuation: overrides.dispatchContinuation ?? (async () => ({ status: 'started', turnId: 'turn-continued' })),
+    cancelContinuation: overrides.cancelContinuation ?? (() => ({ status: 'cancelled' })),
+    persistContinuationState: overrides.persistContinuationState ?? (async () => {}),
     respond: overrides.respond ?? (async (body) => { responses.push(body); }),
     editOriginal: overrides.editOriginal ?? (async (body) => { edits.push(body); }),
     randomBytes: overrides.randomBytes ?? deterministicRandom(),
@@ -255,9 +259,11 @@ test('initial command callbacks are always ephemeral and mention-safe', async ()
 
   assert.equal(responses.length, invocations.length);
   for (const response of responses) {
-    assert.equal([4, 5].includes(response.type), true);
-    assert.equal(response.data.flags & 64, 64);
-    assert.deepEqual(response.data.allowed_mentions, { parse: [] });
+    assert.equal([4, 5, 9].includes(response.type), true);
+    if (response.type !== 9) {
+      assert.equal(response.data.flags & 64, 64);
+      assert.deepEqual(response.data.allowed_mentions, { parse: [] });
+    }
   }
 });
 
@@ -663,6 +669,152 @@ test('new-task modal uses a random 96-bit state id and stores no token or path',
   assert.equal(serialized.includes('C:\\saved\\POS'), false);
   assert.equal(serialized.includes('roots'), false);
   assert.equal([...uiState.values()][0].expiresAt, NOW + 15 * 60_000);
+});
+
+test('continue-task modal stores only authorized root identity and uses the required multiline input', async () => {
+  const uiState = new Map();
+  const { dependencies, responses } = makeDependencies({ uiState });
+
+  await createInteractionRouter(dependencies).handle(commandInteraction('继续任务', { 任务: 'root-1' }));
+
+  const modal = responses[0];
+  assert.equal(modal.type, 9);
+  assert.match(modal.data.custom_id, /^continue:[A-Za-z0-9_-]{16}$/u);
+  const input = modal.data.components[0].components[0];
+  assert.equal(input.custom_id, '继续内容');
+  assert.equal(input.label, '继续内容');
+  assert.equal(input.style, 2);
+  assert.equal(input.min_length, 1);
+  assert.equal(input.max_length, 4_000);
+  const stored = [...uiState.values()][0];
+  assert.deepEqual(Object.keys(stored).sort(), ['expiresAt', 'guildId', 'kind', 'threadId', 'userId']);
+  assert.equal(stored.threadId, 'root-1');
+  assert.equal(JSON.stringify(stored).includes('interaction-token'), false);
+  assert.equal(JSON.stringify(stored).includes('rollout-1'), false);
+});
+
+test('continue modal defers, revalidates the root task, and duplicate delivery dispatches once', async () => {
+  const events = [];
+  const requests = [];
+  const { dependencies, responses, edits } = makeDependencies({
+    respond: async (body) => { events.push(`respond-${body.type}`); responses.push(body); },
+    editOriginal: async (body) => { events.push('edit'); edits.push(body); },
+    dispatchContinuation: async (request) => {
+      events.push('dispatch');
+      requests.push(request);
+      return { status: 'queued', queueId: 'queue-12345678' };
+    },
+  });
+  const router = createInteractionRouter(dependencies);
+  await router.handle(commandInteraction('继续任务', { 任务: 'root-1' }));
+  const customId = responses.shift().data.custom_id;
+  events.length = 0;
+
+  await Promise.all([
+    router.handle(modalSubmit(customId, '重新检查一次', { fieldId: '继续内容', id: 'continue-submit-1' })),
+    router.handle(modalSubmit(customId, '重新检查一次', { fieldId: '继续内容', id: 'continue-submit-redelivery' })),
+  ]);
+
+  assert.equal(events[0], 'respond-5');
+  assert.equal(events.indexOf('dispatch') > events.lastIndexOf('respond-5'), true);
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].source, 'slash');
+  assert.equal(requests[0].requestId, 'continue-submit-1');
+  assert.equal(requests[0].threadId, 'root-1');
+  assert.equal(requests[0].text, '重新检查一次');
+  assert.equal(Object.hasOwn(requests[0], 'interactionToken'), false);
+  assert.match(edits[0].content, /已排队/);
+  assert.match(edits[0].content, /12345678/);
+});
+
+test('continue command and modal reject unknown roots and blank text without dispatching', async () => {
+  let dispatched = false;
+  const { dependencies, responses } = makeDependencies({
+    dispatchContinuation: async () => { dispatched = true; return { status: 'started' }; },
+  });
+  const router = createInteractionRouter(dependencies);
+
+  await router.handle(commandInteraction('继续任务', { 任务: 'subagent-or-unknown' }));
+  assert.match(responses.shift().data.content, /不存在|主任务/);
+
+  await router.handle(commandInteraction('继续任务', { 任务: 'root-1' }));
+  const customId = responses.shift().data.custom_id;
+  await router.handle(modalSubmit(customId, '   ', { fieldId: '继续内容' }));
+  assert.match(responses.shift().data.content, /1.?4000|不能为空/);
+  assert.equal(dispatched, false);
+
+  dependencies.taskIndex.tasks = [];
+  await router.handle(modalSubmit(customId, '不能续接', { fieldId: '继续内容', id: 'removed-root' }));
+  assert.equal(responses.shift().type, 5);
+  assert.equal(dispatched, false);
+});
+
+test('continue queue renders safe summaries and atomically cancels then refreshes', async () => {
+  const queue = [{
+    queueId: 'queue-abcdef12345678',
+    source: 'slash',
+    threadId: 'root-1',
+    summary: '@everyone\n' + '很长'.repeat(100),
+    createdAt: '2026-09-01T00:00:00.000Z',
+    lastAttemptAt: '2026-09-01T00:01:00.000Z',
+    status: 'queued',
+  }];
+  const events = [];
+  const { dependencies, responses } = makeDependencies({
+    getQueue: () => queue,
+    cancelContinuation: (_queueId, now) => {
+      events.push(`cancel:${now}`);
+      queue[0].status = 'cancelled';
+      return { status: 'cancelled' };
+    },
+    persistContinuationState: async () => { events.push('persist'); },
+  });
+  const router = createInteractionRouter(dependencies);
+
+  await router.handle(commandInteraction('继续队列'));
+
+  const initial = responses.shift();
+  assert.equal(initial.type, 4);
+  assert.match(initial.data.embeds[0].description, /Slash 命令/);
+  assert.match(initial.data.embeds[0].description, /12345678/);
+  assert.equal(initial.data.embeds[0].description.includes('@everyone'), false);
+  assert.equal(initial.data.embeds[0].description.length < 1_000, true);
+  const cancelId = initial.data.components[0].components[0].custom_id;
+  assert.match(cancelId, /^cancel:[A-Za-z0-9_-]{16}$/u);
+
+  await router.handle(componentInteraction(cancelId));
+
+  assert.deepEqual(events.map((item) => item.startsWith('cancel:') ? 'cancel' : item), ['cancel', 'persist']);
+  const refreshed = responses.shift();
+  assert.equal(refreshed.type, 7);
+  assert.match(refreshed.data.embeds[0].description, /已取消/);
+  assert.equal(refreshed.data.components.length, 0);
+});
+
+test('continuation queue renderer labels reply sources and omits full unsafe text', () => {
+  const rendered = renderContinuationQueue([{
+    queueId: 'queue-0000feedface', source: 'reply', threadId: 'root-9', projectName: 'POS', taskName: '支付',
+    summary: '# heading\n' + '内容'.repeat(100), createdAt: '2026-09-01T00:00:00Z', status: 'queued',
+  }]);
+  assert.match(rendered, /通知回复/);
+  assert.match(rendered, /feedface/);
+  assert.equal(rendered.includes('# heading'), false);
+  assert.equal(rendered.length < 1_000, true);
+});
+
+test('continuation queue renderer stays within the Discord embed description limit', () => {
+  const rendered = renderContinuationQueue(Array.from({ length: 20 }, (_, index) => ({
+    queueId: `queue-${String(index).padStart(8, '0')}`,
+    source: index % 2 ? 'reply' : 'slash',
+    threadId: `root-${index}`,
+    projectName: '项目'.repeat(80),
+    taskName: '任务'.repeat(80),
+    summary: '摘要'.repeat(80),
+    createdAt: '2026-09-01T00:00:00Z',
+    lastAttemptAt: '2026-09-01T00:01:00Z',
+    status: 'queued',
+  })));
+  assert.equal(rendered.length <= 3_800, true);
 });
 
 test('initial new-task modal reads only the non-refreshing project snapshot', async () => {

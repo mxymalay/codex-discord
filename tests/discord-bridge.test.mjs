@@ -11,15 +11,22 @@ import { startNewCodexTask } from '../discord-task-create-lib.mjs';
 import {
   AppServerClient,
   buildCodexAppServerMessages,
+  cancelContinuation,
   classifyReply,
   compareSnowflakes,
+  createContinuationRequest,
   createEmptyInboxState,
+  dispatchContinuation,
   discordRequest,
+  enqueueContinuation,
   enqueuePendingReply,
   getPendingReplies,
   initializeAppServerClient,
   initializeInboxCursors,
   isActiveWriterError,
+  listContinuations,
+  markContinuationDelivered,
+  migrateInboxState,
   migrateLegacyPendingReplies,
   recordInboxMessage,
   removePendingReply,
@@ -395,8 +402,174 @@ test('queues an active-writer reply with encrypted text and no plaintext at rest
   assert.deepEqual(getPendingReplies(state), []);
 });
 
-test('migrates legacy pending plaintext before state is rewritten', async () => {
+test('migrates the reply queue and stores slash continuations without tokens or full text', () => {
+  const oldPending = {
+    messageId: '777777777777777801',
+    referencedMessageId: '777777777777777701',
+    channelId: config.discordConfirmationChannelId,
+    encryptedText: 'cipher:旧回复',
+    mapping: mapping.messages['777777777777777701'],
+    queuedAt: '2026-09-01T00:00:00.000Z',
+    lastAttemptAt: '2026-09-01T00:00:00.000Z',
+    attempts: 1,
+  };
+  const state = migrateInboxState({
+    version: 1,
+    cursors: {},
+    processedMessageIds: [],
+    pendingReplies: { [oldPending.messageId]: oldPending },
+    createdTasksByInteraction: { 'create-1': { status: 'started', threadId: 'root-new' } },
+  });
+  const request = createContinuationRequest({
+    source: 'slash',
+    requestId: 'interaction-1',
+    threadId: 'root-1',
+    cwd: 'C:\\workspace\\demo',
+    text: '重新检查一次',
+    createdAt: '2026-09-01T00:01:00.000Z',
+  });
+
+  enqueueContinuation(state, { ...request, encryptedText: 'opaque-ciphertext' });
+
+  const serialized = JSON.stringify(state);
+  assert.equal(serialized.includes('interaction-token'), false);
+  assert.equal(serialized.includes('重新检查一次'), false);
+  assert.equal(listContinuations(state).length, 2);
+  assert.equal(state.createdTasksByInteraction['create-1'].threadId, 'root-new');
+  assert.equal(Object.hasOwn(state, 'pendingReplies'), false);
+});
+
+test('deduplicates continuation request ids, rejects blank text, and bounds interaction records', () => {
   const state = createEmptyInboxState();
+  assert.throws(() => createContinuationRequest({
+    source: 'slash', requestId: 'blank-1', threadId: 'root-1', text: '   ',
+  }), /blank|empty|text/i);
+  const request = createContinuationRequest({
+    source: 'slash', requestId: 'same-request', threadId: 'root-1', text: 'first',
+    createdAt: '2026-09-01T00:00:00.000Z',
+  });
+  const first = enqueueContinuation(state, { ...request, encryptedText: 'cipher:first' });
+  const duplicate = enqueueContinuation(state, { ...request, text: 'different', encryptedText: 'cipher:different' });
+  assert.equal(duplicate.queueId, first.queueId);
+  assert.equal(listContinuations(state).length, 1);
+
+  state.processedInteractions = Array.from({ length: 2_005 }, (_, index) => ({ requestId: `old-${index}` }));
+  migrateInboxState(state);
+  assert.equal(state.processedInteractions.length, 2_000);
+  assert.equal(state.processedInteractions[0].requestId, 'old-5');
+});
+
+test('migration bounds completed task-creation idempotence records without losing recent entries', () => {
+  const createdTasksByInteraction = Object.fromEntries(Array.from({ length: 2_005 }, (_, index) => [
+    `create-${index}`,
+    { status: 'started', threadId: `root-${index}` },
+  ]));
+  const state = migrateInboxState({ createdTasksByInteraction });
+  assert.equal(Object.keys(state.createdTasksByInteraction).length, 2_000);
+  assert.equal(Object.hasOwn(state.createdTasksByInteraction, 'create-0'), false);
+  assert.equal(state.createdTasksByInteraction['create-2004'].threadId, 'root-2004');
+});
+
+test('cancels only continuations that have not started and delivered entries cannot be cancelled', () => {
+  const state = createEmptyInboxState();
+  const queued = enqueueContinuation(state, {
+    ...createContinuationRequest({ source: 'slash', requestId: 'queued', threadId: 'root-1', text: 'queued' }),
+    encryptedText: 'cipher:queued',
+  });
+  const started = enqueueContinuation(state, {
+    ...createContinuationRequest({ source: 'slash', requestId: 'started', threadId: 'root-2', text: 'started' }),
+    encryptedText: 'cipher:started', status: 'started',
+  });
+  const delivered = enqueueContinuation(state, {
+    ...createContinuationRequest({ source: 'slash', requestId: 'delivered', threadId: 'root-3', text: 'delivered' }),
+    encryptedText: 'cipher:delivered',
+  });
+  markContinuationDelivered(state, delivered.queueId, '2026-09-01T00:02:00.000Z');
+
+  assert.equal(cancelContinuation(state, queued.queueId, '2026-09-01T00:03:00.000Z').status, 'cancelled');
+  assert.equal(cancelContinuation(state, started.queueId, '2026-09-01T00:03:00.000Z').status, 'already-started');
+  assert.equal(cancelContinuation(state, delivered.queueId, '2026-09-01T00:03:00.000Z').status, 'already-started');
+});
+
+test('dispatch queues an active writer, retries delivery, and preserves legacy reply acknowledgements', async () => {
+  const state = createEmptyInboxState();
+  const acknowledgements = [];
+  const persisted = [];
+  let attempts = 0;
+  const request = createContinuationRequest({
+    source: 'reply',
+    requestId: '777777777777777801',
+    threadId: mapping.messages['777777777777777701'].threadId,
+    cwd: mapping.messages['777777777777777701'].cwd,
+    text: '继续旧通知',
+    channelId: config.discordConfirmationChannelId,
+    replyToMessageId: '777777777777777801',
+    createdAt: '2026-09-01T00:00:00.000Z',
+  });
+  const dependencies = {
+    state,
+    now: () => '2026-09-01T00:01:00.000Z',
+    encryptText: async () => 'opaque-ciphertext',
+    decryptText: async () => '继续旧通知',
+    persistState: async () => { persisted.push(structuredClone(state)); },
+    resumeCodexThread: async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error('thread already has an active writer');
+      return { turnId: 'turn-retried', completion: Promise.resolve({ turn: { status: 'completed' } }) };
+    },
+    sendReply: async (payload) => { acknowledgements.push(payload); },
+  };
+
+  const queued = await dispatchContinuation(request, dependencies);
+  assert.equal(queued.status, 'queued');
+  assert.equal(listContinuations(state).length, 1);
+  assert.equal(JSON.stringify(state).includes('继续旧通知'), false);
+  assert.match(acknowledgements[0].content, /已排队/);
+
+  const delivered = await dispatchContinuation(listContinuations(state)[0], dependencies);
+  assert.equal(delivered.status, 'started');
+  assert.equal(delivered.turnId, 'turn-retried');
+  assert.equal(listContinuations(state)[0].status, 'delivered');
+  assert.match(acknowledgements[1].content, /排队回复现已送达/);
+  assert.equal(persisted.length >= 2, true);
+});
+
+test('a queued retry that cannot resume becomes failed instead of claiming delivery', async () => {
+  const state = createEmptyInboxState();
+  const queued = enqueueContinuation(state, {
+    ...createContinuationRequest({ source: 'slash', requestId: 'retry-fails', threadId: 'root-1', text: 'retry' }),
+    encryptedText: 'opaque-ciphertext',
+  });
+  const result = await dispatchContinuation(queued, {
+    state,
+    decryptText: async () => 'retry',
+    persistState: async () => {},
+    resumeCodexThread: async () => { throw new Error('task not found'); },
+  });
+  assert.equal(result.status, 'failed');
+  assert.equal(listContinuations(state)[0].status, 'failed');
+});
+
+test('slash dispatch persists its idempotence journal before starting an external turn', async () => {
+  const events = [];
+  const state = createEmptyInboxState();
+  const request = createContinuationRequest({
+    source: 'slash', requestId: 'durable-before-resume', threadId: 'root-1', text: 'continue',
+  });
+  const result = await dispatchContinuation(request, {
+    state,
+    persistState: async () => { events.push(`persist:${state.processedInteractions.at(-1)?.status}`); },
+    resumeCodexThread: async () => {
+      events.push('resume');
+      return { turnId: 'turn-durable', completion: Promise.resolve({ turn: { status: 'completed' } }) };
+    },
+  });
+  assert.equal(result.status, 'started');
+  assert.deepEqual(events.slice(0, 2), ['persist:started', 'resume']);
+});
+
+test('migrates legacy pending plaintext before state is rewritten', async () => {
+  const state = { pendingReplies: {} };
   state.pendingReplies['777777777777777801'] = { messageId: '777777777777777801', text: 'legacy continuation', mapping: mapping.messages['777777777777777701'] };
   await migrateLegacyPendingReplies({ state, encryptText: async (text) => `cipher:${text}` });
   assert.equal(state.pendingReplies['777777777777777801'].encryptedText, 'cipher:legacy continuation');

@@ -4,23 +4,22 @@ import { fileURLToPath } from 'node:url';
 
 import {
   classifyReply,
+  createContinuationRequest,
   createEmptyInboxState,
   decryptPendingReplyText,
   encryptPendingReplyText,
-  enqueuePendingReply,
+  dispatchContinuation,
   getDiscordMessagesAfter,
-  getPendingReplies,
+  listContinuations,
   getLatestDiscordMessageId,
   initializeInboxCursors,
-  isActiveWriterError,
   loadDiscordToken,
   migrateLegacyPendingReplies,
+  migrateInboxState,
   readJsonFile,
   recordInboxMessage,
-  removePendingReply,
   resolveCodexExecutable,
   resolvePowerShellExecutable,
-  resumeCodexThread,
   sendDiscordReply,
   writeJsonAtomic,
 } from './discord-bridge-lib.mjs';
@@ -87,91 +86,62 @@ async function saveState(state) {
   await writeJsonAtomic(inboxStatePath, state);
 }
 
-async function startMappedTurn({ token, config, state, accepted }) {
-  const mappedCwd = await existingDirectory(String(accepted.mapping.cwd ?? ''));
-  const wasPending = Boolean(state.pendingReplies?.[String(accepted.messageId)]);
-  try {
-    const text = accepted.encryptedText
-      ? await decryptPendingReplyText({ toolDir, ciphertext: accepted.encryptedText })
-      : '';
-    if (!text.trim()) throw new Error('Discord reply text is unavailable');
-    const started = await resumeCodexThread({
-      threadId: String(accepted.mapping.threadId),
-      cwd: mappedCwd ?? undefined,
-      processCwd: mappedCwd ?? toolDir,
-      text,
-      codexPath: String(config.discordCodexPath ?? 'codex'),
-    });
-
-    removePendingReply(state, accepted.messageId);
-    recordInboxMessage(state, accepted.channelId, accepted.messageId, true);
-    await saveState(state);
-    await sendDiscordReply({
-      token,
-      channelId: accepted.channelId,
-      replyToMessageId: accepted.messageId,
-      content: `${wasPending ? '✅ 排队回复现已送达' : '✅ 已送达'}原 Codex 任务（${mask(accepted.mapping.threadId, 8)}），已开始继续执行。`,
-    });
-    await log(`turn accepted message=${mask(accepted.messageId)} thread=${mask(accepted.mapping.threadId, 8)} turn=${mask(started.turnId, 8)}`);
-
-    const tracked = started.completion
+function trackContinuationCompletion(started, request, token) {
+  const tracked = started.completion
       .then(async (params) => {
         const status = String(params?.turn?.status ?? 'unknown');
-        await log(`turn completed thread=${mask(accepted.mapping.threadId, 8)} turn=${mask(started.turnId, 8)} status=${status}`);
-        if (status === 'failed') {
+        await log(`turn completed thread=${mask(request.threadId, 8)} turn=${mask(started.turnId, 8)} status=${status}`);
+        if (status === 'failed' && request.source === 'reply') {
           await sendDiscordReply({
             token,
-            channelId: accepted.channelId,
-            replyToMessageId: accepted.messageId,
+            channelId: request.channelId,
+            replyToMessageId: request.replyToMessageId,
             content: '⚠️ Codex 已接收这条回复，但本轮执行失败。请打开原任务查看错误后再回复一次。',
           });
         }
       })
       .catch(async () => {
-        await log(`turn completion connection lost thread=${mask(accepted.mapping.threadId, 8)} turn=${mask(started.turnId, 8)}`);
+        await log(`turn completion connection lost thread=${mask(request.threadId, 8)} turn=${mask(started.turnId, 8)}`);
       })
       .finally(() => activeTurns.delete(tracked));
-    activeTurns.add(tracked);
-    return 'started';
-  } catch (error) {
-    if (isActiveWriterError(error)) {
-      const attemptedAt = new Date().toISOString();
-      const encryptedText = accepted.encryptedText ?? await encryptPendingReplyText({ toolDir, text: String(accepted.text ?? '') });
-      enqueuePendingReply(state, accepted, attemptedAt, encryptedText);
-      recordInboxMessage(state, accepted.channelId, accepted.messageId, true);
-      await saveState(state);
-      await log(`turn queued message=${mask(accepted.messageId)} thread=${mask(accepted.mapping.threadId, 8)} active-writer=true`);
-      if (!wasPending) {
-        await sendDiscordReply({
-          token,
-          channelId: accepted.channelId,
-          replyToMessageId: accepted.messageId,
-          content: '⏳ 已排队：原 Codex 任务目前正被桌面端占用；任务释放后会自动送达，无需再次回复。',
-        }).catch(() => {});
-      }
-      return 'queued';
-    }
+  activeTurns.add(tracked);
+}
 
-    removePendingReply(state, accepted.messageId);
-    recordInboxMessage(state, accepted.channelId, accepted.messageId, true);
+async function startContinuation({ token, config, state, request }) {
+  const mappedCwd = await existingDirectory(String(request.cwd ?? ''));
+  const input = { ...request, cwd: mappedCwd ?? undefined };
+  const result = await dispatchContinuation(input, {
+    state,
+    codexPath: String(config.discordCodexPath ?? 'codex'),
+    processCwd: mappedCwd ?? toolDir,
+    encryptText: (text) => encryptPendingReplyText({ toolDir, text }),
+    decryptText: (encryptedText) => decryptPendingReplyText({ toolDir, ciphertext: encryptedText }),
+    persistState: saveState,
+    sendReply: (payload) => sendDiscordReply({ token, ...payload }),
+    trackCompletion: (started, normalized) => trackContinuationCompletion(started, normalized, token),
+  });
+  if (request.source === 'reply') {
+    recordInboxMessage(state, request.channelId, request.requestId, true);
     await saveState(state);
-    await log(`turn rejected message=${mask(accepted.messageId)} thread=${mask(accepted.mapping.threadId, 8)} error=${error?.message ?? 'unknown'}`);
+  }
+  await log(`continuation ${result.status} source=${request.source} request=${mask(request.requestId)} thread=${mask(request.threadId, 8)} turn=${mask(result.turnId, 8)}`);
+  if (result.status === 'failed' && request.source === 'reply') {
     await sendDiscordReply({
       token,
-      channelId: accepted.channelId,
-      replyToMessageId: accepted.messageId,
+      channelId: request.channelId,
+      replyToMessageId: request.replyToMessageId,
       content: '❌ 没有成功续接原 Codex 任务。不会新建任务；请确认 Codex 可正常打开后，再回复一次。',
     }).catch(() => {});
-    return 'failed';
   }
+  return result;
 }
 
 async function retryPendingTurns({ token, config, state }) {
   const now = Date.now();
-  for (const pending of getPendingReplies(state)) {
+  for (const pending of listContinuations(state).filter((item) => item.status === 'queued')) {
     const lastAttempt = Date.parse(String(pending.lastAttemptAt ?? ''));
     if (Number.isFinite(lastAttempt) && now - lastAttempt < pendingRetryIntervalMs) continue;
-    await startMappedTurn({ token, config, state, accepted: pending });
+    await startContinuation({ token, config, state, request: pending });
   }
 }
 
@@ -185,7 +155,16 @@ async function pollChannel({ token, config, state, channelId }) {
       const mapping = await readJsonFile(mappingPath, { version: 1, messages: {} });
       const accepted = classifyReply(message, config, mapping, state);
       if (accepted.accepted) {
-        await startMappedTurn({ token, config, state, accepted });
+        const request = createContinuationRequest({
+          source: 'reply',
+          requestId: accepted.messageId,
+          threadId: accepted.mapping.threadId,
+          cwd: accepted.mapping.cwd,
+          text: accepted.text,
+          channelId: accepted.channelId,
+          replyToMessageId: accepted.messageId,
+        });
+        await startContinuation({ token, config, state, request });
       } else {
         recordInboxMessage(state, channelId, String(message.id), false);
         await saveState(state);
@@ -207,6 +186,7 @@ async function main() {
   const channelIds = [String(config.discordTaskChannelId), String(config.discordConfirmationChannelId)];
   const state = await readJsonFile(inboxStatePath, createEmptyInboxState());
   await migrateLegacyPendingReplies({ state, encryptText: (text) => encryptPendingReplyText({ toolDir, text }) });
+  migrateInboxState(state);
   const rolloutState = await readRolloutWatcherState(rolloutWatcherStatePath, { sessionsRoot });
 
   await initializeInboxCursors({

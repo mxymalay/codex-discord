@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { createInterface } from 'node:readline';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
@@ -15,15 +16,201 @@ export function createEmptyInboxState() {
     initialized: false,
     cursors: {},
     processedMessageIds: [],
-    pendingReplies: {},
+    pendingContinuations: {},
+    processedInteractions: [],
+    createdTasksByInteraction: {},
   };
 }
 
-export async function initializeInboxCursors({ state, channelIds, getLatest }) {
+const MAX_PROCESSED_INTERACTIONS = 2_000;
+const MAX_CREATED_TASK_RECORDS = 2_000;
+const CONTINUATION_STATUSES = new Set(['queued', 'started', 'delivered', 'cancelled', 'failed']);
+const TERMINAL_CREATION_STATUSES = new Set(['started', 'first-turn-failed', 'failed-before-thread', 'recovered-failed']);
+
+function continuationQueueId(source, requestId) {
+  return createHash('sha256').update(`${source}\0${requestId}`, 'utf8').digest().subarray(0, 12).toString('base64url');
+}
+
+function continuationSummary(value) {
+  const safe = String(value ?? '')
+    .replace(/@/gu, '@\u200b')
+    .replace(/[\r\n\t]+/gu, ' ')
+    .replace(/[*_`#>|~[\]{}()\\]/gu, '')
+    .replace(/\s+/gu, ' ')
+    .trim();
+  if (!safe) return '';
+  return safe.length <= 120 ? `${safe.slice(0, Math.max(0, safe.length - 1))}…` : `${safe.slice(0, 119)}…`;
+}
+
+function processedInteraction(state, requestId) {
+  return state.processedInteractions.find((item) => String(item?.requestId ?? '') === String(requestId));
+}
+
+function recordProcessedInteraction(state, requestId, result, now) {
+  if (!String(requestId ?? '').trim()) return;
+  const record = {
+    requestId: String(requestId),
+    status: String(result?.status ?? 'failed'),
+    queueId: result?.queueId ? String(result.queueId) : undefined,
+    turnId: result?.turnId ? String(result.turnId) : undefined,
+    reason: result?.reason ? String(result.reason) : undefined,
+    processedAt: String(now),
+  };
+  state.processedInteractions = state.processedInteractions.filter((item) => String(item?.requestId ?? '') !== record.requestId);
+  state.processedInteractions.push(record);
+  if (state.processedInteractions.length > MAX_PROCESSED_INTERACTIONS) {
+    state.processedInteractions.splice(0, state.processedInteractions.length - MAX_PROCESSED_INTERACTIONS);
+  }
+}
+
+export function createContinuationRequest({
+  source,
+  requestId,
+  threadId,
+  cwd,
+  text,
+  channelId,
+  replyToMessageId,
+  createdAt = new Date().toISOString(),
+}) {
+  const normalizedSource = String(source ?? '');
+  if (!['reply', 'slash'].includes(normalizedSource)) throw new Error('Continuation source is invalid');
+  if (!String(requestId ?? '').trim()) throw new Error('Continuation requestId is empty');
+  if (!String(threadId ?? '').trim()) throw new Error('Continuation threadId is empty');
+  if (!String(text ?? '').trim()) throw new Error('Continuation text is blank');
+  if (String(text).length > 4_000) throw new Error('Continuation text is too long');
+  if (normalizedSource === 'reply' && (!String(channelId ?? '').trim() || !String(replyToMessageId ?? '').trim())) {
+    throw new Error('Reply continuation target is incomplete');
+  }
+  return {
+    source: normalizedSource,
+    requestId: String(requestId),
+    threadId: String(threadId),
+    cwd: String(cwd ?? '') || undefined,
+    text: String(text),
+    channelId: String(channelId ?? '') || undefined,
+    replyToMessageId: String(replyToMessageId ?? '') || undefined,
+    createdAt: String(createdAt),
+  };
+}
+
+export function migrateInboxState(candidate) {
+  const state = candidate && typeof candidate === 'object' ? candidate : {};
   state.version = 2;
-  state.cursors ??= {};
-  state.processedMessageIds ??= [];
-  state.pendingReplies ??= {};
+  state.initialized = Boolean(state.initialized);
+  state.cursors = state.cursors && typeof state.cursors === 'object' ? state.cursors : {};
+  state.processedMessageIds = Array.isArray(state.processedMessageIds) ? state.processedMessageIds.map(String).slice(-2_000) : [];
+  state.pendingContinuations = state.pendingContinuations && typeof state.pendingContinuations === 'object'
+    ? state.pendingContinuations
+    : {};
+  state.processedInteractions = Array.isArray(state.processedInteractions)
+    ? state.processedInteractions.slice(-MAX_PROCESSED_INTERACTIONS)
+    : [];
+  state.createdTasksByInteraction = state.createdTasksByInteraction && typeof state.createdTasksByInteraction === 'object'
+    ? state.createdTasksByInteraction
+    : {};
+  let creationOverflow = Math.max(0, Object.keys(state.createdTasksByInteraction).length - MAX_CREATED_TASK_RECORDS);
+  if (creationOverflow) {
+    for (const [interactionId, record] of Object.entries(state.createdTasksByInteraction)) {
+      if (!TERMINAL_CREATION_STATUSES.has(String(record?.status ?? ''))) continue;
+      delete state.createdTasksByInteraction[interactionId];
+      creationOverflow -= 1;
+      if (!creationOverflow) break;
+    }
+  }
+
+  for (const pending of Object.values(state.pendingReplies ?? {})) {
+    const mapping = pending?.mapping ?? {};
+    const requestId = String(pending?.messageId ?? '');
+    const threadId = String(mapping?.threadId ?? pending?.threadId ?? '');
+    if (!requestId || !threadId) continue;
+    enqueueContinuation(state, {
+      source: 'reply',
+      requestId,
+      threadId,
+      cwd: String(mapping?.cwd ?? pending?.cwd ?? '') || undefined,
+      text: String(pending?.text ?? ''),
+      encryptedText: String(pending?.encryptedText ?? '') || undefined,
+      summary: continuationSummary(pending?.summary ?? pending?.text),
+      channelId: String(pending?.channelId ?? '') || undefined,
+      replyToMessageId: requestId,
+      referencedMessageId: String(pending?.referencedMessageId ?? '') || undefined,
+      mapping: structuredClone(mapping),
+      createdAt: String(pending?.queuedAt ?? pending?.createdAt ?? new Date().toISOString()),
+      queuedAt: String(pending?.queuedAt ?? pending?.createdAt ?? new Date().toISOString()),
+      lastAttemptAt: String(pending?.lastAttemptAt ?? '') || undefined,
+      attempts: Number(pending?.attempts ?? 0),
+      status: 'queued',
+    });
+  }
+  delete state.pendingReplies;
+  return state;
+}
+
+export function enqueueContinuation(state, request) {
+  if (!state || typeof state !== 'object') throw new Error('Continuation state is required');
+  if (state.version !== 2 || !state.pendingContinuations) migrateInboxState(state);
+  const source = String(request?.source ?? '');
+  const requestId = String(request?.requestId ?? '');
+  const threadId = String(request?.threadId ?? '');
+  if (!['reply', 'slash'].includes(source) || !requestId || !threadId) throw new Error('Continuation request is invalid');
+  const duplicate = Object.values(state.pendingContinuations).find((item) =>
+    String(item?.source) === source && String(item?.requestId) === requestId);
+  if (duplicate) return duplicate;
+  const queueId = continuationQueueId(source, requestId);
+  const createdAt = String(request?.createdAt ?? new Date().toISOString());
+  const entry = {
+    queueId,
+    source,
+    requestId,
+    threadId,
+    cwd: String(request?.cwd ?? '') || undefined,
+    encryptedText: String(request?.encryptedText ?? '') || undefined,
+    summary: continuationSummary(request?.summary ?? request?.text),
+    channelId: String(request?.channelId ?? '') || undefined,
+    replyToMessageId: String(request?.replyToMessageId ?? '') || undefined,
+    referencedMessageId: String(request?.referencedMessageId ?? '') || undefined,
+    mapping: request?.mapping ? structuredClone(request.mapping) : undefined,
+    createdAt,
+    queuedAt: String(request?.queuedAt ?? createdAt),
+    lastAttemptAt: String(request?.lastAttemptAt ?? '') || undefined,
+    attempts: Math.max(0, Number(request?.attempts ?? 0)),
+    status: CONTINUATION_STATUSES.has(String(request?.status)) ? String(request.status) : 'queued',
+  };
+  state.pendingContinuations[queueId] = entry;
+  if (source === 'slash') recordProcessedInteraction(state, requestId, { status: 'queued', queueId }, entry.queuedAt);
+  return entry;
+}
+
+export function listContinuations(state) {
+  return Object.values(state?.pendingContinuations ?? {}).sort((left, right) => {
+    const byTime = String(left?.createdAt ?? '').localeCompare(String(right?.createdAt ?? ''));
+    return byTime || String(left?.queueId ?? '').localeCompare(String(right?.queueId ?? ''));
+  });
+}
+
+export function cancelContinuation(state, queueId, now = new Date().toISOString()) {
+  const item = state?.pendingContinuations?.[String(queueId)];
+  if (!item) return { status: 'not-found' };
+  if (item.status === 'cancelled') return { status: 'already-cancelled', queueId: item.queueId };
+  if (item.status !== 'queued') return { status: 'already-started', queueId: item.queueId };
+  item.status = 'cancelled';
+  item.cancelledAt = String(now);
+  if (item.source === 'slash') recordProcessedInteraction(state, item.requestId, { status: 'failed', queueId: item.queueId, reason: 'cancelled' }, now);
+  return { status: 'cancelled', queueId: item.queueId };
+}
+
+export function markContinuationDelivered(state, queueId, now = new Date().toISOString()) {
+  const item = state?.pendingContinuations?.[String(queueId)];
+  if (!item) return { status: 'not-found' };
+  if (item.status === 'cancelled') return { status: 'cancelled', queueId: item.queueId };
+  item.status = 'delivered';
+  item.deliveredAt = String(now);
+  return item;
+}
+
+export async function initializeInboxCursors({ state, channelIds, getLatest }) {
+  migrateInboxState(state);
   for (const channelId of channelIds.map(String)) {
     if (!state.cursors[channelId]) {
       state.cursors[channelId] = String(await getLatest(channelId));
@@ -37,32 +224,189 @@ export function isActiveWriterError(error) {
   return /already has an active writer/i.test(String(error?.message ?? error ?? ''));
 }
 
+async function persistContinuationState(dependencies) {
+  await dependencies.persistState?.(dependencies.state);
+}
+
+async function acknowledgeContinuation(dependencies, request, content) {
+  if (request.source !== 'reply' || typeof dependencies.sendReply !== 'function') return;
+  await dependencies.sendReply({
+    channelId: request.channelId,
+    replyToMessageId: request.replyToMessageId ?? request.requestId,
+    content,
+  });
+}
+
+export async function dispatchContinuation(request, dependencies = {}) {
+  const state = migrateInboxState(dependencies.state ?? createEmptyInboxState());
+  dependencies.state = state;
+  const now = String(typeof dependencies.now === 'function' ? dependencies.now() : new Date().toISOString());
+  const source = String(request?.source ?? '');
+  const requestId = String(request?.requestId ?? '');
+  const existing = listContinuations(state).find((item) => item.source === source && item.requestId === requestId);
+  const isQueuedRetry = Boolean(request?.queueId && existing?.queueId === String(request.queueId));
+  if (!isQueuedRetry) {
+    if (existing) return { status: existing.status === 'delivered' ? 'started' : existing.status, queueId: existing.queueId };
+    const processed = source === 'slash' ? processedInteraction(state, requestId) : null;
+    if (processed) {
+      return {
+        status: processed.status,
+        queueId: processed.queueId,
+        turnId: processed.turnId,
+        reason: processed.reason,
+      };
+    }
+  }
+  if (existing && existing.status !== 'queued') {
+    return {
+      status: existing.status === 'delivered' ? 'started' : 'failed',
+      queueId: existing.queueId,
+      reason: existing.status,
+    };
+  }
+
+  const target = existing ?? request;
+  let continuationText = String(request?.text ?? '');
+  if (!continuationText && target?.encryptedText && typeof dependencies.decryptText === 'function') {
+    continuationText = String(await dependencies.decryptText(target.encryptedText));
+  }
+  let normalized;
+  try {
+    normalized = createContinuationRequest({
+      source,
+      requestId,
+      threadId: target?.threadId,
+      cwd: target?.cwd,
+      text: continuationText,
+      channelId: target?.channelId,
+      replyToMessageId: target?.replyToMessageId ?? target?.requestId,
+      createdAt: target?.createdAt ?? now,
+    });
+  } catch {
+    const result = { status: 'failed', reason: 'invalid-request' };
+    if (source === 'slash') recordProcessedInteraction(state, requestId, result, now);
+    await persistContinuationState(dependencies);
+    return result;
+  }
+
+  if (existing) {
+    existing.status = 'started';
+    existing.lastAttemptAt = now;
+    existing.attempts = Number(existing.attempts ?? 0) + 1;
+    await persistContinuationState(dependencies);
+  } else if (source === 'slash') {
+    recordProcessedInteraction(state, requestId, { status: 'started' }, now);
+    await persistContinuationState(dependencies);
+  }
+  try {
+    const resume = dependencies.resumeCodexThread ?? resumeCodexThread;
+    const started = await resume({
+      threadId: normalized.threadId,
+      cwd: normalized.cwd,
+      processCwd: normalized.cwd ?? dependencies.processCwd,
+      text: normalized.text,
+      codexPath: dependencies.codexPath,
+      clientFactory: dependencies.clientFactory,
+    });
+    if (existing) markContinuationDelivered(state, existing.queueId, now);
+    const result = {
+      status: 'started',
+      queueId: existing?.queueId,
+      turnId: String(started?.turnId ?? '') || undefined,
+    };
+    if (source === 'slash') recordProcessedInteraction(state, requestId, result, now);
+    await persistContinuationState(dependencies);
+    await acknowledgeContinuation(
+      dependencies,
+      normalized,
+      `${existing ? '✅ 排队回复现已送达' : '✅ 已送达'}原 Codex 任务（…${normalized.threadId.slice(-8)}），已开始继续执行。`,
+    ).catch(() => {});
+    dependencies.trackCompletion?.(started, normalized);
+    return result;
+  } catch (error) {
+    if (isActiveWriterError(error)) {
+      let queued = existing;
+      if (queued) {
+        queued.status = 'queued';
+      } else {
+        const encryptedText = typeof dependencies.encryptText === 'function'
+          ? await dependencies.encryptText(normalized.text)
+          : '';
+        if (!String(encryptedText ?? '').trim()) return { status: 'failed', reason: 'encryption-unavailable' };
+        queued = enqueueContinuation(state, {
+          ...normalized,
+          text: normalized.text,
+          encryptedText: String(encryptedText),
+          queuedAt: now,
+          lastAttemptAt: now,
+          attempts: 1,
+        });
+      }
+      const result = { status: 'queued', queueId: queued.queueId };
+      if (source === 'slash') recordProcessedInteraction(state, requestId, result, now);
+      await persistContinuationState(dependencies);
+      if (!existing) {
+        await acknowledgeContinuation(
+          dependencies,
+          normalized,
+          '⏳ 已排队：原 Codex 任务目前正被桌面端占用；任务释放后会自动送达，无需再次回复。',
+        ).catch(() => {});
+      }
+      return result;
+    }
+    if (existing) {
+      existing.status = 'failed';
+      existing.failedAt = now;
+    }
+    const result = { status: 'failed', queueId: existing?.queueId, reason: 'resume-failed' };
+    if (source === 'slash') recordProcessedInteraction(state, requestId, result, now);
+    await persistContinuationState(dependencies);
+    return result;
+  }
+}
+
 export function enqueuePendingReply(state, accepted, attemptedAt = new Date().toISOString(), encryptedText) {
   if (!String(encryptedText ?? '').trim()) throw new Error('Pending reply text must be encrypted before it is persisted');
-  state.version = 2;
-  state.pendingReplies ??= {};
   const messageId = String(accepted.messageId);
-  const existing = state.pendingReplies[messageId];
-  state.pendingReplies[messageId] = {
+  const existing = listContinuations(migrateInboxState(state)).find((item) => item.source === 'reply' && item.requestId === messageId);
+  if (existing) {
+    existing.encryptedText = String(encryptedText);
+    existing.lastAttemptAt = String(attemptedAt);
+    existing.attempts = Number(existing.attempts ?? 0) + 1;
+    return existing;
+  }
+  return enqueueContinuation(state, {
+    source: 'reply',
+    requestId: messageId,
+    threadId: String(accepted.mapping?.threadId ?? ''),
+    cwd: String(accepted.mapping?.cwd ?? '') || undefined,
+    text: String(accepted.text ?? ''),
+    encryptedText: String(encryptedText),
     messageId,
     referencedMessageId: String(accepted.referencedMessageId ?? ''),
     channelId: String(accepted.channelId),
-    encryptedText: String(encryptedText),
+    replyToMessageId: messageId,
     mapping: structuredClone(accepted.mapping),
-    queuedAt: String(existing?.queuedAt ?? attemptedAt),
+    createdAt: String(attemptedAt),
+    queuedAt: String(attemptedAt),
     lastAttemptAt: String(attemptedAt),
-    attempts: Number(existing?.attempts ?? 0) + 1,
-  };
-  return state.pendingReplies[messageId];
+    attempts: 1,
+  });
 }
 
 export function getPendingReplies(state) {
-  return Object.values(state?.pendingReplies ?? {}).sort((left, right) =>
-    compareSnowflakes(left.messageId, right.messageId));
+  return listContinuations(state)
+    .filter((item) => item.source === 'reply' && item.status === 'queued')
+    .map((item) => ({ ...item, messageId: item.requestId }))
+    .sort((left, right) => compareSnowflakes(left.messageId, right.messageId));
 }
 
 export async function migrateLegacyPendingReplies({ state, encryptText }) {
-  for (const pending of Object.values(state?.pendingReplies ?? {})) {
+  const pendingValues = [
+    ...Object.values(state?.pendingReplies ?? {}),
+    ...Object.values(state?.pendingContinuations ?? {}),
+  ];
+  for (const pending of pendingValues) {
     if (!Object.hasOwn(pending, 'text')) continue;
     try {
       const encryptedText = await encryptText(String(pending.text ?? ''));
@@ -77,8 +421,10 @@ export async function migrateLegacyPendingReplies({ state, encryptText }) {
 }
 
 export function removePendingReply(state, messageId) {
-  state.pendingReplies ??= {};
-  delete state.pendingReplies[String(messageId)];
+  migrateInboxState(state);
+  for (const [queueId, pending] of Object.entries(state.pendingContinuations)) {
+    if (pending?.source === 'reply' && String(pending?.requestId) === String(messageId)) delete state.pendingContinuations[queueId];
+  }
   return state;
 }
 

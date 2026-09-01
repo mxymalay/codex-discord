@@ -2,6 +2,7 @@ import { createHash, randomBytes as cryptoRandomBytes } from 'node:crypto';
 import path from 'node:path';
 
 import { COMMAND_NAMES, authorizeInteraction, ephemeral } from './discord-commands-lib.mjs';
+import { createContinuationRequest } from './discord-bridge-lib.mjs';
 import { NO_PROJECT, resolveProjectSelection } from './discord-task-create-lib.mjs';
 
 const DISCORD_API = 'https://discord.com/api/v10';
@@ -381,6 +382,54 @@ export function renderTaskList(tasks, { status = '全部' } = {}) {
   ].join('\n');
 }
 
+function continuationStatusLabel(status) {
+  return ({
+    queued: '等待发送',
+    started: '已开始',
+    delivered: '已送达',
+    cancelled: '已取消',
+    failed: '失败',
+  })[String(status ?? '')] ?? '未知';
+}
+
+function continuationSummaryText(value) {
+  const safe = String(value ?? '')
+    .replace(/@/gu, '＠')
+    .replace(/[\r\n\t]+/gu, ' ')
+    .replace(/[*_`#>|~[\]{}()\\]/gu, '')
+    .replace(/\s+/gu, ' ')
+    .trim();
+  return displayText(safe, '（无可用摘要）', 120);
+}
+
+export function renderContinuationQueue(items, taskIndex = null) {
+  const values = Array.isArray(items) ? items : [];
+  if (!values.length) return '## 继续队列\n当前没有继续请求。';
+  const tasks = Array.isArray(taskIndex?.tasks) ? taskIndex.tasks : [];
+  const entries = values.slice(0, 20).map((item, index) => {
+      const task = tasks.find((candidate) => String(candidate?.threadId ?? '').toLocaleLowerCase() === String(item?.threadId ?? '').toLocaleLowerCase());
+      const projectName = item?.projectName ?? task?.projectName ?? '无项目';
+      const taskName = item?.taskName ?? task?.taskName ?? `任务 …${String(item?.threadId ?? '').slice(-8)}`;
+      const source = item?.source === 'reply' ? '通知回复' : 'Slash 命令';
+      return [
+        `${index + 1}. **${metadataText(projectName, '无项目')} / ${metadataText(taskName, '未命名任务')}**（…${metadataText(String(item?.queueId ?? '').slice(-8), '未知', 16)}）`,
+        `   内容：${metadataText(continuationSummaryText(item?.summary), '（无可用摘要）', 140)}`,
+        `   来源：${source}｜加入：${formatTimestamp(item?.createdAt ?? item?.queuedAt)}｜最后尝试：${formatTimestamp(item?.lastAttemptAt)}｜状态：${continuationStatusLabel(item?.status)}`,
+      ].join('\n');
+    });
+  let rendered = '## 继续队列';
+  for (let index = 0; index < entries.length; index += 1) {
+    const candidate = `${rendered}\n${entries[index]}`;
+    if (candidate.length > EMBED_MARKDOWN_LIMIT) {
+      const omitted = `\n…另有 ${entries.length - index} 项未显示。`;
+      if (rendered.length + omitted.length <= EMBED_MARKDOWN_LIMIT) rendered += omitted;
+      break;
+    }
+    rendered = candidate;
+  }
+  return rendered;
+}
+
 export function renderTaskDetail(detail) {
   if (!detail) return '任务不存在或已不再是侧边栏主任务。';
   const taskText = text(detail.taskText, detail.contentAvailable === false ? '内容暂不可用，请稍后重试。' : '（无可用内容）');
@@ -678,6 +727,36 @@ function detailButtons(dependencies, tasks, interaction) {
   return rows;
 }
 
+function continuationQueuePayload(dependencies, interaction) {
+  const queue = dependencies.getQueue?.();
+  const values = Array.isArray(queue) ? queue : [];
+  const buttons = [];
+  for (const item of values.filter((candidate) => candidate?.status === 'queued').slice(0, 20)) {
+    const stateId = makeStateId(dependencies);
+    dependencies.uiState.set(stateId, {
+      kind: 'cancel-continuation',
+      userId: userId(interaction),
+      guildId: guildId(interaction),
+      queueId: String(item.queueId),
+      expiresAt: nowValue(dependencies) + UI_TTL_MS,
+    });
+    buttons.push({
+      type: 2,
+      style: 4,
+      label: `取消 …${String(item.queueId).slice(-8)}`,
+      custom_id: `cancel:${stateId}`,
+    });
+  }
+  const components = [];
+  for (let index = 0; index < buttons.length; index += 5) {
+    components.push({ type: 1, components: buttons.slice(index, index + 5) });
+  }
+  return mentionSafePayload({
+    embeds: [{ description: renderContinuationQueue(values, dependencies.taskIndex) }],
+    components,
+  });
+}
+
 function safeWorkspaceName(workspace) {
   const candidate = String(workspace?.worktreePath ?? workspace?.cwd ?? '').replace(/\0/gu, '');
   if (!candidate) return '未知';
@@ -733,10 +812,10 @@ function insertCreatedTask(dependencies, result, selection) {
   });
 }
 
-function modalText(interaction) {
+function modalText(interaction, fieldId = '任务内容') {
   for (const row of interaction?.data?.components ?? []) {
     for (const component of row?.components ?? []) {
-      if (component?.custom_id === '任务内容') return String(component?.value ?? '');
+      if (component?.custom_id === fieldId) return String(component?.value ?? '');
     }
   }
   return '';
@@ -831,6 +910,40 @@ async function handleCommand(dependencies, interaction) {
       },
     });
   }
+  if (name === '继续任务') {
+    const record = findTask(dependencies, optionValue(interaction, '任务'));
+    if (!record) return respond(dependencies, interaction, privateResponse('任务不存在或已不再是侧边栏主任务。'));
+    const stateId = makeStateId(dependencies);
+    dependencies.uiState.set(stateId, {
+      kind: 'continue-task',
+      userId: userId(interaction),
+      guildId: guildId(interaction),
+      threadId: String(record.threadId),
+      expiresAt: nowValue(dependencies) + UI_TTL_MS,
+    });
+    return respond(dependencies, interaction, {
+      type: 9,
+      data: {
+        custom_id: `continue:${stateId}`,
+        title: '继续 Codex 任务',
+        components: [{
+          type: 1,
+          components: [{
+            type: 4,
+            custom_id: '继续内容',
+            label: '继续内容',
+            style: 2,
+            min_length: 1,
+            max_length: 4_000,
+            required: true,
+          }],
+        }],
+      },
+    });
+  }
+  if (name === '继续队列') {
+    return respond(dependencies, interaction, { type: 4, data: privatePayload(continuationQueuePayload(dependencies, interaction)) });
+  }
   if (name === '额度') {
     await defer(dependencies, interaction);
     try {
@@ -856,8 +969,6 @@ async function handleCommand(dependencies, interaction) {
     }
   }
   if (name === '帮助') return respond(dependencies, interaction, privateResponse(renderHelp()));
-  if (name === '继续任务') return respond(dependencies, interaction, privateResponse('请选择任务后提交继续内容；继续队列功能将在下一阶段接入。'));
-  if (name === '继续队列') return respond(dependencies, interaction, privateResponse('当前没有等待发送的继续请求。'));
   if (name === '系统测试') return respond(dependencies, interaction, privateResponse('系统测试功能将在健康检查阶段接入。'));
   return respond(dependencies, interaction, privateResponse('未知命令。'));
 }
@@ -868,16 +979,74 @@ async function authoritativeProjects(dependencies) {
   throw new Error('Project refresh unavailable');
 }
 
-function modalStateError(dependencies, interaction, state) {
+function modalStateError(dependencies, interaction, state, kind = 'new-task') {
   const now = nowValue(dependencies);
-  if (!state || state.kind !== 'new-task') return '此表单已过期或无效，请重新执行 /新建任务。';
-  if (now >= state.expiresAt) return '此表单已过期，请重新执行 /新建任务。';
+  const command = kind === 'continue-task' ? '/继续任务' : '/新建任务';
+  if (!state || state.kind !== kind) return `此表单已过期或无效，请重新执行 ${command}。`;
+  if (now >= state.expiresAt) return `此表单已过期，请重新执行 ${command}。`;
   if (state.userId !== userId(interaction) || state.guildId !== guildId(interaction)) return '此表单不属于当前用户或服务器，无权提交。';
   return null;
 }
 
+function continuationReceipt(result) {
+  if (result?.status === 'started') {
+    return `已开始继续执行。${result?.turnId ? `本轮 ID：…${String(result.turnId).slice(-8)}` : ''}`;
+  }
+  if (result?.status === 'queued') {
+    return `已排队；目标任务释放后会自动送达。队列编号：…${String(result?.queueId ?? '').slice(-8)}`;
+  }
+  return '没有成功续接原 Codex 任务；不会新建任务，请稍后重试。';
+}
+
+async function handleContinueModal(dependencies, submissions, interaction, stateId, state) {
+  const invalid = modalStateError(dependencies, interaction, state, 'continue-task');
+  if (invalid) return respond(dependencies, interaction, privateResponse(invalid));
+  const continuationText = modalText(interaction, '继续内容');
+  if (!continuationText.trim() || continuationText.length > 4_000) {
+    return respond(dependencies, interaction, privateResponse('继续内容必须为 1–4000 个字符，且不能为空。'));
+  }
+  await defer(dependencies, interaction);
+
+  let submission = submissions.get(stateId);
+  if (!submission) {
+    const submissionInteractionId = String(interaction.id);
+    const promise = (async () => {
+      const record = findTask(dependencies, state.threadId);
+      if (!record) return '任务不存在或已不再是侧边栏主任务，未发送继续内容。';
+      let request;
+      try {
+        request = createContinuationRequest({
+          source: 'slash',
+          requestId: submissionInteractionId,
+          threadId: record.threadId,
+          cwd: record.worktreePath,
+          text: continuationText,
+          createdAt: new Date(nowValue(dependencies)).toISOString(),
+        });
+      } catch {
+        return '继续内容无效，未发送。';
+      }
+      try {
+        return continuationReceipt(await dependencies.dispatchContinuation(request));
+      } catch {
+        return continuationReceipt({ status: 'failed' });
+      }
+    })();
+    submission = { interactionId: submissionInteractionId, promise };
+    submissions.set(stateId, submission);
+    promise.then((receipt) => { submission.receipt = receipt; }).catch(() => {});
+  }
+  const receipt = submission.receipt ?? await submission.promise;
+  return editOriginal(dependencies, interaction, { content: receipt });
+}
+
 async function handleModal(dependencies, submissions, interaction) {
   const customId = String(interaction?.data?.custom_id ?? '');
+  const continueMatch = customId.match(/^continue:([A-Za-z0-9_-]{16})$/u);
+  if (continueMatch) {
+    const continueState = dependencies.uiState.get(continueMatch[1]);
+    return handleContinueModal(dependencies, submissions, interaction, continueMatch[1], continueState);
+  }
   const match = customId.match(/^new:([A-Za-z0-9_-]{16})$/u);
   const stateId = match?.[1];
   const state = stateId ? dependencies.uiState.get(stateId) : null;
@@ -957,6 +1126,20 @@ function componentStateError(dependencies, interaction, state) {
 
 async function handleComponent(dependencies, interaction) {
   const customId = String(interaction?.data?.custom_id ?? '');
+  const cancelMatch = customId.match(/^cancel:([A-Za-z0-9_-]{16})$/u);
+  if (cancelMatch) {
+    const state = dependencies.uiState.get(cancelMatch[1]);
+    const invalid = componentStateError(dependencies, interaction, state);
+    if (invalid || state?.kind !== 'cancel-continuation') {
+      return respond(dependencies, interaction, privateResponse(invalid ?? '内容已过期或按钮无效，请重新执行命令。'));
+    }
+    const result = await dependencies.cancelContinuation(state.queueId, new Date(nowValue(dependencies)).toISOString());
+    if (result?.status === 'cancelled') await dependencies.persistContinuationState?.();
+    return respond(dependencies, interaction, {
+      type: 7,
+      data: continuationQueuePayload(dependencies, interaction),
+    });
+  }
   const pageMatch = customId.match(/^page:([A-Za-z0-9_-]{16}):(prev|next|noop)$/u);
   if (pageMatch) {
     const state = dependencies.uiState.get(pageMatch[1]);
