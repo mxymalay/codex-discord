@@ -354,22 +354,66 @@ function New-CodexControlOperations {
                 else { $env:CODEX_DISCORD_START_MODE = $previousMode }
             }
         }
-        StopRuntime = {
-            param([Parameter(Mandatory)][object]$Runtime)
-            $process = Get-Process -Id ([int]$Runtime.processId) -ErrorAction Stop
-            $expectedTime = ConvertTo-BridgeRuntimeTimeUtc -Value $Runtime.creationTimeUtc
-            $actualTime = ConvertTo-BridgeRuntimeTimeUtc -Value $process.StartTime
-            if ($null -eq $expectedTime -or $null -eq $actualTime -or $expectedTime.UtcDateTime.Ticks -ne $actualTime.UtcDateTime.Ticks) {
-                throw 'Bridge supervisor identity revalidation failed'
-            }
-            $process.Kill()
+        OpenBridgeProcess = {
+            param([Parameter(Mandatory)][int]$ProcessId)
+            $process = Get-Process -Id $ProcessId -ErrorAction Stop
+            [void]$process.Handle
+            return [pscustomobject]@{ ProcessId=$process.Id; StartTimeUtc=$process.StartTime.ToUniversalTime(); Process=$process }
         }
-        GetBridgeProcesses = {
-            @(Get-Process -ErrorAction Stop | ForEach-Object {
-                [pscustomobject]@{ ProcessId=$_.Id; CreationTimeUtc=$_.StartTime.ToUniversalTime() }
-            })
+        StopRuntimeTree = {
+            param([Parameter(Mandatory)][object]$BoundProcess)
+            $BoundProcess.Process.Kill($true)
+        }
+        WaitForRuntimeExit = {
+            param([Parameter(Mandatory)][object]$BoundProcess, [Parameter(Mandatory)][int]$Milliseconds)
+            return $BoundProcess.Process.WaitForExit($Milliseconds)
+        }
+        WaitForRuntimeRelease = {
+            param([Parameter(Mandatory)][int]$Milliseconds)
+            try {
+                $mutex = [System.Threading.Mutex]::OpenExisting('Local\CodexDiscordBridge')
+            }
+            catch { return $true }
+            try {
+                if (-not $mutex.WaitOne($Milliseconds)) { return $false }
+                $mutex.ReleaseMutex()
+                return $true
+            }
+            finally { $mutex.Dispose() }
         }
     }
+}
+
+function Test-CodexBridgeBoundRuntimeIdentity {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][object]$BoundProcess, [Parameter(Mandatory)][object]$Runtime)
+
+    $processId = Get-ControlProcessProperty -Process $BoundProcess -Name 'ProcessId'
+    $actualTime = ConvertTo-BridgeRuntimeTimeUtc -Value (Get-ControlProcessProperty -Process $BoundProcess -Name 'StartTimeUtc')
+    $expectedTime = ConvertTo-BridgeRuntimeTimeUtc -Value $Runtime.creationTimeUtc
+    return ($null -ne $processId -and [int]$processId -eq [int]$Runtime.processId -and $null -ne $actualTime -and $null -ne $expectedTime -and $actualTime.UtcDateTime.Ticks -eq $expectedTime.UtcDateTime.Ticks)
+}
+
+function Stop-CodexBridgeRuntime {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][object]$Runtime,
+        [Parameter(Mandatory)][hashtable]$Operations,
+        [ValidateRange(1,30000)][int]$TimeoutMilliseconds = 5000
+    )
+
+    foreach ($name in @('OpenBridgeProcess', 'StopRuntimeTree', 'WaitForRuntimeExit', 'WaitForRuntimeRelease')) {
+        if (-not $Operations.ContainsKey($name) -or $Operations[$name] -isnot [scriptblock]) { return [pscustomobject]@{ ok=$false; errorCategory='invalid-service-operations' } }
+    }
+    try {
+        $bound = & $Operations.OpenBridgeProcess ([int]$Runtime.processId)
+        if (-not (Test-CodexBridgeBoundRuntimeIdentity -BoundProcess $bound -Runtime $Runtime)) { return [pscustomobject]@{ ok=$false; errorCategory='runtime-identity-revalidation-failed' } }
+        & $Operations.StopRuntimeTree $bound
+        if (-not (& $Operations.WaitForRuntimeExit $bound $TimeoutMilliseconds)) { return [pscustomobject]@{ ok=$false; errorCategory='runtime-stop-timeout' } }
+        if (-not (& $Operations.WaitForRuntimeRelease $TimeoutMilliseconds)) { return [pscustomobject]@{ ok=$false; errorCategory='runtime-release-timeout' } }
+        return [pscustomobject]@{ ok=$true }
+    }
+    catch { return [pscustomobject]@{ ok=$false; errorCategory='runtime-stop-failed' } }
 }
 
 function Get-CodexBridgeServiceStatus {
@@ -388,18 +432,16 @@ function Get-CodexBridgeServiceStatus {
             $task = [pscustomobject]@{ installed=$false; enabled=$false; running=$false }
         }
         $runtime = $null
-        if ($Operations.ContainsKey('GetRuntime') -and $Operations.GetRuntime -is [scriptblock]) {
-            $runtime = & $Operations.GetRuntime
-        }
+        if ($Operations.ContainsKey('GetRuntime') -and $Operations.GetRuntime -is [scriptblock]) { $runtime = & $Operations.GetRuntime }
         else {
-            $processes = @()
-            if ($Operations.ContainsKey('GetBridgeProcesses') -and $Operations.GetBridgeProcesses -is [scriptblock]) {
-                $processes = @(& $Operations.GetBridgeProcesses)
+            $candidate = Read-BridgeRuntimeIdentityCandidate -Path (Join-Path $ToolDir 'discord-bridge-runtime.json') -ToolDir $ToolDir
+            if ($null -ne $candidate -and $Operations.ContainsKey('OpenBridgeProcess') -and $Operations.OpenBridgeProcess -is [scriptblock]) {
+                try {
+                    $bound = & $Operations.OpenBridgeProcess ([int]$candidate.processId)
+                    if (Test-CodexBridgeBoundRuntimeIdentity -BoundProcess $bound -Runtime $candidate) { $runtime = $candidate }
+                }
+                catch {}
             }
-            elseif ($Operations.ContainsKey('GetProcesses') -and $Operations.GetProcesses -is [scriptblock]) {
-                $processes = @(& $Operations.GetProcesses)
-            }
-            $runtime = Read-ValidatedBridgeRuntimeIdentity -Path (Join-Path $ToolDir 'discord-bridge-runtime.json') -Processes $processes -ToolDir $ToolDir
         }
         return [pscustomobject][ordered]@{
             ok = $true
@@ -420,14 +462,16 @@ function Invoke-CodexBridgeServiceAction {
     param(
         [Parameter(Mandatory)][ValidateSet('start-temporary', 'stop-temporary', 'enable-long-term', 'disable-long-term')][string]$Action,
         [Parameter(Mandatory)][string]$ToolDir,
-        [Parameter(Mandatory)][hashtable]$Operations
+        [Parameter(Mandatory)][hashtable]$Operations,
+        [ValidateRange(1,100)][int]$PollAttempts = 10,
+        [ValidateRange(0,30000)][int]$PollMilliseconds = 250
     )
 
     $requiredByAction = @{
         'start-temporary' = @('GetTask', 'StartTask', 'StartDetached')
-        'stop-temporary' = @('GetTask', 'StopTask', 'StopRuntime')
-        'enable-long-term' = @('GetTask', 'InstallTask', 'EnableTask', 'StartTask', 'StopRuntime')
-        'disable-long-term' = @('GetTask', 'DisableTask', 'StopTask', 'StopRuntime')
+        'stop-temporary' = @('GetTask', 'StopTask')
+        'enable-long-term' = @('GetTask', 'InstallTask', 'EnableTask', 'StartTask')
+        'disable-long-term' = @('GetTask', 'DisableTask', 'StopTask')
     }
     foreach ($operationName in $requiredByAction[$Action]) {
         if (-not $Operations.ContainsKey($operationName) -or $Operations[$operationName] -isnot [scriptblock]) {
@@ -446,23 +490,45 @@ function Invoke-CodexBridgeServiceAction {
                 }
             }
             'stop-temporary' {
-                if ($status.running) { & $Operations.StopRuntime $status.runtime }
+                if ($status.runtime -and $status.runtime.mode -eq 'scheduled') { & $Operations.StopTask }
+                elseif ($status.running) {
+                    if ($Operations.ContainsKey('StopRuntimeTree')) { $stopped = Stop-CodexBridgeRuntime -Runtime $status.runtime -Operations $Operations -TimeoutMilliseconds ($PollAttempts * [Math]::Max(1,$PollMilliseconds)); if (-not $stopped.ok) { return [pscustomobject]@{ ok=$false; action=$Action; errorCategory=$stopped.errorCategory; service=$status } } }
+                    else { & $Operations.StopRuntime $status.runtime }
+                }
                 elseif ($status.taskRunning) { & $Operations.StopTask }
             }
             'enable-long-term' {
                 if (-not $status.taskInstalled) { & $Operations.InstallTask }
-                & $Operations.EnableTask
-                if ($null -ne $status.runtime -and $status.runtime.mode -eq 'temporary') { & $Operations.StopRuntime $status.runtime }
-                & $Operations.StartTask
+                if (-not $status.autoStartEnabled) { & $Operations.EnableTask }
+                if ($null -ne $status.runtime -and $status.runtime.mode -eq 'temporary') {
+                    if ($Operations.ContainsKey('StopRuntimeTree')) { $stopped = Stop-CodexBridgeRuntime -Runtime $status.runtime -Operations $Operations -TimeoutMilliseconds ($PollAttempts * [Math]::Max(1,$PollMilliseconds)); if (-not $stopped.ok) { return [pscustomobject]@{ ok=$false; action=$Action; errorCategory=$stopped.errorCategory; service=$status } } }
+                    else { & $Operations.StopRuntime $status.runtime }
+                }
+                if (-not $status.running -or $null -eq $status.runtime -or $status.runtime.mode -ne 'scheduled') { & $Operations.StartTask }
             }
             'disable-long-term' {
                 if ($status.taskInstalled) { & $Operations.DisableTask }
-                if ($status.running) { & $Operations.StopRuntime $status.runtime }
+                if ($status.runtime -and $status.runtime.mode -eq 'scheduled') { & $Operations.StopTask }
+                elseif ($status.running) {
+                    if ($Operations.ContainsKey('StopRuntimeTree')) { $stopped = Stop-CodexBridgeRuntime -Runtime $status.runtime -Operations $Operations -TimeoutMilliseconds ($PollAttempts * [Math]::Max(1,$PollMilliseconds)); if (-not $stopped.ok) { return [pscustomobject]@{ ok=$false; action=$Action; errorCategory=$stopped.errorCategory; service=$status } } }
+                    else { & $Operations.StopRuntime $status.runtime }
+                }
                 elseif ($status.taskRunning) { & $Operations.StopTask }
             }
         }
-        $finalStatus = Get-CodexBridgeServiceStatus -Operations $Operations -ToolDir $ToolDir
-        return [pscustomobject][ordered]@{ ok=$finalStatus.ok; action=$Action; service=$finalStatus }
+        $finalStatus = $null
+        for ($attempt = 0; $attempt -lt $PollAttempts; $attempt++) {
+            $finalStatus = Get-CodexBridgeServiceStatus -Operations $Operations -ToolDir $ToolDir
+            $complete = $finalStatus.ok -and $(switch ($Action) {
+                'start-temporary' { $finalStatus.running -and $finalStatus.autoStartEnabled -eq $status.autoStartEnabled }
+                'stop-temporary' { -not $finalStatus.running -and -not $finalStatus.taskRunning -and $finalStatus.autoStartEnabled -eq $status.autoStartEnabled }
+                'enable-long-term' { $finalStatus.autoStartEnabled -and $finalStatus.running -and $finalStatus.runtime.mode -eq 'scheduled' }
+                'disable-long-term' { -not $finalStatus.autoStartEnabled -and -not $finalStatus.running -and -not $finalStatus.taskRunning }
+            })
+            if ($complete) { return [pscustomobject][ordered]@{ ok=$true; action=$Action; service=$finalStatus } }
+            if ($attempt -lt ($PollAttempts - 1) -and $Operations.ContainsKey('Sleep') -and $Operations.Sleep -is [scriptblock]) { & $Operations.Sleep $PollMilliseconds }
+        }
+        return [pscustomobject][ordered]@{ ok=$false; action=$Action; errorCategory='service-action-incomplete'; service=$finalStatus }
     }
     catch {
         return [pscustomobject]@{ ok=$false; action=$Action; errorCategory='service-action-failed' }

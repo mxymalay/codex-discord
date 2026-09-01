@@ -262,6 +262,115 @@ $disableLongTerm = Invoke-CodexBridgeServiceAction -Action 'disable-long-term' -
 if (-not $disableLongTerm.ok) { throw "long-term disable failed: $($disableLongTerm.errorCategory)" }
 if ($bridgeState.running -or $bridgeState.enabled) { throw 'long-term disable did not persist' }
 
+$reviewRuntimeRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('codex-reviewed-bridge-' + [guid]::NewGuid().ToString('N'))
+try {
+    New-Item -ItemType Directory -Path $reviewRuntimeRoot -Force | Out-Null
+    $reviewRuntimePath = Join-Path $reviewRuntimeRoot 'discord-bridge-runtime.json'
+    [void](Write-BridgeRuntimeIdentity -Path $reviewRuntimePath -Mode scheduled -ProcessId 701 -CreationTimeUtc '2026-09-01T13:00:00.0000000Z' -ToolDir $reviewRuntimeRoot)
+
+    $statusState = @{ opens=0; enumerations=0 }
+    $statusOps = @{
+        GetTask = { [pscustomobject]@{ installed=$true; enabled=$true; running=$true } }
+        OpenBridgeProcess = {
+            param($processId)
+            $statusState.opens++
+            if ($processId -ne 701) { throw 'runtime lookup used the wrong PID' }
+            [pscustomobject]@{ ProcessId=701; StartTimeUtc='2026-09-01T13:00:00.0000000Z'; Process=[pscustomobject]@{} }
+        }
+        GetBridgeProcesses = { $statusState.enumerations++; throw 'unrelated process enumeration is forbidden' }
+        GetProcesses = { $statusState.enumerations++; throw 'unrelated process enumeration is forbidden' }
+    }
+    $productionStatus = Get-CodexBridgeServiceStatus -Operations $statusOps -ToolDir $reviewRuntimeRoot
+    if (-not $productionStatus.ok -or -not $productionStatus.running -or $productionStatus.runtime.mode -ne 'scheduled' -or $statusState.opens -ne 1 -or $statusState.enumerations -ne 0) {
+        throw 'production service status did not bind only the identity-selected synthetic PID'
+    }
+
+    $stopEvents = [System.Collections.Generic.List[string]]::new()
+    $reusedStop = Stop-CodexBridgeRuntime -Runtime ([pscustomobject]@{ processId=702; creationTimeUtc='2026-09-01T13:00:00.0000000Z'; mode='temporary' }) -Operations @{
+        OpenBridgeProcess = { param($processId) [pscustomobject]@{ ProcessId=$processId; StartTimeUtc='2026-09-01T13:00:01.0000000Z'; Process=[pscustomobject]@{} } }
+        StopRuntimeTree = { param($bound) $stopEvents.Add('kill') }
+        WaitForRuntimeExit = { param($bound,$milliseconds) $true }
+        WaitForRuntimeRelease = { param($milliseconds) $true }
+    } -TimeoutMilliseconds 1
+    if ($reusedStop.ok -or $stopEvents.Count -ne 0) {
+        throw 'a changed/reused runtime identity performed a termination operation'
+    }
+
+    $boundSupervisor = [pscustomobject]@{ ProcessId=702; StartTimeUtc='2026-09-01T13:00:00.0000000Z'; Process=[pscustomobject]@{} }
+    $treeEvents = [System.Collections.Generic.List[string]]::new()
+    $treeStop = Stop-CodexBridgeRuntime -Runtime ([pscustomobject]@{ processId=702; creationTimeUtc='2026-09-01T13:00:00.0000000Z'; mode='temporary' }) -Operations @{
+        OpenBridgeProcess = { param($processId) $boundSupervisor }
+        StopRuntimeTree = { param($bound) if (-not [object]::ReferenceEquals($bound, $boundSupervisor)) { throw 'tree stop did not receive the held process binding' }; $treeEvents.Add('tree') }
+        WaitForRuntimeExit = { param($bound,$milliseconds) if (-not [object]::ReferenceEquals($bound, $boundSupervisor)) { throw 'exit wait did not receive the held process binding' }; $treeEvents.Add('exit'); $true }
+        WaitForRuntimeRelease = { param($milliseconds) $treeEvents.Add('release'); $true }
+    } -TimeoutMilliseconds 1
+    if (-not $treeStop.ok -or ($treeEvents -join ',') -ne 'tree,exit,release') { throw 'verified supervisor tree was not stopped and released in order' }
+
+    $timeoutStop = Stop-CodexBridgeRuntime -Runtime ([pscustomobject]@{ processId=702; creationTimeUtc='2026-09-01T13:00:00.0000000Z'; mode='temporary' }) -Operations @{
+        OpenBridgeProcess = { param($processId) $boundSupervisor }
+        StopRuntimeTree = { param($bound) }
+        WaitForRuntimeExit = { param($bound,$milliseconds) $false }
+        WaitForRuntimeRelease = { param($milliseconds) throw 'release must not run after exit timeout' }
+    } -TimeoutMilliseconds 1
+    if ($timeoutStop.ok -or $timeoutStop.errorCategory -ne 'runtime-stop-timeout') { throw 'unconfirmed runtime exit was not failed closed' }
+
+    $scheduledState = @{ installed=$true; enabled=$true; running=$true; mode='scheduled'; stopTask=0; stopRuntime=0 }
+    $scheduledOps = @{
+        GetTask = { [pscustomobject]@{ installed=$scheduledState.installed; enabled=$scheduledState.enabled; running=$scheduledState.running } }
+        GetRuntime = { if ($scheduledState.running) { [pscustomobject]@{ processId=703; creationTimeUtc='2026-09-01T13:00:00.0000000Z'; mode=$scheduledState.mode } } }
+        StopTask = { $scheduledState.stopTask++; $scheduledState.running=$false; $scheduledState.mode=$null }
+        StopRuntime = { param($runtime) $scheduledState.stopRuntime++; $scheduledState.running=$false; $scheduledState.mode=$null }
+        StartTask = {}; StartDetached = {}; InstallTask = {}; EnableTask = {}; DisableTask = {}
+        Sleep = { param($milliseconds) }
+    }
+    $scheduledStop = Invoke-CodexBridgeServiceAction -Action 'stop-temporary' -ToolDir $reviewRuntimeRoot -Operations $scheduledOps -PollAttempts 2 -PollMilliseconds 0
+    if (-not $scheduledStop.ok -or $scheduledState.stopTask -ne 1 -or $scheduledState.stopRuntime -ne 0 -or -not $scheduledState.enabled) {
+        throw 'temporary stop did not use the fixed scheduled task while preserving auto-start'
+    }
+
+    $timeoutState = @{ installed=$true; enabled=$false; running=$false; starts=0 }
+    $timeoutOps = @{
+        GetTask = { [pscustomobject]@{ installed=$timeoutState.installed; enabled=$timeoutState.enabled; running=$timeoutState.running } }
+        GetRuntime = { $null }
+        StartDetached = { param($path,$mode) $timeoutState.starts++ }
+        StartTask = { $timeoutState.starts++ }
+        StopTask = {}; StopRuntime = {}; InstallTask = {}; EnableTask = {}; DisableTask = {}
+        Sleep = { param($milliseconds) }
+    }
+    $timedOutStart = Invoke-CodexBridgeServiceAction -Action 'start-temporary' -ToolDir $reviewRuntimeRoot -Operations $timeoutOps -PollAttempts 2 -PollMilliseconds 0
+    if ($timedOutStart.ok -or $timedOutStart.errorCategory -ne 'service-action-incomplete' -or $timeoutState.starts -ne 1 -or $timedOutStart.service.running) {
+        throw 'an unpublished asynchronous start was reported as successful'
+    }
+
+    $publicationState = @{ installed=$true; enabled=$false; running=$false; pending=$false; starts=0 }
+    $publicationOps = @{
+        GetTask = { [pscustomobject]@{ installed=$publicationState.installed; enabled=$publicationState.enabled; running=$publicationState.running } }
+        GetRuntime = { if ($publicationState.running) { [pscustomobject]@{ processId=705; creationTimeUtc='2026-09-01T13:00:00.0000000Z'; mode='temporary' } } }
+        StartDetached = { param($path,$mode) $publicationState.starts++; $publicationState.pending=$true }
+        StartTask = {}; StopTask = {}; StopRuntime = {}; InstallTask = {}; EnableTask = {}; DisableTask = {}
+        Sleep = { param($milliseconds) if ($publicationState.pending) { $publicationState.pending=$false; $publicationState.running=$true } }
+    }
+    $publishedStart = Invoke-CodexBridgeServiceAction -Action 'start-temporary' -ToolDir $reviewRuntimeRoot -Operations $publicationOps -PollAttempts 3 -PollMilliseconds 0
+    if (-not $publishedStart.ok -or -not $publicationState.running -or $publicationState.starts -ne 1) {
+        throw 'a delayed temporary runtime publication was not observed by the bounded status poll'
+    }
+
+    $idempotentState = @{ installed=$true; enabled=$true; running=$true; enables=0; starts=0 }
+    $idempotentOps = @{
+        GetTask = { [pscustomobject]@{ installed=$idempotentState.installed; enabled=$idempotentState.enabled; running=$idempotentState.running } }
+        GetRuntime = { [pscustomobject]@{ processId=704; creationTimeUtc='2026-09-01T13:00:00.0000000Z'; mode='scheduled' } }
+        EnableTask = { $idempotentState.enables++ }; StartTask = { $idempotentState.starts++ }
+        InstallTask = {}; DisableTask = {}; StopTask = {}; StopRuntime = {}; StartDetached = {}; Sleep = { param($milliseconds) }
+    }
+    $idempotentEnable = Invoke-CodexBridgeServiceAction -Action 'enable-long-term' -ToolDir $reviewRuntimeRoot -Operations $idempotentOps -PollAttempts 1 -PollMilliseconds 0
+    if (-not $idempotentEnable.ok -or $idempotentState.enables -ne 0 -or $idempotentState.starts -ne 0) {
+        throw 'repeating long-term enable was not idempotent for an already scheduled runtime'
+    }
+}
+finally {
+    Remove-Item -LiteralPath $reviewRuntimeRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 $entrypoint = Join-Path $sourceRoot 'codex-control.ps1'
 $invalidJson = @(& pwsh -NoProfile -File $entrypoint -Action 'arbitrary-action' 2>$null)
 if ($LASTEXITCODE -eq 0) { throw 'entrypoint accepted an arbitrary action' }

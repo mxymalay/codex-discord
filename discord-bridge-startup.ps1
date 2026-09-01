@@ -118,18 +118,10 @@ function Read-ValidatedBridgeRuntimeIdentity {
     )
 
     try {
-        if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
-            return $null
-        }
-        $identity = Get-Content -Raw -LiteralPath $Path | ConvertFrom-Json
-        $processId = 0
-        if ($identity.version -ne 1 -or -not [int]::TryParse([string]$identity.processId, [ref]$processId) -or $processId -le 0 -or $identity.mode -notin @('scheduled', 'temporary')) {
-            return $null
-        }
+        $identity = Read-BridgeRuntimeIdentityCandidate -Path $Path -ToolDir $ToolDir
+        if ($null -eq $identity) { return $null }
+        $processId = [int]$identity.processId
         $identityCreationTime = ConvertTo-BridgeRuntimeTimeUtc -Value $identity.creationTimeUtc
-        if ($null -eq $identityCreationTime -or $identity.toolDirHash -cne (Get-ControlPathHash -Path $ToolDir)) {
-            return $null
-        }
         foreach ($process in @($Processes)) {
             if ($null -eq $process) { continue }
             $candidateId = 0
@@ -149,6 +141,25 @@ function Read-ValidatedBridgeRuntimeIdentity {
     }
     catch {}
     return $null
+}
+
+function Read-BridgeRuntimeIdentityCandidate {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$ToolDir
+    )
+
+    try {
+        if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+        $identity = Get-Content -Raw -LiteralPath $Path | ConvertFrom-Json
+        $processId = 0
+        if ($identity.version -ne 1 -or -not [int]::TryParse([string]$identity.processId, [ref]$processId) -or $processId -le 0 -or $identity.mode -notin @('scheduled', 'temporary')) { return $null }
+        $creationTime = ConvertTo-BridgeRuntimeTimeUtc -Value $identity.creationTimeUtc
+        if ($null -eq $creationTime -or $identity.toolDirHash -cne (Get-ControlPathHash -Path $ToolDir)) { return $null }
+        return [pscustomobject][ordered]@{ version=1; processId=$processId; creationTimeUtc=$creationTime.ToString('o'); mode=[string]$identity.mode; toolDirHash=[string]$identity.toolDirHash }
+    }
+    catch { return $null }
 }
 
 function Remove-BridgeRuntimeIdentity {
