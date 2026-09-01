@@ -34,6 +34,19 @@ function event(timestamp, type, overrides = {}) {
   return { timestamp, type: 'event_msg', payload: { type, ...overrides } };
 }
 
+function responseMessage(timestamp, role, text, phase) {
+  return {
+    timestamp,
+    type: 'response_item',
+    payload: {
+      type: 'message',
+      role,
+      content: [{ type: role === 'user' ? 'input_text' : 'output_text', text }],
+      ...(phase ? { phase } : {}),
+    },
+  };
+}
+
 async function fixture() {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'discord-task-index-'));
   return {
@@ -60,6 +73,15 @@ test('accepts only matching sidebar user roots', () => {
   assert.equal(isUserRootSession({ id: 'root-1' }, null), false);
 });
 
+test('root eligibility fails closed on empty IDs and compares dispatcher identity fields case-insensitively', () => {
+  assert.equal(isUserRootSession({}, {}), false);
+  assert.equal(isUserRootSession({ id: '' }, { id: '' }), false);
+  assert.equal(isUserRootSession({ id: '   ' }, { id: '   ' }), false);
+  assert.equal(isUserRootSession({ id: 'ROOT-A', session_id: 'root-a', thread_source: 'USER' }, { id: 'root-a' }), true);
+  assert.equal(isUserRootSession({ id: 'ROOT-A', session_id: 'other', thread_source: 'USER' }, { id: 'root-a' }), false);
+  assert.equal(isUserRootSession({ id: 'ROOT-A', thread_source: 'SUBAGENT' }, { id: 'root-a' }), false);
+});
+
 test('indexes sidebar user roots, uses the last sidebar title, and excludes every non-root form', async () => {
   const paths = await fixture();
   try {
@@ -68,7 +90,7 @@ test('indexes sidebar user roots, uses the last sidebar title, and excludes ever
       { id: 'child-source', thread_name: 'source child' },
       { id: 'child-parent', thread_name: 'parented child' },
       { id: 'child-session', thread_name: 'session child' },
-      { id: 'root-1', thread_name: '主任务' },
+      { id: 'ROOT-1', thread_name: '主任务' },
       { id: 'missing-rollout', thread_name: '没有 rollout' },
     ], '{ invalid sidebar line\n');
     await writeJsonl(paths.rollout('root-1'), [
@@ -137,6 +159,48 @@ test('derives running and failed status and sums only timestamped turn runtime',
     assert.equal(byId['failed-1'].runtimeMs, 180_000);
     assert.equal(byId['aborted-1'].status, 'failed');
     assert.equal(byId['aborted-1'].runtimeMs, 150_000);
+  } finally {
+    await fs.rm(paths.root, { recursive: true, force: true });
+  }
+});
+
+test('reports unknown runtime when any completed, active, or unmatched interval is not fully bounded', async () => {
+  const paths = await fixture();
+  try {
+    await writeJsonl(paths.sessionIndexPath, [
+      { id: 'missing-start-time', thread_name: '缺开始时间' },
+      { id: 'missing-end-time', thread_name: '缺结束时间' },
+      { id: 'missing-active-time', thread_name: '缺运行中时间' },
+      { id: 'unmatched-prior', thread_name: '前序未配对' },
+    ]);
+    await writeJsonl(paths.rollout('missing-start-time'), [
+      meta('missing-start-time'),
+      event(undefined, 'task_started', { turn_id: 'turn-1' }),
+      event('2026-09-01T00:02:00.000Z', 'task_complete', { turn_id: 'turn-1' }),
+    ]);
+    await writeJsonl(paths.rollout('missing-end-time'), [
+      meta('missing-end-time'),
+      event('2026-09-01T00:01:00.000Z', 'task_started', { turn_id: 'turn-1' }),
+      event(undefined, 'task_complete', { turn_id: 'turn-1' }),
+    ]);
+    await writeJsonl(paths.rollout('missing-active-time'), [
+      meta('missing-active-time'),
+      event(undefined, 'task_started', { turn_id: 'turn-1' }),
+    ]);
+    await writeJsonl(paths.rollout('unmatched-prior'), [
+      meta('unmatched-prior'),
+      event('2026-09-01T00:01:00.000Z', 'task_started', { turn_id: 'turn-old' }),
+      event('2026-09-01T00:03:00.000Z', 'task_started', { turn_id: 'turn-current' }),
+      event('2026-09-01T00:04:00.000Z', 'task_complete', { turn_id: 'turn-current' }),
+    ]);
+
+    const index = await buildTaskIndex({ ...paths, nowMs: Date.parse('2026-09-01T00:05:00.000Z') });
+    assert.deepEqual(Object.fromEntries(index.tasks.map((item) => [item.threadId, item.runtimeMs])), {
+      'missing-start-time': null,
+      'missing-end-time': null,
+      'missing-active-time': null,
+      'unmatched-prior': null,
+    });
   } finally {
     await fs.rm(paths.root, { recursive: true, force: true });
   }
@@ -224,6 +288,53 @@ test('reads first task, latest completed result, and page-safe Markdown on deman
     assert.match(detail.markdown, /## 原始任务\n修复 \*\*支付\*\* 通知/);
     assert.match(detail.markdown, /## 最新结果\n最终结果/);
     assert.equal(detail.markdown.includes('@everyone'), false);
+  } finally {
+    await fs.rm(paths.root, { recursive: true, force: true });
+  }
+});
+
+test('reads current response-item messages using first user and latest final assistant semantics', async () => {
+  const paths = await fixture();
+  try {
+    const rolloutPath = paths.rollout('current-detail');
+    await writeJsonl(rolloutPath, [
+      meta('current-detail'),
+      responseMessage('2026-09-01T00:01:00.000Z', 'user', '检查 webhook@example.invalid 的通知映射'),
+      responseMessage('2026-09-01T00:01:10.000Z', 'assistant', '正在检查临时路径 C:\\Users\\Example\\secret', 'commentary'),
+      responseMessage('2026-09-01T00:02:00.000Z', 'assistant', '第一轮已完成。', 'final_answer'),
+      responseMessage('2026-09-01T00:03:00.000Z', 'user', '再验证一次，但首条任务仍应保留。'),
+      responseMessage('2026-09-01T00:04:00.000Z', 'assistant', '最终验证完成，未保留凭据。', 'final_answer'),
+    ]);
+    const record = { threadId: 'current-detail', taskName: '通知映射', projectName: 'Bridge', rolloutPath, offset: (await fs.stat(rolloutPath)).size };
+    const detail = await readTaskDetail(record);
+    assert.equal(detail.contentAvailable, true);
+    assert.equal(detail.taskText, '检查 webhook@example.invalid 的通知映射');
+    assert.equal(detail.resultText, '最终验证完成，未保留凭据。');
+    assert.equal(detail.resultText.includes('临时路径'), false);
+    assert.deepEqual((await searchTasks({ index: { tasks: [record] }, keyword: '凭据' })).map((item) => item.threadId), ['current-detail']);
+  } finally {
+    await fs.rm(paths.root, { recursive: true, force: true });
+  }
+});
+
+test('marks missing rollout content unavailable and retries the same search cache key after restoration', async () => {
+  const paths = await fixture();
+  try {
+    const rolloutPath = paths.rollout('restored');
+    const restoredEntries = [meta('restored'), responseMessage('2026-09-01T00:01:00.000Z', 'user', '恢复后可搜索的唯一文字')];
+    const restoredContent = restoredEntries.map(line).join('');
+    const record = {
+      threadId: 'restored', taskName: '普通任务', projectName: 'Bridge',
+      status: 'completed', rolloutPath, offset: Buffer.byteLength(restoredContent),
+    };
+    const unavailable = await readTaskDetail(record);
+    assert.equal(unavailable.threadId, 'restored');
+    assert.equal(unavailable.contentAvailable, false);
+    assert.match(unavailable.markdown, /内容暂不可用/);
+    assert.deepEqual(await searchTasks({ index: { tasks: [record] }, keyword: '唯一文字' }), []);
+
+    await writeJsonl(rolloutPath, restoredEntries);
+    assert.deepEqual((await searchTasks({ index: { tasks: [record] }, keyword: '唯一文字' })).map((item) => item.threadId), ['restored']);
   } finally {
     await fs.rm(paths.root, { recursive: true, force: true });
   }

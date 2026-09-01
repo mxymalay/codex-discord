@@ -40,6 +40,10 @@ function stringOrNull(value) {
   return text || null;
 }
 
+function identityKey(value) {
+  return String(value ?? '').trim().toLocaleLowerCase();
+}
+
 function textValue(value) {
   if (typeof value === 'string') return value;
   if (!Array.isArray(value)) return '';
@@ -58,12 +62,19 @@ function normalizeSearch(value) {
 }
 
 export function isUserRootSession(meta, sidebarEntry) {
-  if (!meta || !sidebarEntry || String(meta.id ?? '') !== String(sidebarEntry.id ?? '')) return false;
-  if (String(meta.thread_source ?? '') === 'subagent') return false;
-  if (meta.thread_source && String(meta.thread_source) !== 'user') return false;
-  if (meta.source?.subagent != null) return false;
-  if (String(meta.parent_thread_id ?? '')) return false;
-  if (meta.session_id && String(meta.session_id) !== String(meta.id)) return false;
+  if (!meta || typeof meta !== 'object' || !sidebarEntry || typeof sidebarEntry !== 'object') return false;
+  const metaId = String(meta.id ?? '').trim();
+  const sidebarId = String(sidebarEntry.id ?? '').trim();
+  if (!metaId || !sidebarId || metaId.toLocaleLowerCase() !== sidebarId.toLocaleLowerCase()) return false;
+  const threadSource = String(meta.thread_source ?? '').trim().toLocaleLowerCase();
+  if (threadSource === 'subagent') return false;
+  if (threadSource && threadSource !== 'user') return false;
+  if (meta.source && typeof meta.source === 'object' && Object.entries(meta.source).some(
+    ([key, value]) => key.toLocaleLowerCase() === 'subagent' && value != null,
+  )) return false;
+  if (String(meta.parent_thread_id ?? '').trim()) return false;
+  const sessionId = String(meta.session_id ?? '').trim();
+  if (sessionId && sessionId.toLocaleLowerCase() !== metaId.toLocaleLowerCase()) return false;
   return true;
 }
 
@@ -87,7 +98,7 @@ async function readSidebarEntries(sessionIndexPath) {
   const byId = new Map();
   for (const entry of parseJsonLines(content)) {
     const id = stringOrNull(entry?.id);
-    if (id) byId.set(id, entry);
+    if (id) byId.set(identityKey(id), entry);
   }
   return byId;
 }
@@ -122,12 +133,13 @@ function newestMappings(messageMap) {
     const mappedAt = validTime(mapping?.createdAt);
     const numericId = /^\d+$/u.test(messageId) ? BigInt(messageId) : null;
     const candidate = { mapping, mappedAt, numericId, order };
-    const current = byThread.get(threadId);
+    const key = identityKey(threadId);
+    const current = byThread.get(key);
     const newer = !current ||
       (mappedAt != null && (current.mappedAt == null || mappedAt > current.mappedAt)) ||
       (mappedAt === current.mappedAt && numericId != null && current.numericId != null && numericId > current.numericId) ||
       (mappedAt === current.mappedAt && numericId === current.numericId && order > current.order);
-    if (newer) byThread.set(threadId, candidate);
+    if (newer) byThread.set(key, candidate);
   }
   return byThread;
 }
@@ -188,6 +200,7 @@ function buildRecord({ entries, rolloutPath, offset, sidebarEntry, previous, now
   let statusChangedMs = null;
   let status = 'pending';
   let runtimeMs = 0;
+  let runtimeComplete = true;
   let activeTurnId = null;
   const turns = new Map();
   let generatedTurn = 0;
@@ -203,7 +216,9 @@ function buildRecord({ entries, rolloutPath, offset, sidebarEntry, previous, now
     const type = String(payload.type ?? '');
     if (type === 'task_started') {
       const turnId = stringOrNull(payload.turn_id) ?? `generated-${generatedTurn += 1}`;
-      if (timestampMs != null) turns.set(turnId, timestampMs);
+      if (turns.has(turnId)) runtimeComplete = false;
+      if (timestampMs == null) runtimeComplete = false;
+      turns.set(turnId, timestampMs);
       activeTurnId = turnId;
       firstStartedMs = timestampMs == null ? firstStartedMs : (firstStartedMs == null ? timestampMs : Math.min(firstStartedMs, timestampMs));
       status = 'running';
@@ -214,8 +229,10 @@ function buildRecord({ entries, rolloutPath, offset, sidebarEntry, previous, now
     const terminal = type === 'task_complete' || isFailureType(type) || isFailureType(payload.status);
     if (!terminal) continue;
     const turnId = stringOrNull(payload.turn_id) ?? activeTurnId;
-    const startedMs = turnId ? turns.get(turnId) : null;
-    if (timestampMs != null && startedMs != null && timestampMs >= startedMs) runtimeMs += timestampMs - startedMs;
+    const hasStart = Boolean(turnId) && turns.has(turnId);
+    const startedMs = hasStart ? turns.get(turnId) : null;
+    if (!hasStart || timestampMs == null || startedMs == null || timestampMs < startedMs) runtimeComplete = false;
+    else runtimeMs += timestampMs - startedMs;
     if (turnId) turns.delete(turnId);
     if (!turnId || activeTurnId === turnId) activeTurnId = null;
     status = type === 'task_complete' && !isFailureType(payload.status) ? 'completed' : 'failed';
@@ -225,9 +242,11 @@ function buildRecord({ entries, rolloutPath, offset, sidebarEntry, previous, now
 
   if (activeTurnId) {
     const activeStartedMs = turns.get(activeTurnId);
-    if (activeStartedMs != null && Number.isFinite(nowMs) && nowMs >= activeStartedMs) runtimeMs += nowMs - activeStartedMs;
+    if (activeStartedMs == null || !Number.isFinite(nowMs) || nowMs < activeStartedMs) runtimeComplete = false;
+    else runtimeMs += nowMs - activeStartedMs;
     status = 'running';
   }
+  if ([...turns.keys()].some((turnId) => turnId !== activeTurnId)) runtimeComplete = false;
 
   const mappingEvent = String(latestMapping?.mapping?.eventName ?? '');
   const mappingIsCurrent = latestMapping && (latestMapping.mappedAt == null || statusChangedMs == null || latestMapping.mappedAt >= statusChangedMs);
@@ -251,7 +270,7 @@ function buildRecord({ entries, rolloutPath, offset, sidebarEntry, previous, now
     lastActivityAt: isoTime(lastActivityMs),
     startedAt: isoTime(firstStartedMs),
     completedAt: status === 'running' ? null : isoTime(latestTerminalMs),
-    runtimeMs,
+    runtimeMs: runtimeComplete ? runtimeMs : null,
     rolloutPath,
     offset,
     ...worktree,
@@ -269,7 +288,7 @@ export async function buildTaskIndex({
   const sidebarEntries = await readSidebarEntries(sessionIndexPath);
   const messageMap = await readOptionalJson(messageMapPath, { version: 1, messages: {} });
   const mappings = newestMappings(messageMap);
-  const previousById = new Map((previousIndex?.tasks ?? []).map((record) => [String(record.threadId), record]));
+  const previousById = new Map((previousIndex?.tasks ?? []).map((record) => [identityKey(record.threadId), record]));
   const worktreeRoot = configuredWorktreeRoot(discordWorktreeRoot, previousIndex);
   const recordsById = new Map();
 
@@ -289,11 +308,11 @@ export async function buildTaskIndex({
       entries,
       rolloutPath,
       offset: Buffer.byteLength(content),
-      sidebarEntry: sidebarEntries.get(threadId),
-      previous: previousById.get(threadId),
+      sidebarEntry: sidebarEntries.get(identityKey(threadId)),
+      previous: previousById.get(identityKey(threadId)),
       nowMs: Number(nowMs),
       worktreeRoot,
-      latestMapping: mappings.get(threadId),
+      latestMapping: mappings.get(identityKey(threadId)),
     });
     if (!record) continue;
     const current = recordsById.get(threadId);
@@ -315,25 +334,44 @@ async function readRecordEntries(record) {
 }
 
 export async function readTaskDetail(record) {
-  const entries = await readRecordEntries(record);
+  let entries;
+  try {
+    entries = await readRecordEntries(record);
+  } catch {
+    return {
+      ...record,
+      contentAvailable: false,
+      taskText: '',
+      resultText: '',
+      markdown: '## 任务内容\n内容暂不可用，请稍后重试。',
+    };
+  }
   let taskText = '';
   let resultText = '';
   let latestAgentText = '';
   for (const entry of entries) {
-    if (entry?.type !== 'event_msg') continue;
     const payload = entry.payload ?? {};
-    if (payload.type === 'user_message' && !taskText) {
-      taskText = cleanPageText(textValue(payload.message ?? payload.content));
+    if (entry?.type === 'event_msg') {
+      if (payload.type === 'user_message' && !taskText) {
+        taskText = cleanPageText(textValue(payload.message ?? payload.content));
+        continue;
+      }
+      if (payload.type === 'agent_message') {
+        const candidate = cleanPageText(textValue(payload.message ?? payload.content));
+        if (candidate) latestAgentText = candidate;
+        continue;
+      }
+      if (payload.type === 'task_complete') {
+        const candidate = cleanPageText(textValue(payload.last_agent_message ?? payload.message));
+        if (candidate) resultText = candidate;
+      }
       continue;
     }
-    if (payload.type === 'agent_message') {
-      const candidate = cleanPageText(textValue(payload.message ?? payload.content));
-      if (candidate) latestAgentText = candidate;
-      continue;
-    }
-    if (payload.type === 'task_complete') {
-      const candidate = cleanPageText(textValue(payload.last_agent_message ?? payload.message));
-      if (candidate) resultText = candidate;
+    if (entry?.type === 'response_item' && payload.type === 'message') {
+      const role = String(payload.role ?? '').toLocaleLowerCase();
+      const candidate = cleanPageText(textValue(payload.content));
+      if (role === 'user' && !taskText && candidate) taskText = candidate;
+      if (role === 'assistant' && candidate && (!payload.phase || payload.phase === 'final_answer')) resultText = candidate;
     }
   }
   if (!resultText) resultText = latestAgentText;
@@ -344,7 +382,7 @@ export async function readTaskDetail(record) {
     '## 最新结果',
     resultText || '（暂无结果）',
   ].join('\n');
-  return { ...record, taskText, resultText, markdown };
+  return { ...record, contentAvailable: true, taskText, resultText, markdown };
 }
 
 function taskSummary(record, matchScore) {
@@ -372,13 +410,13 @@ export async function searchTasks({ index, keyword, limit = 10 }) {
       const key = `${path.resolve(String(record?.rolloutPath ?? ''))}\u0000${Number(record?.offset ?? 0)}`;
       let body = detailSearchCache.get(key);
       if (body === undefined) {
-        try {
-          const detail = await readTaskDetail(record);
+        const detail = await readTaskDetail(record);
+        if (detail.contentAvailable) {
           body = normalizeSearch(`${detail.taskText}\n${detail.resultText}`);
-        } catch {
+          detailSearchCache.set(key, body);
+        } else {
           body = '';
         }
-        detailSearchCache.set(key, body);
       }
       if (body.includes(query)) score = 100;
     }
