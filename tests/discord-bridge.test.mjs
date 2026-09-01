@@ -5,6 +5,7 @@ import path from 'node:path';
 import test from 'node:test';
 
 import {
+  AppServerClient,
   buildCodexAppServerMessages,
   classifyReply,
   compareSnowflakes,
@@ -12,12 +13,14 @@ import {
   discordRequest,
   enqueuePendingReply,
   getPendingReplies,
+  initializeAppServerClient,
   initializeInboxCursors,
   isActiveWriterError,
   migrateLegacyPendingReplies,
   recordInboxMessage,
   removePendingReply,
   resolveCodexExecutable,
+  resumeCodexThread,
 } from '../discord-bridge-lib.mjs';
 
 const config = {
@@ -109,6 +112,67 @@ test('builds initialize, resume, and turn requests without creating a new thread
   assert.equal(messages[2].params.threadId, '11111111-1111-4111-8111-111111111111');
   assert.equal(messages[2].params.cwd, 'C:\\workspace\\demo');
   assert.deepEqual(messages[3].params.input, [{ type: 'text', text: '重新检查一次，只修改显示格式。' }]);
+});
+
+test('exports the App Server client and initializes reusable clients before requests', async () => {
+  const messages = [];
+  const client = {
+    async request(message) {
+      messages.push(message);
+      return {};
+    },
+    send(message) {
+      messages.push(message);
+    },
+  };
+
+  assert.equal(typeof AppServerClient, 'function');
+  await initializeAppServerClient(client);
+  assert.deepEqual(messages, [
+    {
+      method: 'initialize',
+      id: 1,
+      params: { clientInfo: { name: 'codex-discord-bridge', version: '1.0.0' } },
+    },
+    { method: 'initialized', params: {} },
+  ]);
+});
+
+test('resume uses the reusable initializer before preserving resume and turn completion order', async () => {
+  const methods = [];
+  const client = {
+    async request(message) {
+      methods.push(message.method);
+      if (message.method === 'thread/resume') return { thread: { id: 'thread-resume' } };
+      if (message.method === 'turn/start') return { turn: { id: 'turn-resume' } };
+      return {};
+    },
+    send(message) {
+      methods.push(message.method);
+    },
+    waitForTurn(turnId) {
+      assert.equal(turnId, 'turn-resume');
+      methods.push('waitForTurn');
+      return Promise.resolve({ turn: { id: turnId } });
+    },
+    close() {
+      methods.push('close');
+    },
+  };
+
+  const resumed = await resumeCodexThread({
+    threadId: 'thread-resume',
+    cwd: 'C:\\workspace',
+    processCwd: 'C:\\workspace',
+    text: 'continue',
+    codexPath: 'not-used',
+    clientFactory: () => client,
+  });
+  assert.equal(resumed.turnId, 'turn-resume');
+  await resumed.completion;
+  assert.deepEqual(methods, [
+    'initialize', 'initialized', 'thread/resume', 'turn/start', 'waitForTurn', 'close',
+  ]);
 });
 
 test('orders Discord Snowflakes numerically', () => {

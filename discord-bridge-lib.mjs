@@ -160,8 +160,7 @@ export function buildCodexAppServerMessages({ threadId, cwd, text }) {
       id: 1,
       params: {
         clientInfo: {
-          name: 'codex_discord_bridge',
-          title: 'Codex Discord Bridge',
+          name: 'codex-discord-bridge',
           version: '1.0.0',
         },
       },
@@ -361,7 +360,7 @@ export function decryptPendingReplyText({ toolDir, powershellPath = 'pwsh', ciph
   return transformPendingReplyText({ toolDir, powershellPath, scriptName: 'unprotect-discord-pending-reply.ps1', value: ciphertext });
 }
 
-class AppServerClient {
+export class AppServerClient {
   constructor({ codexPath, cwd }) {
     this.child = spawn(codexPath, ['app-server', '--stdio'], {
       cwd,
@@ -461,12 +460,22 @@ class AppServerClient {
   }
 }
 
-export async function resumeCodexThread({ threadId, cwd, processCwd = cwd, text, codexPath }) {
-  const client = new AppServerClient({ codexPath, cwd: processCwd });
+export async function initializeAppServerClient(client) {
+  await client.request({
+    method: 'initialize',
+    id: 1,
+    params: { clientInfo: { name: 'codex-discord-bridge', version: '1.0.0' } },
+  });
+  client.send({ method: 'initialized', params: {} });
+}
+
+export async function resumeCodexThread({ threadId, cwd, processCwd = cwd, text, codexPath, clientFactory }) {
+  const client = clientFactory
+    ? clientFactory({ codexPath, cwd: processCwd })
+    : new AppServerClient({ codexPath, cwd: processCwd });
   const messages = buildCodexAppServerMessages({ threadId, cwd, text });
   try {
-    await client.request(messages[0]);
-    client.send(messages[1]);
+    await initializeAppServerClient(client);
     const resumed = await client.request(messages[2]);
     const resumedThreadId = String(resumed?.thread?.id ?? '');
     if (resumedThreadId !== threadId) throw new Error('Codex App Server resumed a different thread');
