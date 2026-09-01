@@ -197,6 +197,40 @@ test('retires a reconnecting socket and ignores its stale events', async () => {
   assert.equal(client.getStatus().state, 'connecting');
 });
 
+test('does not deliver a queued interaction after stop and accepts it once after restart', async () => {
+  const { client, interactions, sockets } = createHarness();
+  await client.start();
+  sockets[0].receive({ op: 10, d: { heartbeat_interval: 45_000 } });
+  sockets[0].receive({ op: 0, t: 'INTERACTION_CREATE', s: 1, d: { id: 'interaction-1' } });
+  await client.stop();
+  await Promise.resolve();
+
+  assert.deepEqual(interactions, []);
+  await client.start();
+  sockets[1].receive({ op: 10, d: { heartbeat_interval: 45_000 } });
+  sockets[1].receive({ op: 0, t: 'INTERACTION_CREATE', s: 2, d: { id: 'interaction-1' } });
+  await Promise.resolve();
+
+  assert.deepEqual(interactions, ['interaction-1']);
+});
+
+test('does not deliver a queued interaction after reconnect and accepts it once on the new socket', async () => {
+  const { client, interactions, sockets, timers } = createHarness();
+  await client.start();
+  sockets[0].receive({ op: 10, d: { heartbeat_interval: 45_000 } });
+  sockets[0].receive({ op: 0, t: 'INTERACTION_CREATE', s: 1, d: { id: 'interaction-1' } });
+  sockets[0].receive({ op: 7, d: null });
+  await Promise.resolve();
+
+  assert.deepEqual(interactions, []);
+  await timers.advance(1_000);
+  sockets[1].receive({ op: 10, d: { heartbeat_interval: 45_000 } });
+  sockets[1].receive({ op: 0, t: 'INTERACTION_CREATE', s: 2, d: { id: 'interaction-1' } });
+  await Promise.resolve();
+
+  assert.deepEqual(interactions, ['interaction-1']);
+});
+
 test('ignores a stopped start request when its gateway fetch resolves late', async () => {
   const sockets = [];
   let resolveFirstFetch;

@@ -156,8 +156,16 @@ export function createGatewayClient({
     }
     publish();
     if (frame.t === 'INTERACTION_CREATE' && typeof frame.d?.id === 'string' && rememberInteraction(frame.d.id)) {
+      const interaction = frame.d;
+      const interactionId = interaction.id;
       Promise.resolve()
-        .then(() => onInteraction(frame.d))
+        .then(() => {
+          if (!isLifecycleActive(lifecycle) || connection !== activeConnectionGeneration) {
+            deliveredInteractions.delete(interactionId);
+            return undefined;
+          }
+          return onInteraction(interaction);
+        })
         .catch(() => {
           if (isLifecycleActive(lifecycle) && connection === activeConnectionGeneration) {
             status.lastError = 'interaction-handler-failed';
