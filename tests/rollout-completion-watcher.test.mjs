@@ -77,7 +77,8 @@ test('baselines existing bytes but preserves the active turn context for the nex
     assert.equal(tracked.threadId, threadId);
     assert.equal(tracked.cwd, 'C:\\workspace\\demo');
     assert.equal(tracked.activeTurnId, turnId);
-    assert.deepEqual(tracked.inputMessages, ['请检查 Discord 通知为什么漏发']);
+    assert.equal(Object.hasOwn(tracked, 'inputMessages'), false);
+    assert.equal(JSON.stringify(state).includes('请检查 Discord 通知为什么漏发'), false);
     assert.equal(tracked.offset, (await fs.stat(paths.rolloutPath)).size);
   } finally {
     await fs.rm(paths.root, { recursive: true, force: true });
@@ -112,6 +113,8 @@ test('waits for a complete JSONL line and grace period, then dispatches one stan
       dispatchNotification: async (notification) => dispatched.push(notification),
     });
     assert.equal(dispatched.length, 0, 'the fallback must give the native hook time to deliver first');
+    assert.equal(JSON.stringify(state.pending).includes('请检查 Discord 通知为什么漏发'), false);
+    assert.equal(JSON.stringify(state.pending).includes('已经完成修复。'), false);
 
     await pollRolloutCompletions({
       sessionsRoot: paths.sessionsRoot,
@@ -149,6 +152,9 @@ test('persists an unfinished turn so a guard restart still catches its later com
     const beforeRestart = createEmptyRolloutWatcherState();
     await initializeRolloutWatcherState({ sessionsRoot: paths.sessionsRoot, state: beforeRestart });
     await writeRolloutWatcherState(paths.statePath, beforeRestart);
+    const stored = await fs.readFile(paths.statePath, 'utf8');
+    assert.equal(stored.includes('重启后也要提醒'), false);
+    assert.equal(stored.includes('重启后的任务已完成。'), false);
 
     await fs.appendFile(paths.rolloutPath, jsonLine(taskComplete('重启后的任务已完成。')), 'utf8');
     const afterRestart = await readRolloutWatcherState(paths.statePath);
@@ -202,6 +208,68 @@ test('keeps a failed fallback pending and retries it later', async () => {
     });
     assert.equal(attempts, 2);
     assert.equal(Object.keys(state.pending).length, 0);
+  } finally {
+    await fs.rm(paths.root, { recursive: true, force: true });
+  }
+});
+
+test('keeps only a sanitized locator when the canonical rollout is unavailable', async () => {
+  const paths = await fixture();
+  try {
+    await fs.writeFile(paths.rolloutPath, [sessionMeta(), taskStarted(), userMessage(), taskComplete()].map(jsonLine).join(''), 'utf8');
+    const state = createEmptyRolloutWatcherState();
+    await initializeRolloutWatcherState({ sessionsRoot: paths.sessionsRoot, state });
+    state.files[path.resolve(paths.rolloutPath)].offset = Buffer.byteLength(
+      [sessionMeta(), taskStarted(), userMessage()].map(jsonLine).join(''),
+    );
+    await pollRolloutCompletions({
+      sessionsRoot: paths.sessionsRoot,
+      state,
+      nowMs: Date.parse('2026-09-01T00:00:12.000Z'),
+      graceMs: 5_000,
+      dispatchNotification: async () => { throw new Error('dispatch must wait for grace period'); },
+    });
+    await fs.rm(paths.rolloutPath);
+    await assert.rejects(() => pollRolloutCompletions({
+      sessionsRoot: paths.sessionsRoot,
+      state,
+      nowMs: Date.parse('2026-09-01T00:00:20.000Z'),
+      graceMs: 5_000,
+      dispatchNotification: async () => {},
+    }), /Rollout content is unavailable/);
+    assert.equal(Object.keys(state.pending).length, 1);
+    assert.equal(JSON.stringify(state.pending).includes('请检查 Discord 通知为什么漏发'), false);
+    assert.equal(JSON.stringify(state.pending).includes('已经完成修复。'), false);
+  } finally {
+    await fs.rm(paths.root, { recursive: true, force: true });
+  }
+});
+
+test('migrates legacy watcher state without retaining conversation content', async () => {
+  const paths = await fixture();
+  try {
+    await fs.writeFile(paths.statePath, JSON.stringify({
+      version: 1,
+      initialized: true,
+      files: {
+        [paths.rolloutPath]: {
+          offset: 42,
+          threadId,
+          cwd: 'C:\\workspace\\demo',
+          activeTurnId: turnId,
+          inputMessages: ['do not retain this'],
+        },
+      },
+      pending: {
+        [turnId]: { notification: { 'input-messages': ['do not retain this'], 'last-assistant-message': 'do not retain this' } },
+      },
+    }), 'utf8');
+    const migrated = await readRolloutWatcherState(paths.statePath);
+    assert.equal(migrated.version, 2);
+    assert.equal(Object.hasOwn(migrated.files[paths.rolloutPath], 'inputMessages'), false);
+    assert.deepEqual(migrated.pending, {});
+    await writeRolloutWatcherState(paths.statePath, migrated);
+    assert.equal((await fs.readFile(paths.statePath, 'utf8')).includes('do not retain this'), false);
   } finally {
     await fs.rm(paths.root, { recursive: true, force: true });
   }

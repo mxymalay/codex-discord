@@ -74,9 +74,9 @@ $AllowedUserId = $AllowedUserId.Trim()
 
 $config = Get-Content -Raw -LiteralPath $configPath -Encoding UTF8 | ConvertFrom-Json
 $expectedApplicationId = if ([string]::IsNullOrWhiteSpace($ExpectedApplicationId)) { [string]$config.discordApplicationId } else { $ExpectedApplicationId }
-$taskWebhook = [string]$config.endpoint
-$confirmationWebhook = [string]$config.confirmationEndpoint
-$quotaWebhook = [string]$config.quotaEndpoint
+$taskWebhook = Get-DiscordConfigProperty -Config $config -Name 'endpoint'
+$confirmationWebhook = Get-DiscordConfigProperty -Config $config -Name 'confirmationEndpoint'
+$quotaWebhook = Get-DiscordConfigProperty -Config $config -Name 'quotaEndpoint'
 
 $authHeaders = New-DiscordBotHeaders -Token $token
 $botIdentity = Invoke-DiscordRead -Uri 'https://discord.com/api/v10/users/@me' -Headers $authHeaders

@@ -37,7 +37,8 @@ export function isActiveWriterError(error) {
   return /already has an active writer/i.test(String(error?.message ?? error ?? ''));
 }
 
-export function enqueuePendingReply(state, accepted, attemptedAt = new Date().toISOString()) {
+export function enqueuePendingReply(state, accepted, attemptedAt = new Date().toISOString(), encryptedText) {
+  if (!String(encryptedText ?? '').trim()) throw new Error('Pending reply text must be encrypted before it is persisted');
   state.version = 2;
   state.pendingReplies ??= {};
   const messageId = String(accepted.messageId);
@@ -46,7 +47,7 @@ export function enqueuePendingReply(state, accepted, attemptedAt = new Date().to
     messageId,
     referencedMessageId: String(accepted.referencedMessageId ?? ''),
     channelId: String(accepted.channelId),
-    text: String(accepted.text),
+    encryptedText: String(encryptedText),
     mapping: structuredClone(accepted.mapping),
     queuedAt: String(existing?.queuedAt ?? attemptedAt),
     lastAttemptAt: String(attemptedAt),
@@ -315,6 +316,34 @@ export async function loadDiscordToken({ toolDir, powershellPath = 'pwsh' }) {
       resolve(token);
     });
   });
+}
+
+async function transformPendingReplyText({ toolDir, powershellPath = 'pwsh', scriptName, value }) {
+  const helperPath = path.join(toolDir, scriptName);
+  return new Promise((resolve, reject) => {
+    const child = spawn(powershellPath, ['-NoProfile', '-File', helperPath], {
+      cwd: toolDir,
+      windowsHide: true,
+      stdio: ['pipe', 'pipe', 'ignore'],
+    });
+    let stdout = '';
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.on('error', () => reject(new Error('Unable to start the Discord pending-reply secret helper')));
+    child.on('close', (code) => {
+      if (code !== 0 || !stdout) reject(new Error('Unable to process Discord pending-reply text for this Windows account'));
+      else resolve(stdout);
+    });
+    child.stdin.end(String(value));
+  });
+}
+
+export function encryptPendingReplyText({ toolDir, powershellPath = 'pwsh', text }) {
+  return transformPendingReplyText({ toolDir, powershellPath, scriptName: 'protect-discord-pending-reply.ps1', value: text });
+}
+
+export function decryptPendingReplyText({ toolDir, powershellPath = 'pwsh', ciphertext }) {
+  return transformPendingReplyText({ toolDir, powershellPath, scriptName: 'unprotect-discord-pending-reply.ps1', value: ciphertext });
 }
 
 class AppServerClient {

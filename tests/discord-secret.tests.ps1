@@ -38,6 +38,15 @@ try {
         throw 'DPAPI round trip failed'
     }
 
+    $queuedText = 'Continue the original task with the approved migration steps.'
+    $queuedCipher = Protect-DiscordSecret -Value $queuedText
+    if ($queuedCipher.Contains($queuedText, [System.StringComparison]::Ordinal)) {
+        throw 'Plaintext continuation leaked into DPAPI ciphertext'
+    }
+    if ((Unprotect-DiscordSecret -Ciphertext $queuedCipher) -cne $queuedText) {
+        throw 'Queued continuation DPAPI round trip failed'
+    }
+
     try {
         Protect-DiscordBotToken -Token '   ' -Path (Join-Path $tempRoot 'blank.dpapi')
         throw 'Blank token was accepted'

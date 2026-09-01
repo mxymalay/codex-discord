@@ -1,5 +1,30 @@
 Set-StrictMode -Version Latest
 
+function Protect-DiscordSecret {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        throw '要加密的 Discord 内容不能为空'
+    }
+    $secure = ConvertTo-SecureString -String $Value -AsPlainText -Force
+    return ConvertFrom-SecureString -SecureString $secure
+}
+
+function Unprotect-DiscordSecret {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Ciphertext)
+
+    try {
+        $secure = ConvertTo-SecureString -String $Ciphertext
+        $credential = [System.Management.Automation.PSCredential]::new('discord-secret', $secure)
+        return $credential.GetNetworkCredential().Password
+    }
+    catch {
+        throw '无法使用当前 Windows 账户解密 Discord 内容'
+    }
+}
+
 function Protect-DiscordBotToken {
     [CmdletBinding()]
     param(
@@ -23,8 +48,7 @@ function Protect-DiscordBotToken {
         [void](New-Item -ItemType Directory -Path $parent -Force)
     }
 
-    $secure = ConvertTo-SecureString -String $Token -AsPlainText -Force
-    $cipher = ConvertFrom-SecureString -SecureString $secure
+    $cipher = Protect-DiscordSecret -Value $Token
     $temporaryPath = Join-Path $parent ('.{0}.{1}.tmp' -f ([System.IO.Path]::GetFileName($fullPath)), $PID)
 
     try {
@@ -54,9 +78,7 @@ function Unprotect-DiscordBotToken {
         if ([string]::IsNullOrWhiteSpace($cipher)) {
             throw 'Discord Bot Token 加密文件为空'
         }
-        $secure = ConvertTo-SecureString -String $cipher
-        $credential = [System.Management.Automation.PSCredential]::new('discord-bot', $secure)
-        return $credential.GetNetworkCredential().Password
+        return Unprotect-DiscordSecret -Ciphertext $cipher
     }
     catch {
         throw '无法使用当前 Windows 账户解密 Discord Bot Token'

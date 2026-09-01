@@ -174,7 +174,7 @@ test('Discord REST requests always send the required Bot user agent', async () =
   assert.match(observedHeaders['User-Agent'], /^DiscordBot \(.+, \d+\.\d+\.\d+\)$/);
 });
 
-test('queues an active-writer reply for later delivery without losing its task mapping', () => {
+test('queues an active-writer reply with encrypted text and no plaintext at rest', () => {
   const state = createEmptyInboxState();
   const accepted = classifyReply(makeMessage(), config, mapping, state);
   const now = '2026-08-31T10:00:00.000Z';
@@ -182,16 +182,18 @@ test('queues an active-writer reply for later delivery without losing its task m
   assert.equal(isActiveWriterError(new Error('Codex App Server rejected thread/resume: thread already has an active writer')), true);
   assert.equal(isActiveWriterError(new Error('Codex App Server rejected thread/resume: task not found')), false);
 
-  enqueuePendingReply(state, accepted, now);
+  enqueuePendingReply(state, accepted, now, 'dpapi-ciphertext');
   const pending = getPendingReplies(state);
   assert.equal(pending.length, 1);
   assert.equal(pending[0].messageId, accepted.messageId);
-  assert.equal(pending[0].text, accepted.text);
+  assert.equal(pending[0].encryptedText, 'dpapi-ciphertext');
+  assert.equal(Object.hasOwn(pending[0], 'text'), false);
+  assert.equal(JSON.stringify(state).includes(accepted.text), false);
   assert.equal(pending[0].mapping.threadId, accepted.mapping.threadId);
   assert.equal(pending[0].attempts, 1);
   assert.equal(pending[0].lastAttemptAt, now);
 
-  enqueuePendingReply(state, accepted, '2026-08-31T10:01:00.000Z');
+  enqueuePendingReply(state, accepted, '2026-08-31T10:01:00.000Z', 'dpapi-ciphertext');
   assert.equal(getPendingReplies(state)[0].attempts, 2);
   assert.equal(getPendingReplies(state)[0].lastAttemptAt, '2026-08-31T10:01:00.000Z');
 

@@ -5,6 +5,8 @@ import { fileURLToPath } from 'node:url';
 import {
   classifyReply,
   createEmptyInboxState,
+  decryptPendingReplyText,
+  encryptPendingReplyText,
   enqueuePendingReply,
   getDiscordMessagesAfter,
   getPendingReplies,
@@ -88,11 +90,15 @@ async function startMappedTurn({ token, config, state, accepted }) {
   const mappedCwd = await existingDirectory(String(accepted.mapping.cwd ?? ''));
   const wasPending = Boolean(state.pendingReplies?.[String(accepted.messageId)]);
   try {
+    const text = accepted.encryptedText
+      ? await decryptPendingReplyText({ toolDir, ciphertext: accepted.encryptedText })
+      : String(accepted.text ?? '');
+    if (!text.trim()) throw new Error('Discord reply text is unavailable');
     const started = await resumeCodexThread({
       threadId: String(accepted.mapping.threadId),
       cwd: mappedCwd ?? undefined,
       processCwd: mappedCwd ?? toolDir,
-      text: accepted.text,
+      text,
       codexPath: String(config.discordCodexPath ?? 'codex'),
     });
 
@@ -129,7 +135,8 @@ async function startMappedTurn({ token, config, state, accepted }) {
   } catch (error) {
     if (isActiveWriterError(error)) {
       const attemptedAt = new Date().toISOString();
-      enqueuePendingReply(state, accepted, attemptedAt);
+      const encryptedText = accepted.encryptedText ?? await encryptPendingReplyText({ toolDir, text: String(accepted.text ?? '') });
+      enqueuePendingReply(state, accepted, attemptedAt, encryptedText);
       recordInboxMessage(state, accepted.channelId, accepted.messageId, true);
       await saveState(state);
       await log(`turn queued message=${mask(accepted.messageId)} thread=${mask(accepted.mapping.threadId, 8)} active-writer=true`);

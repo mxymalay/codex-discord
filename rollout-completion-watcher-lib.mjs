@@ -3,7 +3,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 
-const stateVersion = 1;
+const stateVersion = 2;
 const maxMessageChars = 50_000;
 const maxInputMessages = 12;
 const metadataReadBytes = 512 * 1024;
@@ -17,6 +17,15 @@ export function createEmptyRolloutWatcherState() {
 export async function readRolloutWatcherState(statePath) {
   try {
     const state = JSON.parse(await fs.readFile(statePath, 'utf8'));
+    if (state?.version === 1 && typeof state.files === 'object') {
+      const files = Object.fromEntries(Object.entries(state.files).map(([filePath, fileState]) => [filePath, {
+        offset: Number(fileState?.offset ?? 0),
+        threadId: String(fileState?.threadId ?? ''),
+        cwd: String(fileState?.cwd ?? ''),
+        activeTurnId: String(fileState?.activeTurnId ?? ''),
+      }]));
+      return { version: stateVersion, initialized: Boolean(state.initialized), files, pending: {} };
+    }
     if (state?.version !== stateVersion || typeof state.files !== 'object' || typeof state.pending !== 'object') {
       throw new Error('invalid rollout watcher state');
     }
@@ -93,7 +102,7 @@ async function readRange(filePath, start, end) {
   }
 }
 
-function applyEntry(fileState, entry, pending, { emitCompletions }) {
+function applyEntry(filePath, fileState, entry, pending, { emitCompletions }) {
   if (entry?.type === 'session_meta') {
     fileState.threadId = String(entry.payload?.id ?? fileState.threadId ?? '');
     fileState.cwd = String(entry.payload?.cwd ?? fileState.cwd ?? '');
@@ -103,14 +112,6 @@ function applyEntry(fileState, entry, pending, { emitCompletions }) {
   const payload = entry.payload ?? {};
   if (payload.type === 'task_started') {
     fileState.activeTurnId = String(payload.turn_id ?? '');
-    fileState.inputMessages = [];
-    return;
-  }
-  if (payload.type === 'user_message') {
-    const message = boundedText(payload.message);
-    if (message.trim()) {
-      fileState.inputMessages = [...(fileState.inputMessages ?? []), message].slice(-maxInputMessages);
-    }
     return;
   }
   if (payload.type !== 'task_complete') return;
@@ -120,32 +121,26 @@ function applyEntry(fileState, entry, pending, { emitCompletions }) {
     pending[turnId] = {
       completedAtMs: Date.parse(String(entry.timestamp ?? '')) || Date.now(),
       lastAttemptAtMs: 0,
-      notification: {
-        type: 'agent-turn-complete',
-        'thread-id': fileState.threadId,
-        'turn-id': turnId,
-        cwd: String(fileState.cwd ?? ''),
-        'input-messages': [...(fileState.inputMessages ?? [])],
-        'last-assistant-message': boundedText(payload.last_agent_message),
-      },
+      rolloutPath: filePath,
+      threadId: fileState.threadId,
+      cwd: String(fileState.cwd ?? ''),
     };
   }
   if (!fileState.activeTurnId || fileState.activeTurnId === turnId) {
     fileState.activeTurnId = '';
-    fileState.inputMessages = [];
   }
 }
 
 async function hydrateExistingFile(filePath, info, nowMs) {
-  const fileState = { offset: info.size, threadId: '', cwd: '', activeTurnId: '', inputMessages: [] };
+  const fileState = { offset: info.size, threadId: '', cwd: '', activeTurnId: '' };
   const metadataBuffer = await readRange(filePath, 0, Math.min(info.size, metadataReadBytes));
-  for (const entry of parseLines(metadataBuffer)) applyEntry(fileState, entry, {}, { emitCompletions: false });
+  for (const entry of parseLines(metadataBuffer)) applyEntry(filePath, fileState, entry, {}, { emitCompletions: false });
 
   if (nowMs - info.mtimeMs <= recentContextWindowMs && info.size > 0) {
     const start = Math.max(0, info.size - recentTailBytes);
     const tail = await readRange(filePath, start, info.size);
     for (const entry of parseLines(tail, { dropFirstPartial: start > 0 })) {
-      applyEntry(fileState, entry, {}, { emitCompletions: false });
+      applyEntry(filePath, fileState, entry, {}, { emitCompletions: false });
     }
   }
   return fileState;
@@ -165,7 +160,6 @@ async function consumeFile(filePath, fileState, info, pending) {
   if (info.size < Number(fileState.offset ?? 0)) {
     fileState.offset = 0;
     fileState.activeTurnId = '';
-    fileState.inputMessages = [];
   }
   const start = Number(fileState.offset ?? 0);
   if (info.size <= start) return;
@@ -173,7 +167,7 @@ async function consumeFile(filePath, fileState, info, pending) {
   const lastNewline = bytes.lastIndexOf(0x0a);
   if (lastNewline < 0) return;
   const complete = bytes.subarray(0, lastNewline + 1);
-  for (const entry of parseLines(complete)) applyEntry(fileState, entry, pending, { emitCompletions: true });
+  for (const entry of parseLines(complete)) applyEntry(filePath, fileState, entry, pending, { emitCompletions: true });
   fileState.offset = start + complete.length;
 }
 
@@ -189,7 +183,7 @@ export async function pollRolloutCompletions({
   for (const filePath of await listRolloutFiles(sessionsRoot)) {
     const info = await fs.stat(filePath);
     if (!state.files[filePath]) {
-      state.files[filePath] = { offset: 0, threadId: '', cwd: '', activeTurnId: '', inputMessages: [] };
+      state.files[filePath] = { offset: 0, threadId: '', cwd: '', activeTurnId: '' };
     }
     await consumeFile(filePath, state.files[filePath], info, state.pending);
   }
@@ -199,10 +193,46 @@ export async function pollRolloutCompletions({
     .sort((left, right) => Number(left[1].completedAtMs) - Number(right[1].completedAtMs));
   for (const [turnId, item] of ready) {
     item.lastAttemptAtMs = nowMs;
-    await dispatchNotification(item.notification);
+    await dispatchNotification(await reconstructNotification(item, turnId));
     delete state.pending[turnId];
   }
   return state;
+}
+
+async function reconstructNotification(item, turnId) {
+  let content;
+  try {
+    content = await fs.readFile(String(item.rolloutPath ?? ''), 'utf8');
+  } catch {
+    throw new Error('Rollout content is unavailable; fallback notification will retry');
+  }
+  let activeTurnId = '';
+  let inputMessages = [];
+  for (const entry of parseLines(Buffer.from(content, 'utf8'))) {
+    if (entry?.type !== 'event_msg') continue;
+    const payload = entry.payload ?? {};
+    if (payload.type === 'task_started') {
+      activeTurnId = String(payload.turn_id ?? '');
+      inputMessages = [];
+      continue;
+    }
+    if (payload.type === 'user_message' && activeTurnId === String(turnId)) {
+      const message = boundedText(payload.message);
+      if (message.trim()) inputMessages = [...inputMessages, message].slice(-maxInputMessages);
+      continue;
+    }
+    if (payload.type === 'task_complete' && String(payload.turn_id ?? activeTurnId ?? '') === String(turnId)) {
+      return {
+        type: 'agent-turn-complete',
+        'thread-id': String(item.threadId ?? ''),
+        'turn-id': String(turnId),
+        cwd: String(item.cwd ?? ''),
+        'input-messages': inputMessages,
+        'last-assistant-message': boundedText(payload.last_agent_message),
+      };
+    }
+  }
+  throw new Error('Rollout completion content is unavailable; fallback notification will retry');
 }
 
 export async function dispatchNotificationViaPowerShell({ notification, toolDir, powershellPath }) {

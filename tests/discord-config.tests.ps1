@@ -43,10 +43,10 @@ if ([string]$result.discordTaskChannelId -ne '100000000000000004' -or
 if ([string]$result.discordTokenPath -ne 'C:\safe\discord-token.dpapi') {
     throw 'Encrypted token path was not saved'
 }
-if ([string]$result.legacyDiscordWebhooks.task -ne [string]$config.endpoint -or
-    [string]$result.legacyDiscordWebhooks.confirmation -ne [string]$config.confirmationEndpoint -or
-    [string]$result.legacyDiscordWebhooks.quota -ne [string]$config.quotaEndpoint) {
-    throw 'Legacy webhooks were not preserved for rollback'
+foreach ($name in @('endpoint', 'confirmationEndpoint', 'quotaEndpoint', 'legacyDiscordWebhooks')) {
+    if ($result.PSObject.Properties[$name]) {
+        throw "Credential-bearing property persisted after Bot migration: $name"
+    }
 }
 
 $validToken = 'AAAAAAAAAAAAAAAAAAAAAAAA.BBBBBB.CCCCCCCCCCCCCCCCCCCCCCCCCCC'
@@ -71,13 +71,10 @@ $activated = Enable-DiscordBotConfiguration -Config $result
 if ([string]$activated.provider -ne 'discord-bot') {
     throw 'Discord Bot provider was not activated'
 }
-if (-not [string]::IsNullOrWhiteSpace([string]$activated.endpoint) -or
-    -not [string]::IsNullOrWhiteSpace([string]$activated.confirmationEndpoint) -or
-    -not [string]::IsNullOrWhiteSpace([string]$activated.quotaEndpoint)) {
-    throw 'Active Discord webhook endpoints were not cleared'
-}
-if ([string]$activated.legacyDiscordWebhooks.task -ne 'https://discord.com/api/webhooks/111111/task-secret') {
-    throw 'Discord webhook rollback data was lost during activation'
+foreach ($name in @('endpoint', 'confirmationEndpoint', 'quotaEndpoint', 'legacyDiscordWebhooks')) {
+    if ($activated.PSObject.Properties[$name]) {
+        throw "Credential-bearing property persisted after activation: $name"
+    }
 }
 
 $rotated = Set-DiscordBotConfiguration `
@@ -89,10 +86,24 @@ $rotated = Set-DiscordBotConfiguration `
     -ConfirmationChannelId '100000000000000005' `
     -QuotaChannelId '100000000000000006' `
     -TokenPath 'C:\safe\discord-token-rotated.dpapi'
-if ([string]$rotated.legacyDiscordWebhooks.task -ne 'https://discord.com/api/webhooks/111111/task-secret' -or
-    [string]$rotated.legacyDiscordWebhooks.confirmation -ne 'https://discord.com/api/webhooks/222222/confirmation-secret' -or
-    [string]$rotated.legacyDiscordWebhooks.quota -ne 'https://discord.com/api/webhooks/333333/quota-secret') {
-    throw 'Rotating an already migrated Bot token overwrote legacy rollback webhooks'
+foreach ($name in @('endpoint', 'confirmationEndpoint', 'quotaEndpoint', 'legacyDiscordWebhooks')) {
+    if ($rotated.PSObject.Properties[$name]) {
+        throw "Credential-bearing property persisted after token rotation: $name"
+    }
+}
+
+$example = Get-Content -Raw -LiteralPath (Join-Path $sourceRoot 'config.example.json') -Encoding UTF8 | ConvertFrom-Json
+$exampleMigrated = Set-DiscordBotConfiguration `
+    -Config $example `
+    -ApplicationId '111111111111111111' `
+    -GuildId '222222222222222222' `
+    -AllowedUserId '333333333333333333' `
+    -TaskChannelId '444444444444444444' `
+    -ConfirmationChannelId '555555555555555555' `
+    -QuotaChannelId '666666666666666666' `
+    -TokenPath 'C:\safe\discord-token.dpapi'
+if ([string]$exampleMigrated.discordApplicationId -ne '111111111111111111') {
+    throw 'Example configuration could not be migrated under StrictMode'
 }
 
 Write-Output 'PASS: Discord Bot configuration migration'
