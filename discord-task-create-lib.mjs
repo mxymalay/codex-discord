@@ -21,6 +21,24 @@ function closeClient(client) {
   }
 }
 
+function clientResource(client) {
+  let released = false;
+  const release = (force) => {
+    if (released) return;
+    released = true;
+    try {
+      if (force && typeof client.cancel === 'function') client.cancel();
+      else client.close?.();
+    } catch {
+      // App Server release is best-effort and idempotent at this boundary.
+    }
+  };
+  return {
+    close: () => release(false),
+    cancel: () => release(true),
+  };
+}
+
 export async function listCodexProjects({ codexPath, processCwd, clientFactory } = {}) {
   const client = createClient({ clientFactory, codexPath, processCwd });
   try {
@@ -706,6 +724,7 @@ export async function startNewCodexTask({
   onThreadCreated,
 } = {}) {
   const client = createClient({ clientFactory, codexPath, processCwd });
+  const resource = clientResource(client);
   let threadId = null;
   let taskName = '生成中';
   try {
@@ -742,10 +761,10 @@ export async function startNewCodexTask({
     });
     const turnId = String(turnResult?.turn?.id ?? '');
     if (!turnId) throw new Error('Codex App Server did not return a turn ID');
-    const completion = client.waitForTurn(turnId).finally(() => closeClient(client));
-    return { threadId, turnId, taskName, completion, workspace };
+    const completion = client.waitForTurn(turnId).finally(resource.close);
+    return { threadId, turnId, taskName, completion, workspace, ...resource };
   } catch (error) {
-    closeClient(client);
+    resource.close();
     if (threadId) {
       error.threadId = threadId;
       error.taskName = taskName;
@@ -802,6 +821,7 @@ export async function createNewTaskOnce({
   stateFlights.set(interactionId, operation);
   (async () => {
     let prepared = null;
+    let started = null;
     try {
       await persistInteractionRecord({
         state, interactionId, record: { status: 'creating' }, persistState,
@@ -827,7 +847,7 @@ export async function createNewTaskOnce({
         record: { status: 'workspace-ready', workspace: persistentWorkspace },
         persistState,
       });
-      const started = await startNewCodexTask({
+      started = await startNewCodexTask({
         selection,
         workspace: prepared,
         text,
@@ -866,8 +886,15 @@ export async function createNewTaskOnce({
         workspace: persistentWorkspace,
       };
       await persistInteractionRecord({ state, interactionId, record, persistState });
-      return { ...record, completion: started.completion, workspace: retainedWorkspace };
+      return {
+        ...record,
+        completion: started.completion,
+        close: started.close,
+        cancel: started.cancel,
+        workspace: retainedWorkspace,
+      };
     } catch (error) {
+      started?.close?.();
       const current = state.createdTasksByInteraction[interactionId];
       if (error?.persistenceFailure) {
         throw error;

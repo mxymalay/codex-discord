@@ -70,7 +70,6 @@ const sessionIndexPath = path.join(codexRoot, 'session_index.jsonl');
 const pollIntervalMs = 4000;
 const pendingRetryIntervalMs = 30_000;
 const indexRefreshIntervalMs = 30_000;
-const activeTurns = new Set();
 const transientFailureAcks = new Map();
 
 const activityFields = new Set([
@@ -92,15 +91,9 @@ function exactCommandNames(commands) {
   return names;
 }
 
-async function settleWithTimeout(promises, timeoutMs) {
-  const pending = [...promises];
-  if (pending.length === 0) return;
-  let timeoutId;
-  await Promise.race([
-    Promise.allSettled(pending),
-    new Promise((resolve) => { timeoutId = setTimeout(resolve, timeoutMs); }),
-  ]);
-  clearTimeout(timeoutId);
+function boundedShutdownTimeout(value) {
+  const milliseconds = Number(value);
+  return Number.isFinite(milliseconds) ? Math.max(0, Math.min(60_000, Math.floor(milliseconds))) : 10_000;
 }
 
 /** Compose the bridge lifecycle from injectable components. */
@@ -117,10 +110,57 @@ export function createBridgeApplication(dependencies = {}) {
     legacyPollers: null,
     gatewayStatus: { state: 'idle' },
     latestErrorCategory: null,
+    activeResources: new Set(),
     timestamps: Object.fromEntries([...activityFields].map((field) => [field, null])),
   };
   let started = false;
   let prepared = false;
+  let acceptingResources = true;
+  let stopPromise = null;
+  const idleWaiters = new Set();
+
+  const notifyIdle = () => {
+    if (context.activeResources.size !== 0) return;
+    for (const resolve of idleWaiters) resolve();
+    idleWaiters.clear();
+  };
+
+  const releaseResource = (resource) => {
+    const release = typeof resource?.cancel === 'function' ? resource.cancel : resource?.close;
+    if (typeof release !== 'function') return;
+    try {
+      Promise.resolve(release.call(resource)).catch(() => {});
+    } catch {
+      // Shutdown aggregation records the resource category, never private errors.
+    }
+  };
+
+  const trackActiveResource = (resource) => {
+    if (!resource?.completion || typeof resource.completion.then !== 'function') return resource;
+    const entry = {
+      kind: String(resource.kind ?? 'active-resource'),
+      completion: resource.completion,
+      close: typeof resource.close === 'function' ? resource.close : undefined,
+      cancel: typeof resource.cancel === 'function' ? resource.cancel : undefined,
+    };
+    if (!acceptingResources) {
+      Promise.resolve(entry.completion).catch(() => {});
+      releaseResource(entry);
+      return resource;
+    }
+    context.activeResources.add(entry);
+    Promise.resolve(entry.completion).then(
+      () => { context.activeResources.delete(entry); notifyIdle(); },
+      () => { context.activeResources.delete(entry); notifyIdle(); },
+    );
+    return resource;
+  };
+
+  const waitForActiveResources = () => {
+    if (context.activeResources.size === 0) return Promise.resolve();
+    return new Promise((resolve) => idleWaiters.add(resolve));
+  };
+  context.trackActiveResource = trackActiveResource;
 
   const recordActivity = (field, at = dependencies.now?.() ?? Date.now()) => {
     if (!activityFields.has(field)) throw new Error(`Unknown bridge activity field: ${field}`);
@@ -172,6 +212,7 @@ export function createBridgeApplication(dependencies = {}) {
   return {
     context,
     recordActivity,
+    trackActiveResource,
     getSystemStatus,
     async registerCommandsOnce() {
       await prepare(true);
@@ -179,6 +220,8 @@ export function createBridgeApplication(dependencies = {}) {
     },
     async start() {
       if (started) return;
+      acceptingResources = true;
+      stopPromise = null;
       await prepare(false);
       try {
         await registerAndVerify();
@@ -202,13 +245,53 @@ export function createBridgeApplication(dependencies = {}) {
       await context.legacyPollers?.completion;
     },
     async stop() {
-      if (!started && !context.gateway && !context.legacyPollers) return;
-      await context.legacyPollers?.stop?.();
-      await context.gateway?.stop?.();
-      await dependencies.persistTaskIndex?.(context);
-      await dependencies.persistInboxState?.(context);
-      await settleWithTimeout(dependencies.getActiveTurns?.(context) ?? [], Number(dependencies.shutdownTimeoutMs ?? 10_000));
-      started = false;
+      if (stopPromise) return stopPromise;
+      if (!started && !context.gateway && !context.legacyPollers) return undefined;
+      acceptingResources = false;
+      stopPromise = (async () => {
+        const failures = [];
+        const invoke = (category, operation) => {
+          if (typeof operation !== 'function') return Promise.resolve();
+          try {
+            return Promise.resolve(operation()).catch(() => { failures.push(category); });
+          } catch {
+            failures.push(category);
+            return Promise.resolve();
+          }
+        };
+
+        const operations = [];
+        operations.push(invoke('gateway-stop', () => context.gateway?.stop?.()));
+        operations.push(invoke('legacy-pollers-stop', () => context.legacyPollers?.stop?.()));
+        operations.push(invoke('task-index-persist', () => dependencies.persistTaskIndex?.(context)));
+        operations.push(invoke('inbox-persist', () => dependencies.persistInboxState?.(context)));
+        operations.push(invoke('rollout-persist', () => dependencies.persistRolloutState?.(context)));
+        operations.push(waitForActiveResources());
+
+        const timeoutMs = boundedShutdownTimeout(dependencies.shutdownTimeoutMs ?? 10_000);
+        let timeoutId;
+        const completed = await Promise.race([
+          Promise.allSettled(operations).then(() => true),
+          new Promise((resolve) => {
+            timeoutId = setTimeout(() => resolve(false), timeoutMs);
+          }),
+        ]);
+        clearTimeout(timeoutId);
+        if (!completed) {
+          failures.push('deadline-exceeded');
+          for (const resource of [...context.activeResources]) {
+            releaseResource(resource);
+            context.activeResources.delete(resource);
+          }
+          notifyIdle();
+        }
+        started = false;
+        if (failures.length > 0) {
+          throw new Error(`Discord bridge shutdown failed: ${[...new Set(failures)].join(',')}`);
+        }
+        return { status: 'stopped' };
+      })();
+      return stopPromise;
     },
   };
 }
@@ -277,7 +360,7 @@ async function saveState(state) {
   await writeJsonAtomic(inboxStatePath, state);
 }
 
-function trackContinuationCompletion(started, request, token) {
+function trackContinuationCompletion(started, request, token, trackActiveResource) {
   const tracked = started.completion
       .then(async (params) => {
         const status = String(params?.turn?.status ?? 'unknown');
@@ -294,8 +377,12 @@ function trackContinuationCompletion(started, request, token) {
       .catch(async () => {
         await log(`turn completion connection lost thread=${mask(request.threadId, 8)} turn=${mask(started.turnId, 8)}`);
       })
-      .finally(() => activeTurns.delete(tracked));
-  activeTurns.add(tracked);
+  trackActiveResource?.({
+    kind: 'continuation',
+    completion: tracked,
+    close: started.close,
+    cancel: started.cancel,
+  });
 }
 
 async function recordInboxMessageDurably(state, channelId, messageId, processed, persistState) {
@@ -361,7 +448,7 @@ export async function finalizeContinuationOutcome({
   return { ...result, durable, stopChannelScan: !durable };
 }
 
-async function startContinuation({ token, config, state, request }) {
+async function startContinuation({ token, config, state, request, trackActiveResource }) {
   const mappedCwd = await existingDirectory(String(request.cwd ?? ''));
   const input = { ...request, cwd: mappedCwd ?? undefined };
   const result = await dispatchContinuation(input, {
@@ -372,19 +459,21 @@ async function startContinuation({ token, config, state, request }) {
     decryptText: (encryptedText) => decryptPendingReplyText({ toolDir, powershellPath: config.discordPowerShellPath, ciphertext: encryptedText }),
     persistState: saveState,
     sendReply: (payload) => sendDiscordReply({ token, ...payload }),
-    trackCompletion: (started, normalized) => trackContinuationCompletion(started, normalized, token),
+    trackCompletion: (started, normalized) => trackContinuationCompletion(
+      started, normalized, token, trackActiveResource,
+    ),
   });
   const outcome = await finalizeContinuationOutcome({ result, state, request, token });
   await log(`continuation ${result.status} source=${request.source} request=${mask(request.requestId)} thread=${mask(request.threadId, 8)} turn=${mask(result.turnId, 8)}`);
   return outcome;
 }
 
-async function retryPendingTurns({ token, config, state, onRetry = () => {} }) {
+async function retryPendingTurns({ token, config, state, onRetry = () => {}, trackActiveResource }) {
   const now = Date.now();
   for (const pending of listRetryableContinuations(state)) {
     const lastAttempt = Date.parse(String(pending.lastAttemptAt ?? ''));
     if (Number.isFinite(lastAttempt) && now - lastAttempt < pendingRetryIntervalMs) continue;
-    await startContinuation({ token, config, state, request: pending });
+    await startContinuation({ token, config, state, request: pending, trackActiveResource });
     onRetry();
   }
 }
@@ -565,6 +654,7 @@ function createProductionBridgeDependencies({ runOnce = false } = {}) {
         processCwd: toolDir,
         createNewTaskOnce: async (options) => {
           const result = await createNewTaskOnce(options);
+          context.trackActiveResource({ kind: 'task-creation', ...result });
           if (['started', 'first-turn-failed'].includes(String(result?.status))) {
             context.recordActivity('lastTaskCreationAt');
           }
@@ -583,6 +673,7 @@ function createProductionBridgeDependencies({ runOnce = false } = {}) {
           config: context.config,
           state: context.inboxState,
           request,
+          trackActiveResource: context.trackActiveResource,
         }),
         cancelContinuationPersisted: (queueId, now) => cancelContinuationPersisted({
           state: context.inboxState,
@@ -668,6 +759,7 @@ function createProductionBridgeDependencies({ runOnce = false } = {}) {
               config,
               state,
               onRetry: () => context.recordActivity('lastQueueRetryAt'),
+              trackActiveResource: context.trackActiveResource,
             });
           } catch (error) {
             context.latestErrorCategory = 'queue-retry-failed';
@@ -676,7 +768,16 @@ function createProductionBridgeDependencies({ runOnce = false } = {}) {
           for (const channelId of channelIds) {
             if (stopping) break;
             try {
-              await pollChannel({ token, config, state, channelId });
+              await pollChannel({
+                token,
+                config,
+                state,
+                channelId,
+                continueRequest: (payload) => startContinuation({
+                  ...payload,
+                  trackActiveResource: context.trackActiveResource,
+                }),
+              });
             } catch (error) {
               context.latestErrorCategory = 'channel-poll-failed';
               await log(`poll failed channel=${mask(channelId)} error=${error?.message ?? 'unknown'}`);
@@ -711,13 +812,12 @@ function createProductionBridgeDependencies({ runOnce = false } = {}) {
           stopping = true;
           wake?.();
           await completion;
-          await writeRolloutWatcherState(rolloutWatcherStatePath, rolloutState);
         },
       };
     },
     persistTaskIndex: (context) => writeTaskIndexAtomic(taskIndexPath, context.taskIndex),
     persistInboxState: (context) => saveState(context.inboxState),
-    getActiveTurns: () => activeTurns,
+    persistRolloutState: (context) => writeRolloutWatcherState(rolloutWatcherStatePath, context.rolloutState),
   };
 }
 

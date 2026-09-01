@@ -130,8 +130,105 @@ test('bridge composition starts registration, index and gateway without disablin
 
   await app.stop();
   assert.deepEqual(events.slice(-4), [
-    'legacy-pollers-stopped', 'gateway-stopped', 'index-persisted', 'inbox-persisted',
+    'gateway-stopped', 'legacy-pollers-stopped', 'index-persisted', 'inbox-persisted',
   ]);
+});
+
+test('shutdown isolates a poller stop failure and still attempts gateway and every persistence boundary', async () => {
+  const events = [];
+  const app = createBridgeApplication(makeBridgeDependencies(events, {
+    async startLegacyPollers() {
+      events.push('legacy-pollers-started');
+      return {
+        async stop() {
+          events.push('legacy-pollers-stopped');
+          throw new Error('private poller path C:\\secret');
+        },
+      };
+    },
+    async persistRolloutState() { events.push('rollout-persisted'); },
+  }));
+  await app.start();
+
+  await assert.rejects(app.stop(), (error) => {
+    assert.match(error.message, /^Discord bridge shutdown failed: /);
+    assert.match(error.message, /legacy-pollers-stop/);
+    assert.equal(error.message.includes('private'), false);
+    assert.equal(error.message.includes('secret'), false);
+    return true;
+  });
+
+  const shutdown = events.slice(events.indexOf('gateway-stopped'));
+  assert.deepEqual(shutdown, [
+    'gateway-stopped', 'legacy-pollers-stopped', 'index-persisted', 'inbox-persisted', 'rollout-persisted',
+  ]);
+});
+
+test('shutdown uses one deadline when poller stop hangs and still attempts every other cleanup', async () => {
+  const events = [];
+  const app = createBridgeApplication(makeBridgeDependencies(events, {
+    shutdownTimeoutMs: 20,
+    async startLegacyPollers() {
+      events.push('legacy-pollers-started');
+      return {
+        async stop() {
+          events.push('legacy-pollers-stopped');
+          return new Promise(() => {});
+        },
+      };
+    },
+    async persistRolloutState() { events.push('rollout-persisted'); },
+  }));
+  await app.start();
+
+  const startedAt = Date.now();
+  const outcome = await Promise.race([
+    app.stop().then(() => 'resolved', (error) => error.message),
+    new Promise((resolve) => setTimeout(() => resolve('test-timeout'), 250)),
+  ]);
+
+  assert.match(outcome, /^Discord bridge shutdown failed: .*deadline-exceeded/);
+  assert.ok(Date.now() - startedAt < 250);
+  assert.deepEqual(events.slice(events.indexOf('gateway-stopped'), events.indexOf('gateway-stopped') + 5), [
+    'gateway-stopped', 'legacy-pollers-stopped', 'index-persisted', 'inbox-persisted', 'rollout-persisted',
+  ]);
+});
+
+test('shutdown waits for a running new-task first turn and removes it after normal completion', async () => {
+  const events = [];
+  let finishTurn;
+  const completion = new Promise((resolve) => { finishTurn = resolve; });
+  const app = createBridgeApplication(makeBridgeDependencies(events, { shutdownTimeoutMs: 200 }));
+  await app.start();
+  app.trackActiveResource({ kind: 'task-creation', completion, cancel() { events.push('task-cancelled'); } });
+
+  let stopped = false;
+  const stopping = app.stop().then(() => { stopped = true; });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(stopped, false);
+  finishTurn({ turn: { status: 'completed' } });
+  await stopping;
+
+  assert.equal(stopped, true);
+  assert.equal(events.includes('task-cancelled'), false);
+  assert.equal(app.context.activeResources.size, 0);
+});
+
+test('shutdown deadline cancels creation and continuation resources from the shared registry', async () => {
+  const events = [];
+  const never = new Promise(() => {});
+  const app = createBridgeApplication(makeBridgeDependencies(events, { shutdownTimeoutMs: 20 }));
+  await app.start();
+  app.trackActiveResource({ kind: 'task-creation', completion: never, cancel() { events.push('task-cancelled'); } });
+  app.trackActiveResource({ kind: 'continuation', completion: never, close() { events.push('continuation-closed'); } });
+
+  const startedAt = Date.now();
+  await assert.rejects(app.stop(), /deadline-exceeded/);
+
+  assert.ok(Date.now() - startedAt < 250);
+  assert.equal(events.filter((item) => item === 'task-cancelled').length, 1);
+  assert.equal(events.filter((item) => item === 'continuation-closed').length, 1);
+  assert.equal(app.context.activeResources.size, 0);
 });
 
 test('registration-only lifecycle verifies exactly ten commands without starting Codex or pollers', async () => {
@@ -334,6 +431,8 @@ test('resume uses the reusable initializer before preserving resume and turn com
     clientFactory: () => client,
   });
   assert.equal(resumed.turnId, 'turn-resume');
+  assert.equal(typeof resumed.close, 'function');
+  assert.equal(typeof resumed.cancel, 'function');
   await resumed.completion;
   assert.deepEqual(methods, [
     'initialize', 'initialized', 'thread/resume', 'turn/start', 'waitForTurn', 'close',
@@ -351,6 +450,8 @@ test('new task consumes an early completion from the same stdout chunk and close
     text: 'early', interactionId: 'early-new', codexPath: 'not-used', processCwd: 'C:\\workspace',
     clientFactory: () => client,
   });
+  assert.equal(typeof result.close, 'function');
+  assert.equal(typeof result.cancel, 'function');
   assert.equal((await result.completion).turn.id, 'turn-early-new');
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(child.stdin.writableEnded, true);

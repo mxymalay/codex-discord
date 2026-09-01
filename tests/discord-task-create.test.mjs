@@ -39,6 +39,9 @@ function fakeAppServer(methods, responses, messages = []) {
     close() {
       methods.push('close');
     },
+    cancel() {
+      methods.push('cancel');
+    },
   };
 }
 
@@ -777,6 +780,8 @@ test('starts a durable thread before its first turn with exact workspace metadat
   assert.equal(result.turnId, 'turn-1');
   assert.equal(result.taskName, '生成中');
   assert.equal(result.workspace.cwd, 'C:\\repo');
+  assert.equal(typeof result.close, 'function');
+  assert.equal(typeof result.cancel, 'function');
   await result.completion;
   assert.equal(methods.at(-1), 'close');
 });
@@ -1089,6 +1094,12 @@ test('task creation shares the inbox commit queue with cursor updates and prunes
 test('failed started persistence restores the exact thread-created live record', async () => {
   const state = {};
   let threadCreatedRecord = null;
+  const appServerMethods = [];
+  const appServer = fakeAppServer(appServerMethods, {
+    'thread/start': { thread: { id: 'thread-started-rollback', name: 'Task' } },
+    'turn/start': { turn: { id: 'turn-started-rollback' } },
+  });
+  appServer.waitForTurn = () => new Promise(() => {});
   await assert.rejects(() => createNewTaskOnce({
     state, interactionId: 'startedrollback1',
     selection: { kind: 'projectless', projectId: null, projectName: '无项目', roots: ['C:\\tasks'] },
@@ -1098,14 +1109,12 @@ test('failed started persistence restores the exact thread-created live record',
       if (record.status === 'thread-created') threadCreatedRecord = record;
       if (record.status === 'started') throw new Error('final write failed');
     },
-    clientFactory: () => fakeAppServer([], {
-      'thread/start': { thread: { id: 'thread-started-rollback', name: 'Task' } },
-      'turn/start': { turn: { id: 'turn-started-rollback' } },
-    }),
+    clientFactory: () => appServer,
   }), /state persistence failed/);
   assert.deepEqual(state.createdTasksByInteraction.startedrollback1, threadCreatedRecord);
   assert.equal(state.createdTasksByInteraction.startedrollback1.status, 'thread-created');
   assert.equal(state.createdTasksByInteraction.startedrollback1.threadId, 'thread-started-rollback');
+  assert.equal(appServerMethods.includes('close'), true);
 
   let externalCalls = 0;
   const duplicate = await createNewTaskOnce({

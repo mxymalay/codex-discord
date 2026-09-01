@@ -1288,6 +1288,11 @@ export class AppServerClient {
       if (!this.closed) this.child.kill();
     }, 2000).unref();
   }
+
+  cancel() {
+    if (this.closed) return;
+    this.child.kill();
+  }
 }
 
 export async function initializeAppServerClient(client) {
@@ -1312,6 +1317,18 @@ export async function resumeCodexThread({
   const client = clientFactory
     ? clientFactory({ codexPath, cwd: processCwd })
     : new AppServerClient({ codexPath, cwd: processCwd });
+  let released = false;
+  const close = () => {
+    if (released) return;
+    released = true;
+    client.close?.();
+  };
+  const cancel = () => {
+    if (released) return;
+    released = true;
+    if (typeof client.cancel === 'function') client.cancel();
+    else client.close?.();
+  };
   const messages = buildCodexAppServerMessages({ threadId, cwd, text });
   try {
     await initializeAppServerClient(client);
@@ -1328,10 +1345,10 @@ export async function resumeCodexThread({
     }
     const turnId = String(started?.turn?.id ?? '');
     if (!turnId) throw new Error('Codex App Server did not return a turn ID');
-    const completion = client.waitForTurn(turnId).finally(() => client.close());
-    return { turnId, completion };
+    const completion = client.waitForTurn(turnId).finally(close);
+    return { turnId, completion, close, cancel };
   } catch (error) {
-    client.close();
+    close();
     error.submissionStage ??= 'pre-submit';
     throw error;
   }
