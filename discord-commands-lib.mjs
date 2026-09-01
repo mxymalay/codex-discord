@@ -6,7 +6,7 @@
  */
 
 export const COMMAND_NAMES = Object.freeze([
-  '任务列表', '任务详情', '任务搜索', '新建任务', '继续任务', '继续队列', '额度', '系统状态', '系统测试', '帮助',
+  '任务列表', '任务详情', '任务搜索', '新建任务', '继续任务', '继续队列', '额度', '系统状态', '系统测试', '退出Codex', '帮助',
 ]);
 
 const STRING_OPTION = 3;
@@ -71,6 +71,7 @@ export function buildGuildCommandDefinitions() {
       required: false,
       choices: ['快速', '完整'].map(choice),
     }]),
+    command('退出Codex', '查看风险并退出 Codex 桌面端'),
     command('帮助', '查看命令帮助'),
   ];
 }

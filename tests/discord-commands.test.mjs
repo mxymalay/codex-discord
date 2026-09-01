@@ -8,10 +8,10 @@ import {
   registerGuildCommands,
 } from '../discord-commands-lib.mjs';
 
-test('defines exactly the approved ten Chinese guild commands', () => {
+test('defines exactly the approved eleven Chinese guild commands', () => {
   const commands = buildGuildCommandDefinitions();
   assert.deepEqual(commands.map((item) => item.name), [
-    '任务列表', '任务详情', '任务搜索', '新建任务', '继续任务', '继续队列', '额度', '系统状态', '系统测试', '帮助',
+    '任务列表', '任务详情', '任务搜索', '新建任务', '继续任务', '继续队列', '额度', '系统状态', '系统测试', '退出Codex', '帮助',
   ]);
 
   for (const command of commands) {
@@ -84,7 +84,7 @@ test('registers commands with the guild PUT endpoint and sends definitions', asy
   assert.equal(calls[0].options.headers.Authorization, 'Bot test-token');
   assert.equal(calls[0].options.headers['Content-Type'], 'application/json');
   assert.deepEqual(JSON.parse(calls[0].options.body).map((item) => item.name), [
-    '任务列表', '任务详情', '任务搜索', '新建任务', '继续任务', '继续队列', '额度', '系统状态', '系统测试', '帮助',
+    '任务列表', '任务详情', '任务搜索', '新建任务', '继续任务', '继续队列', '额度', '系统状态', '系统测试', '退出Codex', '帮助',
   ]);
 });
 

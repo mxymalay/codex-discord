@@ -80,7 +80,7 @@ function makeBridgeDependencies(events, overrides = {}) {
     async registerCommands() { events.push('commands-registered'); },
     async fetchRegisteredCommands() { return [
       '任务列表', '任务详情', '任务搜索', '新建任务', '继续任务',
-      '继续队列', '额度', '系统状态', '系统测试', '帮助',
+      '继续队列', '额度', '系统状态', '系统测试', '退出Codex', '帮助',
     ].map((name) => ({ name })); },
     async loadTaskIndex() { events.push('index-ready'); return { version: 1, generatedAt: '2026-09-01T00:00:00.000Z', tasks: [] }; },
     async loadInboxState() { return createEmptyInboxState(); },
@@ -471,7 +471,7 @@ test('shutdown deadline cancels creation and continuation resources from the sha
   assert.equal(app.context.activeResources.size, 0);
 });
 
-test('registration-only lifecycle verifies exactly ten commands without starting Codex or pollers', async () => {
+test('registration-only lifecycle verifies exactly eleven commands without starting Codex or pollers', async () => {
   const events = [];
   const app = createBridgeApplication(makeBridgeDependencies(events, {
     async resolveExecutables() { throw new Error('Codex must not be resolved'); },
@@ -484,7 +484,7 @@ test('registration-only lifecycle verifies exactly ten commands without starting
 
   assert.deepEqual(result.commandNames, [
     '任务列表', '任务详情', '任务搜索', '新建任务', '继续任务',
-    '继续队列', '额度', '系统状态', '系统测试', '帮助',
+    '继续队列', '额度', '系统状态', '系统测试', '退出Codex', '帮助',
   ]);
   assert.deepEqual(events, ['commands-registered']);
 });
