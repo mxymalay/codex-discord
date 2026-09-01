@@ -29,15 +29,18 @@ export async function readRolloutWatcherState(statePath, { sessionsRoot } = {}) 
         const threadId = String(item?.notification?.['thread-id'] ?? '');
         const cwd = String(item?.notification?.cwd ?? '');
         const candidates = sessionsRoot ? await listRolloutFiles(sessionsRoot) : Object.keys(files);
+        const matches = [];
         for (const rolloutPath of candidates) {
           let entries;
           try { entries = parseLines(Buffer.from(await fs.readFile(rolloutPath, 'utf8'))); } catch { continue; }
           const metadata = entries.find((entry) => entry?.type === 'session_meta');
           const complete = entries.find((entry) => entry?.type === 'event_msg' && entry.payload?.type === 'task_complete' && String(entry.payload?.turn_id ?? '') === String(turnId));
           if (complete && String(metadata?.payload?.id ?? '') === threadId) {
-            migrated.pending[turnId] = { completedAtMs: Number(item?.completedAtMs ?? Date.now()), lastAttemptAtMs: Number(item?.lastAttemptAtMs ?? 0), rolloutPath, threadId, cwd };
-            break;
+            matches.push(rolloutPath);
           }
+        }
+        if (matches.length === 1) {
+          migrated.pending[turnId] = { completedAtMs: Number(item?.completedAtMs ?? Date.now()), lastAttemptAtMs: Number(item?.lastAttemptAtMs ?? 0), rolloutPath: matches[0], threadId, cwd };
         }
       }
       return migrated;

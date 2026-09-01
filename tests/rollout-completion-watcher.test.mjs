@@ -292,6 +292,26 @@ test('migrates a recoverable v1 pending completion to a locator and dispatches o
   } finally { await fs.rm(paths.root, { recursive: true, force: true }); }
 });
 
+test('does not migrate an ambiguous or missing v1 pending rollout locator', async () => {
+  const paths = await fixture();
+  try {
+    const legacy = () => ({ version: 1, initialized: true, files: {}, pending: {
+      [turnId]: { completedAtMs: 0, notification: { 'thread-id': threadId, cwd: 'C:\\workspace\\demo', 'last-assistant-message': 'do not retain' } },
+    } });
+    await fs.writeFile(paths.rolloutPath, [sessionMeta(), taskStarted(), taskComplete()].map(jsonLine).join(''), 'utf8');
+    const second = path.join(paths.sessionsRoot, '2026', '09', '01', `rollout-copy-${threadId}.jsonl`);
+    await fs.writeFile(second, [sessionMeta(), taskStarted(), taskComplete()].map(jsonLine).join(''), 'utf8');
+    await fs.writeFile(paths.statePath, JSON.stringify(legacy()), 'utf8');
+    let state = await readRolloutWatcherState(paths.statePath, { sessionsRoot: paths.sessionsRoot });
+    assert.deepEqual(state.pending, {});
+    await fs.rm(second);
+    await fs.rm(paths.rolloutPath);
+    await fs.writeFile(paths.statePath, JSON.stringify(legacy()), 'utf8');
+    state = await readRolloutWatcherState(paths.statePath, { sessionsRoot: paths.sessionsRoot });
+    assert.deepEqual(state.pending, {});
+  } finally { await fs.rm(paths.root, { recursive: true, force: true }); }
+});
+
 test('hands long notification JSON to the fallback dispatcher through a UTF-8 file', async () => {
   const paths = await fixture();
   try {
