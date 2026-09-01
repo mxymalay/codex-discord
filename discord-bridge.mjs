@@ -14,6 +14,7 @@ import {
   initializeInboxCursors,
   isActiveWriterError,
   loadDiscordToken,
+  migrateLegacyPendingReplies,
   readJsonFile,
   recordInboxMessage,
   removePendingReply,
@@ -92,7 +93,7 @@ async function startMappedTurn({ token, config, state, accepted }) {
   try {
     const text = accepted.encryptedText
       ? await decryptPendingReplyText({ toolDir, ciphertext: accepted.encryptedText })
-      : String(accepted.text ?? '');
+      : '';
     if (!text.trim()) throw new Error('Discord reply text is unavailable');
     const started = await resumeCodexThread({
       threadId: String(accepted.mapping.threadId),
@@ -205,7 +206,8 @@ async function main() {
   const token = await loadDiscordToken({ toolDir });
   const channelIds = [String(config.discordTaskChannelId), String(config.discordConfirmationChannelId)];
   const state = await readJsonFile(inboxStatePath, createEmptyInboxState());
-  const rolloutState = await readRolloutWatcherState(rolloutWatcherStatePath);
+  await migrateLegacyPendingReplies({ state, encryptText: (text) => encryptPendingReplyText({ toolDir, text }) });
+  const rolloutState = await readRolloutWatcherState(rolloutWatcherStatePath, { sessionsRoot });
 
   await initializeInboxCursors({
     state,

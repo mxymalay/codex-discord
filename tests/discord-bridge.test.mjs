@@ -14,6 +14,7 @@ import {
   getPendingReplies,
   initializeInboxCursors,
   isActiveWriterError,
+  migrateLegacyPendingReplies,
   recordInboxMessage,
   removePendingReply,
   resolveCodexExecutable,
@@ -199,6 +200,15 @@ test('queues an active-writer reply with encrypted text and no plaintext at rest
 
   removePendingReply(state, accepted.messageId);
   assert.deepEqual(getPendingReplies(state), []);
+});
+
+test('migrates legacy pending plaintext before state is rewritten', async () => {
+  const state = createEmptyInboxState();
+  state.pendingReplies['777777777777777801'] = { messageId: '777777777777777801', text: 'legacy continuation', mapping: mapping.messages['777777777777777701'] };
+  await migrateLegacyPendingReplies({ state, encryptText: async (text) => `cipher:${text}` });
+  assert.equal(state.pendingReplies['777777777777777801'].encryptedText, 'cipher:legacy continuation');
+  assert.equal(Object.hasOwn(state.pendingReplies['777777777777777801'], 'text'), false);
+  await assert.rejects(() => migrateLegacyPendingReplies({ state: { pendingReplies: { x: { text: 'keep me' } } }, encryptText: async () => { throw new Error('DPAPI unavailable'); } }), /state was not rewritten/);
 });
 
 test('resolves the newest installed Codex executable when the scheduled-task PATH is minimal', async () => {

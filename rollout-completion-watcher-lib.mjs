@@ -14,7 +14,7 @@ export function createEmptyRolloutWatcherState() {
   return { version: stateVersion, initialized: false, files: {}, pending: {} };
 }
 
-export async function readRolloutWatcherState(statePath) {
+export async function readRolloutWatcherState(statePath, { sessionsRoot } = {}) {
   try {
     const state = JSON.parse(await fs.readFile(statePath, 'utf8'));
     if (state?.version === 1 && typeof state.files === 'object') {
@@ -24,7 +24,23 @@ export async function readRolloutWatcherState(statePath) {
         cwd: String(fileState?.cwd ?? ''),
         activeTurnId: String(fileState?.activeTurnId ?? ''),
       }]));
-      return { version: stateVersion, initialized: Boolean(state.initialized), files, pending: {} };
+      const migrated = { version: stateVersion, initialized: Boolean(state.initialized), files, pending: {} };
+      for (const [turnId, item] of Object.entries(state.pending ?? {})) {
+        const threadId = String(item?.notification?.['thread-id'] ?? '');
+        const cwd = String(item?.notification?.cwd ?? '');
+        const candidates = sessionsRoot ? await listRolloutFiles(sessionsRoot) : Object.keys(files);
+        for (const rolloutPath of candidates) {
+          let entries;
+          try { entries = parseLines(Buffer.from(await fs.readFile(rolloutPath, 'utf8'))); } catch { continue; }
+          const metadata = entries.find((entry) => entry?.type === 'session_meta');
+          const complete = entries.find((entry) => entry?.type === 'event_msg' && entry.payload?.type === 'task_complete' && String(entry.payload?.turn_id ?? '') === String(turnId));
+          if (complete && String(metadata?.payload?.id ?? '') === threadId) {
+            migrated.pending[turnId] = { completedAtMs: Number(item?.completedAtMs ?? Date.now()), lastAttemptAtMs: Number(item?.lastAttemptAtMs ?? 0), rolloutPath, threadId, cwd };
+            break;
+          }
+        }
+      }
+      return migrated;
     }
     if (state?.version !== stateVersion || typeof state.files !== 'object' || typeof state.pending !== 'object') {
       throw new Error('invalid rollout watcher state');

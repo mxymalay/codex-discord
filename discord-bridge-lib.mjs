@@ -61,6 +61,21 @@ export function getPendingReplies(state) {
     compareSnowflakes(left.messageId, right.messageId));
 }
 
+export async function migrateLegacyPendingReplies({ state, encryptText }) {
+  for (const pending of Object.values(state?.pendingReplies ?? {})) {
+    if (!Object.hasOwn(pending, 'text')) continue;
+    try {
+      const encryptedText = await encryptText(String(pending.text ?? ''));
+      if (!encryptedText) throw new Error('empty ciphertext');
+      pending.encryptedText = String(encryptedText);
+      delete pending.text;
+    } catch {
+      throw new Error('Legacy pending reply encryption is unavailable; state was not rewritten');
+    }
+  }
+  return state;
+}
+
 export function removePendingReply(state, messageId) {
   state.pendingReplies ??= {};
   delete state.pendingReplies[String(messageId)];

@@ -275,6 +275,23 @@ test('migrates legacy watcher state without retaining conversation content', asy
   }
 });
 
+test('migrates a recoverable v1 pending completion to a locator and dispatches once', async () => {
+  const paths = await fixture();
+  try {
+    await fs.writeFile(paths.rolloutPath, [sessionMeta(), taskStarted(), userMessage(), taskComplete()].map(jsonLine).join(''), 'utf8');
+    await fs.writeFile(paths.statePath, JSON.stringify({ version: 1, initialized: true, files: {}, pending: {
+      [turnId]: { completedAtMs: 0, lastAttemptAtMs: 0, notification: { 'thread-id': threadId, cwd: 'C:\\workspace\\demo', 'input-messages': ['legacy secret'], 'last-assistant-message': 'legacy result' } },
+    } }), 'utf8');
+    const state = await readRolloutWatcherState(paths.statePath, { sessionsRoot: paths.sessionsRoot });
+    assert.equal(state.pending[turnId].rolloutPath, path.resolve(paths.rolloutPath));
+    assert.equal(JSON.stringify(state.pending).includes('legacy secret'), false);
+    const delivered = [];
+    await pollRolloutCompletions({ sessionsRoot: paths.sessionsRoot, state, nowMs: Date.now() + 60_000, graceMs: 0, dispatchNotification: async (item) => delivered.push(item) });
+    assert.equal(delivered.length, 1);
+    assert.equal(Object.keys(state.pending).length, 0);
+  } finally { await fs.rm(paths.root, { recursive: true, force: true }); }
+});
+
 test('hands long notification JSON to the fallback dispatcher through a UTF-8 file', async () => {
   const paths = await fixture();
   try {
