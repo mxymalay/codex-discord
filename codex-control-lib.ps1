@@ -1,5 +1,11 @@
 Set-StrictMode -Version Latest
 
+$bridgeStartupPath = Join-Path $PSScriptRoot 'discord-bridge-startup.ps1'
+if (-not (Test-Path -LiteralPath $bridgeStartupPath -PathType Leaf)) {
+    throw 'Discord bridge startup helpers are missing'
+}
+. $bridgeStartupPath
+
 function Get-CodexDesktopProgramFilesPath {
     [CmdletBinding()]
     param()
@@ -318,6 +324,148 @@ function New-CodexControlOperations {
             param([int]$Milliseconds)
             Start-Sleep -Milliseconds $Milliseconds
         }
+        GetTask = {
+            $task = Get-ScheduledTask -TaskName 'Codex Discord Bridge' -ErrorAction SilentlyContinue
+            if ($null -eq $task) { return [pscustomobject]@{ installed=$false; enabled=$false; running=$false } }
+            $enabled = $true
+            if ($null -ne $task.Settings -and $null -ne $task.Settings.PSObject.Properties['Enabled']) {
+                $enabled = [bool]$task.Settings.Enabled
+            }
+            return [pscustomobject]@{ installed=$true; enabled=$enabled; running=($task.State -eq 'Running') }
+        }
+        InstallTask = {
+            $installScript = Join-Path $PSScriptRoot 'install-discord-bridge-task.ps1'
+            & $installScript | Out-Null
+        }
+        EnableTask = { Enable-ScheduledTask -TaskName 'Codex Discord Bridge' -ErrorAction Stop | Out-Null }
+        DisableTask = { Disable-ScheduledTask -TaskName 'Codex Discord Bridge' -ErrorAction Stop | Out-Null }
+        StartTask = { Start-ScheduledTask -TaskName 'Codex Discord Bridge' -ErrorAction Stop }
+        StopTask = { Stop-ScheduledTask -TaskName 'Codex Discord Bridge' -ErrorAction Stop }
+        StartDetached = {
+            param([Parameter(Mandatory)][string]$StartupPath, [Parameter(Mandatory)][ValidateSet('temporary')][string]$Mode)
+            $powerShellPath = (Get-Command pwsh -ErrorAction Stop).Source
+            $previousMode = $env:CODEX_DISCORD_START_MODE
+            $env:CODEX_DISCORD_START_MODE = $Mode
+            try {
+                Start-Process -FilePath $powerShellPath -ArgumentList @('-NoProfile', '-File', $StartupPath) -WindowStyle Hidden -ErrorAction Stop | Out-Null
+            }
+            finally {
+                if ($null -eq $previousMode) { Remove-Item -LiteralPath 'Env:CODEX_DISCORD_START_MODE' -ErrorAction SilentlyContinue }
+                else { $env:CODEX_DISCORD_START_MODE = $previousMode }
+            }
+        }
+        StopRuntime = {
+            param([Parameter(Mandatory)][object]$Runtime)
+            $process = Get-Process -Id ([int]$Runtime.processId) -ErrorAction Stop
+            $expectedTime = ConvertTo-BridgeRuntimeTimeUtc -Value $Runtime.creationTimeUtc
+            $actualTime = ConvertTo-BridgeRuntimeTimeUtc -Value $process.StartTime
+            if ($null -eq $expectedTime -or $null -eq $actualTime -or $expectedTime.UtcDateTime.Ticks -ne $actualTime.UtcDateTime.Ticks) {
+                throw 'Bridge supervisor identity revalidation failed'
+            }
+            $process.Kill()
+        }
+        GetBridgeProcesses = {
+            @(Get-Process -ErrorAction Stop | ForEach-Object {
+                [pscustomobject]@{ ProcessId=$_.Id; CreationTimeUtc=$_.StartTime.ToUniversalTime() }
+            })
+        }
+    }
+}
+
+function Get-CodexBridgeServiceStatus {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][hashtable]$Operations,
+        [Parameter(Mandatory)][string]$ToolDir
+    )
+
+    if (-not $Operations.ContainsKey('GetTask') -or $Operations.GetTask -isnot [scriptblock]) {
+        return [pscustomobject]@{ ok=$false; errorCategory='invalid-service-operations' }
+    }
+    try {
+        $task = & $Operations.GetTask
+        if ($null -eq $task) {
+            $task = [pscustomobject]@{ installed=$false; enabled=$false; running=$false }
+        }
+        $runtime = $null
+        if ($Operations.ContainsKey('GetRuntime') -and $Operations.GetRuntime -is [scriptblock]) {
+            $runtime = & $Operations.GetRuntime
+        }
+        else {
+            $processes = @()
+            if ($Operations.ContainsKey('GetBridgeProcesses') -and $Operations.GetBridgeProcesses -is [scriptblock]) {
+                $processes = @(& $Operations.GetBridgeProcesses)
+            }
+            elseif ($Operations.ContainsKey('GetProcesses') -and $Operations.GetProcesses -is [scriptblock]) {
+                $processes = @(& $Operations.GetProcesses)
+            }
+            $runtime = Read-ValidatedBridgeRuntimeIdentity -Path (Join-Path $ToolDir 'discord-bridge-runtime.json') -Processes $processes -ToolDir $ToolDir
+        }
+        return [pscustomobject][ordered]@{
+            ok = $true
+            taskInstalled = [bool]$task.installed
+            autoStartEnabled = [bool]$task.enabled
+            taskRunning = [bool]$task.running
+            running = ($null -ne $runtime)
+            runtime = $runtime
+        }
+    }
+    catch {
+        return [pscustomobject]@{ ok=$false; errorCategory='service-status-failed' }
+    }
+}
+
+function Invoke-CodexBridgeServiceAction {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][ValidateSet('start-temporary', 'stop-temporary', 'enable-long-term', 'disable-long-term')][string]$Action,
+        [Parameter(Mandatory)][string]$ToolDir,
+        [Parameter(Mandatory)][hashtable]$Operations
+    )
+
+    $requiredByAction = @{
+        'start-temporary' = @('GetTask', 'StartTask', 'StartDetached')
+        'stop-temporary' = @('GetTask', 'StopTask', 'StopRuntime')
+        'enable-long-term' = @('GetTask', 'InstallTask', 'EnableTask', 'StartTask', 'StopRuntime')
+        'disable-long-term' = @('GetTask', 'DisableTask', 'StopTask', 'StopRuntime')
+    }
+    foreach ($operationName in $requiredByAction[$Action]) {
+        if (-not $Operations.ContainsKey($operationName) -or $Operations[$operationName] -isnot [scriptblock]) {
+            return [pscustomobject]@{ ok=$false; action=$Action; errorCategory='invalid-service-operations' }
+        }
+    }
+    $status = Get-CodexBridgeServiceStatus -Operations $Operations -ToolDir $ToolDir
+    if (-not $status.ok) { return [pscustomobject]@{ ok=$false; action=$Action; errorCategory=$status.errorCategory } }
+    try {
+        $startupPath = Join-Path ([System.IO.Path]::GetFullPath($ToolDir)) 'start-discord-bridge.ps1'
+        switch ($Action) {
+            'start-temporary' {
+                if (-not $status.running) {
+                    if ($status.autoStartEnabled) { & $Operations.StartTask }
+                    else { & $Operations.StartDetached $startupPath 'temporary' }
+                }
+            }
+            'stop-temporary' {
+                if ($status.running) { & $Operations.StopRuntime $status.runtime }
+                elseif ($status.taskRunning) { & $Operations.StopTask }
+            }
+            'enable-long-term' {
+                if (-not $status.taskInstalled) { & $Operations.InstallTask }
+                & $Operations.EnableTask
+                if ($null -ne $status.runtime -and $status.runtime.mode -eq 'temporary') { & $Operations.StopRuntime $status.runtime }
+                & $Operations.StartTask
+            }
+            'disable-long-term' {
+                if ($status.taskInstalled) { & $Operations.DisableTask }
+                if ($status.running) { & $Operations.StopRuntime $status.runtime }
+                elseif ($status.taskRunning) { & $Operations.StopTask }
+            }
+        }
+        $finalStatus = Get-CodexBridgeServiceStatus -Operations $Operations -ToolDir $ToolDir
+        return [pscustomobject][ordered]@{ ok=$finalStatus.ok; action=$Action; service=$finalStatus }
+    }
+    catch {
+        return [pscustomobject]@{ ok=$false; action=$Action; errorCategory='service-action-failed' }
     }
 }
 
@@ -467,10 +615,10 @@ function Invoke-CodexControlAction {
     switch ($Action) {
         'status' { return Get-CodexControlStatus -Operations $operations -ToolDir $ToolDir }
         'stop-codex' { return Stop-CodexDesktop -Operations $operations }
-        'start-temporary' { return [pscustomobject]@{ ok=$false; action=$Action; errorCategory='service-control-unavailable' } }
-        'stop-temporary' { return [pscustomobject]@{ ok=$false; action=$Action; errorCategory='service-control-unavailable' } }
-        'enable-long-term' { return [pscustomobject]@{ ok=$false; action=$Action; errorCategory='service-control-unavailable' } }
-        'disable-long-term' { return [pscustomobject]@{ ok=$false; action=$Action; errorCategory='service-control-unavailable' } }
+        'start-temporary' { return Invoke-CodexBridgeServiceAction -Action $Action -ToolDir $ToolDir -Operations $operations }
+        'stop-temporary' { return Invoke-CodexBridgeServiceAction -Action $Action -ToolDir $ToolDir -Operations $operations }
+        'enable-long-term' { return Invoke-CodexBridgeServiceAction -Action $Action -ToolDir $ToolDir -Operations $operations }
+        'disable-long-term' { return Invoke-CodexBridgeServiceAction -Action $Action -ToolDir $ToolDir -Operations $operations }
         default { return [pscustomobject]@{ ok=$false; errorCategory='invalid-action' } }
     }
 }

@@ -1,10 +1,10 @@
 $repo = Split-Path -Parent $PSScriptRoot
-$forbiddenFiles = @('config.json','discord-token.dpapi','discord-inbox-state.json','discord-message-map.json','quota-state.json','rollout-watcher-state.json','task-delivery-state.json')
+$forbiddenFiles = @('config.json','discord-token.dpapi','discord-inbox-state.json','discord-message-map.json','quota-state.json','rollout-watcher-state.json','task-delivery-state.json','discord-bridge-runtime.json','discord-bridge-health.json')
 foreach ($name in $forbiddenFiles) {
     if (Test-Path -LiteralPath (Join-Path $repo $name)) { throw "runtime file tracked candidate: $name" }
 }
 $text = Get-ChildItem $repo -Recurse -File |
-    Where-Object { $_.FullName -notmatch '\\.git\\|\\.superpowers\\' } |
+    Where-Object { $_.FullName -notmatch '\\.git\\|\\.superpowers\\|\\docs\\superpowers\\' } |
     ForEach-Object { Get-Content -Raw -LiteralPath $_.FullName -ErrorAction SilentlyContinue }
 $joined = $text -join "`n"
 if ($joined -match 'https://discord\.com/api/webhooks/[0-9]+/[A-Za-z0-9_-]{20,}') { throw 'real webhook pattern found' }

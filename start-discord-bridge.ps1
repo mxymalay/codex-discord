@@ -30,7 +30,11 @@ if (-not $createdNew) {
     exit 0
 }
 
+$runtimePath = Join-Path $toolDir 'discord-bridge-runtime.json'
 try {
+    $supervisor = Get-Process -Id $PID -ErrorAction Stop
+    $mode = if ($env:CODEX_DISCORD_START_MODE -eq 'temporary') { 'temporary' } else { 'scheduled' }
+    Write-BridgeRuntimeIdentity -Path $runtimePath -Mode $mode -ProcessId $PID -CreationTimeUtc $supervisor.StartTime.ToUniversalTime() -ToolDir $toolDir | Out-Null
     Write-BridgeGuardLog -Category 'guard-started'
     while ($true) {
         $attempt = [System.Diagnostics.Stopwatch]::StartNew()
@@ -57,6 +61,7 @@ try {
     }
 }
 finally {
+    [void](Remove-BridgeRuntimeIdentity -Path $runtimePath -ExpectedProcessId $PID)
     try { $mutex.ReleaseMutex() } catch {}
     $mutex.Dispose()
 }

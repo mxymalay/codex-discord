@@ -198,6 +198,70 @@ if (-not $status.ok -or -not $status.codexDesktop.running -or $status.codexDeskt
     throw 'control status did not report the trusted process plan'
 }
 
+function New-FakeBridgeOperations {
+    param([Parameter(Mandatory)][hashtable]$State)
+
+    $operations = @{
+        GetTask = { [pscustomobject]@{ installed=$State.installed; enabled=$State.enabled; running=($State.running -and $State.mode -eq 'scheduled') } }
+        GetProcesses = {
+            if (-not $State.running) { return @() }
+            return @([pscustomobject]@{ ProcessId=501; CreationTimeUtc='2026-09-01T12:00:00.0000000Z' })
+        }
+        GetRuntime = {
+            if (-not $State.running) { return $null }
+            return [pscustomobject]@{ processId=501; creationTimeUtc='2026-09-01T12:00:00.0000000Z'; mode=$State.mode }
+        }
+        InstallTask = { $State.installed=$true }
+        EnableTask = { $State.enabled=$true }
+        DisableTask = { $State.enabled=$false }
+        StartTask = { $State.running=$true; $State.mode='scheduled' }
+        StopTask = { $State.running=$false; $State.mode=$null }
+        StartDetached = { param($startupPath,$mode) $State.running=$true; $State.mode=$mode }
+        StopRuntime = { param($runtime) if ($runtime.processId -ne 501) { throw 'wrong runtime stopped' }; $State.running=$false; $State.mode=$null }
+    }
+    foreach ($name in @($operations.Keys)) { $operations[$name] = $operations[$name].GetNewClosure() }
+    return $operations
+}
+
+$bridgeRuntimeRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('codex-bridge-runtime-' + [guid]::NewGuid().ToString('N'))
+try {
+    New-Item -ItemType Directory -Path $bridgeRuntimeRoot -Force | Out-Null
+    $runtimePath = Join-Path $bridgeRuntimeRoot 'discord-bridge-runtime.json'
+    [void](Write-BridgeRuntimeIdentity -Path $runtimePath -Mode temporary -ProcessId 501 -CreationTimeUtc '2026-09-01T12:00:00.0000000Z' -ToolDir $bridgeRuntimeRoot)
+    $runtime = Read-ValidatedBridgeRuntimeIdentity -Path $runtimePath -Processes @([pscustomobject]@{ ProcessId=501; CreationTimeUtc='2026-09-01T12:00:00.0000000Z' }) -ToolDir $bridgeRuntimeRoot
+    if ($null -eq $runtime -or $runtime.mode -ne 'temporary' -or $runtime.processId -ne 501) {
+        throw 'runtime identity did not validate its matching synthetic supervisor'
+    }
+    if ($null -ne (Read-ValidatedBridgeRuntimeIdentity -Path $runtimePath -Processes @([pscustomobject]@{ ProcessId=501; CreationTimeUtc='2026-09-01T12:00:01.0000000Z' }) -ToolDir $bridgeRuntimeRoot)) {
+        throw 'runtime identity accepted a reused PID with a different creation time'
+    }
+    if ($null -ne (Read-ValidatedBridgeRuntimeIdentity -Path $runtimePath -Processes @([pscustomobject]@{ ProcessId=501; CreationTimeUtc='2026-09-01T12:00:00.0000000Z' }) -ToolDir (Join-Path $bridgeRuntimeRoot 'other-tool-dir'))) {
+        throw 'runtime identity accepted a different tool directory'
+    }
+    [void](Remove-BridgeRuntimeIdentity -Path $runtimePath -ExpectedProcessId 502)
+    if (-not (Test-Path -LiteralPath $runtimePath)) { throw 'runtime cleanup removed a different supervisor identity' }
+    [void](Remove-BridgeRuntimeIdentity -Path $runtimePath -ExpectedProcessId 501)
+    if (Test-Path -LiteralPath $runtimePath) { throw 'runtime cleanup did not remove its matching supervisor identity' }
+}
+finally {
+    Remove-Item -LiteralPath $bridgeRuntimeRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+$bridgeState = @{ installed=$false; enabled=$false; running=$false; mode=$null }
+$bridgeOps = New-FakeBridgeOperations -State $bridgeState
+$startTemporary = Invoke-CodexBridgeServiceAction -Action 'start-temporary' -ToolDir $sourceRoot -Operations $bridgeOps
+if (-not $startTemporary.ok) { throw "temporary start failed: $($startTemporary.errorCategory)" }
+if (-not $bridgeState.running -or $bridgeState.enabled -or $bridgeState.mode -ne 'temporary') { throw 'temporary start changed long-term setting or did not use detached ownership' }
+$enableLongTerm = Invoke-CodexBridgeServiceAction -Action 'enable-long-term' -ToolDir $sourceRoot -Operations $bridgeOps
+if (-not $enableLongTerm.ok) { throw "long-term enable failed: $($enableLongTerm.errorCategory)" }
+if (-not $bridgeState.running -or -not $bridgeState.enabled -or $bridgeState.mode -ne 'scheduled') { throw 'long-term enable did not adopt scheduled ownership' }
+$stopTemporary = Invoke-CodexBridgeServiceAction -Action 'stop-temporary' -ToolDir $sourceRoot -Operations $bridgeOps
+if (-not $stopTemporary.ok) { throw "temporary stop failed: $($stopTemporary.errorCategory)" }
+if ($bridgeState.running -or -not $bridgeState.enabled) { throw 'temporary stop changed long-term setting' }
+$disableLongTerm = Invoke-CodexBridgeServiceAction -Action 'disable-long-term' -ToolDir $sourceRoot -Operations $bridgeOps
+if (-not $disableLongTerm.ok) { throw "long-term disable failed: $($disableLongTerm.errorCategory)" }
+if ($bridgeState.running -or $bridgeState.enabled) { throw 'long-term disable did not persist' }
+
 $entrypoint = Join-Path $sourceRoot 'codex-control.ps1'
 $invalidJson = @(& pwsh -NoProfile -File $entrypoint -Action 'arbitrary-action' 2>$null)
 if ($LASTEXITCODE -eq 0) { throw 'entrypoint accepted an arbitrary action' }

@@ -49,9 +49,24 @@ if ($startupSource -match '(?i)discord-token|\bBot\s+[A-Za-z0-9_.-]+|webhooks/')
     throw 'Startup guard contains a Discord secret'
 }
 
-$watchSource = Get-Content -Raw -LiteralPath (Join-Path $sourceRoot 'watch-notify.ps1')
-if ($watchSource -notmatch 'install-discord-bridge-task\.ps1' -or $watchSource -notmatch '\$null -eq \$bridgeTask') {
-    throw 'Notification guard does not reinstall a missing Discord bridge task'
+$watchScript = Join-Path $sourceRoot 'watch-notify.ps1'
+$guardState = [ordered]@{ repairs=0; installs=0; enables=0; disables=0; starts=0; stops=0; sleeps=0 }
+$guardOperations = @{
+    Repair = { $guardState.repairs++ }
+    InstallTask = { $guardState.installs++ }
+    EnableTask = { $guardState.enables++ }
+    DisableTask = { $guardState.disables++ }
+    StartTask = { $guardState.starts++ }
+    StopTask = { $guardState.stops++ }
+    Sleep = { param($seconds) $guardState.sleeps++ }
+    Log = { param($message) }
+}
+& $watchScript -Once -Operations $guardOperations
+if ($guardState.repairs -ne 1 -or $guardState.sleeps -ne 0) {
+    throw 'notification guard did not perform exactly one injected repair iteration'
+}
+if (($guardState.installs + $guardState.enables + $guardState.disables + $guardState.starts + $guardState.stops) -ne 0) {
+    throw 'notification guard changed Discord bridge service state'
 }
 
 Write-Output 'PASS: Discord bridge startup task definition'
