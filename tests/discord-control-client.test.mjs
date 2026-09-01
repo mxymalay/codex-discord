@@ -126,3 +126,29 @@ test('concurrent health writes leave one complete JSON snapshot', async () => {
     await fs.rm(root, { recursive: true, force: true });
   }
 });
+
+test('aborted health writes clean their temp file without committing after a newer generation', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-bridge-health-abort-'));
+  const target = path.join(root, 'discord-bridge-health.json');
+  const controller = new AbortController();
+  let releaseWrite;
+  const renamed = [];
+  const fsImpl = {
+    async writeFile(file, contents) { await new Promise((resolve) => { releaseWrite = resolve; }); await fs.writeFile(file, contents, 'utf8'); },
+    async rename(source, destination) { renamed.push(destination); await fs.rename(source, destination); },
+    rm: fs.rm.bind(fs),
+  };
+  try {
+    const oldWrite = writeBridgeHealthAtomic(target, { gateway: { state: 'ready' } }, {
+      fsImpl, signal: controller.signal, shouldCommit: () => !controller.signal.aborted,
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    controller.abort();
+    releaseWrite();
+    await oldWrite;
+    assert.deepEqual(renamed, []);
+    assert.equal((await fs.readdir(root)).some((name) => name.endsWith('.tmp')), false);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});

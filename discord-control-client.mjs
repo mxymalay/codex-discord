@@ -147,15 +147,19 @@ function sanitizeHealth(status) {
 }
 
 /** Atomically replace a same-directory, sanitized bridge health snapshot. */
-export async function writeBridgeHealthAtomic(targetPath, status, { fsImpl = fs } = {}) {
+export async function writeBridgeHealthAtomic(targetPath, status, { fsImpl = fs, signal, shouldCommit = () => !signal?.aborted, bypassQueue = false } = {}) {
+  const canCommit = () => !signal?.aborted && shouldCommit();
+  if (!canCommit()) return;
   const queueKey = path.resolve(targetPath);
   const previous = healthWriteQueues.get(queueKey) ?? Promise.resolve();
-  const write = previous.catch(() => {}).then(async () => {
+  const writeOperation = async () => {
+    if (!canCommit()) return;
     const directory = path.dirname(targetPath);
     const temporaryPath = path.join(directory, `.${path.basename(targetPath)}.${process.pid}.${randomUUID()}.tmp`);
     const serialized = `${JSON.stringify(sanitizeHealth(status))}\n`;
     try {
       await fsImpl.writeFile(temporaryPath, serialized, 'utf8');
+      if (!canCommit()) return;
       await fsImpl.rename(temporaryPath, targetPath);
     } finally {
       try {
@@ -165,11 +169,12 @@ export async function writeBridgeHealthAtomic(targetPath, status, { fsImpl = fs 
         // A successful rename has already consumed the unique temporary file.
       }
     }
-  });
-  healthWriteQueues.set(queueKey, write);
+  };
+  const write = bypassQueue ? Promise.resolve().then(writeOperation) : previous.catch(() => {}).then(writeOperation);
+  if (!bypassQueue) healthWriteQueues.set(queueKey, write);
   try {
     await write;
   } finally {
-    if (healthWriteQueues.get(queueKey) === write) healthWriteQueues.delete(queueKey);
+    if (!bypassQueue && healthWriteQueues.get(queueKey) === write) healthWriteQueues.delete(queueKey);
   }
 }

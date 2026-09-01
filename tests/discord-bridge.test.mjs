@@ -171,6 +171,51 @@ test('bridge contains health publication failures as a sanitized category', asyn
   await app.stop();
 });
 
+test('health lifecycle bounds hung publication and makes stopped final publication last', async () => {
+  const events = [];
+  const published = [];
+  const timers = [];
+  let ordinaryRelease;
+  const app = createBridgeApplication(makeBridgeDependencies(events, {
+    healthPublishTimeoutMs: 5,
+    publishHealth: async (_context, { forceFinal, signal } = {}) => {
+      if (forceFinal) { published.push('final'); return; }
+      published.push('ordinary');
+      await new Promise((resolve) => { ordinaryRelease = resolve; });
+      if (signal?.aborted) return;
+      published.push('late-ordinary');
+    },
+    setInterval(callback) { timers.push(callback); return 0; },
+    clearInterval() {},
+  }));
+  const started = await Promise.race([
+    app.start().then(() => 'started'),
+    new Promise((resolve) => setTimeout(() => resolve('timed-out'), 30)),
+  ]);
+  assert.equal(started, 'started');
+  await app.stop();
+  await timers[0]();
+  ordinaryRelease?.();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(published.at(-1), 'final');
+  assert.equal(published.includes('late-ordinary'), false);
+});
+
+test('REST tracker publishes failed then recovered state without raw failures', async () => {
+  const events = [];
+  const published = [];
+  const app = createBridgeApplication(makeBridgeDependencies(events, {
+    publishHealth: async (context) => { published.push(structuredClone(context.getSystemStatus().discordRest)); },
+  }));
+  await app.start();
+  await assert.rejects(() => app.context.trackDiscordRest(() => { throw new Error('Token must-not-appear'); }));
+  await app.context.trackDiscordRest(async () => {});
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(published.slice(-2).map((item) => item.state), ['failed', 'ok']);
+  assert.equal(JSON.stringify(published).includes('must-not-appear'), false);
+  await app.stop();
+});
+
 test('older v2 inbox state gains the newer empty containers before strict validation', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-older-v2-inbox-'));
   const inboxPath = path.join(root, 'discord-inbox-state.json');

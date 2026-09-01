@@ -108,6 +108,22 @@ function boundedShutdownTimeout(value) {
   return Number.isFinite(milliseconds) ? Math.max(0, Math.min(60_000, Math.floor(milliseconds))) : 10_000;
 }
 
+function boundedHealthTimeout(value) {
+  const milliseconds = Number(value);
+  return Number.isFinite(milliseconds) ? Math.max(1, Math.min(10_000, Math.floor(milliseconds))) : 2_000;
+}
+
+export async function trackDiscordRest(context, operation) {
+  try {
+    const result = await operation();
+    context.setDiscordRestStatus('ok');
+    return result;
+  } catch (error) {
+    context.setDiscordRestStatus('failed');
+    throw error;
+  }
+}
+
 /** Compose the bridge lifecycle from injectable components. */
 export function createBridgeApplication(dependencies = {}) {
   const context = {
@@ -135,6 +151,10 @@ export function createBridgeApplication(dependencies = {}) {
   let stopPromise = null;
   let healthTimer = null;
   let healthPublication = Promise.resolve();
+  let healthGeneration = 0;
+  let healthController = null;
+  let healthLifecycle = 'inactive';
+  let healthFinalAllowed = false;
   const idleWaiters = new Set();
 
   const notifyIdle = () => {
@@ -180,16 +200,40 @@ export function createBridgeApplication(dependencies = {}) {
   };
   context.trackActiveResource = trackActiveResource;
 
-  const safePublishHealth = async () => {
-    if (typeof dependencies.publishHealth !== 'function') return;
-    healthPublication = healthPublication.catch(() => {}).then(() => dependencies.publishHealth(context));
-    try {
-      await healthPublication;
-    } catch {
-      // Never feed a health-write failure back through publication.
-      context.latestErrorCategory = 'bridge-health-write-failed';
-      await Promise.resolve(dependencies.logHealthFailure?.('bridge-health-write-failed')).catch(() => {});
-    }
+  const reportHealthFailure = (generation) => {
+    if (generation === healthGeneration) context.latestErrorCategory = 'bridge-health-write-failed';
+    try { Promise.resolve(dependencies.logHealthFailure?.('bridge-health-write-failed')).catch(() => {}); } catch {}
+  };
+  const healthIsCurrent = (generation, controller, forceFinal) => generation === healthGeneration && controller === healthController && !controller.signal.aborted &&
+    (forceFinal ? healthLifecycle === 'stopping' && healthFinalAllowed : ['starting', 'running'].includes(healthLifecycle));
+  const safePublishHealth = ({ forceFinal = false } = {}) => {
+    if (typeof dependencies.publishHealth !== 'function') return Promise.resolve();
+    const generation = healthGeneration;
+    const lifecycleController = healthController;
+    if (!lifecycleController || !healthIsCurrent(generation, lifecycleController, forceFinal)) return Promise.resolve();
+    const previous = healthPublication;
+    const run = async () => {
+      await previous.catch(() => {});
+      if (!healthIsCurrent(generation, lifecycleController, forceFinal)) return;
+      const publicationController = new AbortController();
+      const abort = () => publicationController.abort();
+      lifecycleController.signal.addEventListener('abort', abort, { once: true });
+      const operation = Promise.resolve().then(() => dependencies.publishHealth(context, {
+        signal: publicationController.signal, generation, forceFinal,
+        shouldCommit: () => healthIsCurrent(generation, lifecycleController, forceFinal) && !publicationController.signal.aborted,
+      }));
+      operation.catch(() => {});
+      let timeoutId;
+      const outcome = await Promise.race([
+        operation.then(() => 'ok', () => 'failed'),
+        new Promise((resolve) => { timeoutId = setTimeout(() => resolve('timeout'), boundedHealthTimeout(dependencies.healthPublishTimeoutMs)); }),
+      ]);
+      clearTimeout(timeoutId);
+      lifecycleController.signal.removeEventListener('abort', abort);
+      if (outcome !== 'ok') { publicationController.abort(); reportHealthFailure(generation); }
+    };
+    healthPublication = run().catch(() => {});
+    return healthPublication;
   };
 
   const publishHealthSoon = () => { void safePublishHealth(); };
@@ -221,6 +265,7 @@ export function createBridgeApplication(dependencies = {}) {
   context.recordActivity = recordActivity;
   context.getSystemStatus = getSystemStatus;
   context.publishHealth = safePublishHealth;
+  context.trackDiscordRest = (operation) => trackDiscordRest(context, operation);
   context.setGatewayStatus = (status) => {
     context.gatewayStatus = status && typeof status === 'object' ? status : { state: 'unknown' };
     if (status?.lastEventAt != null) recordActivity('lastGatewayEventAt', status.lastEventAt);
@@ -246,11 +291,10 @@ export function createBridgeApplication(dependencies = {}) {
   }
 
   async function registerAndVerify() {
-    await dependencies.registerCommands(context);
-    const commands = await dependencies.fetchRegisteredCommands(context);
+    await context.trackDiscordRest(() => dependencies.registerCommands(context));
+    const commands = await context.trackDiscordRest(() => dependencies.fetchRegisteredCommands(context));
     const commandNames = exactCommandNames(commands);
     recordActivity('lastRegistrationAt');
-    context.setDiscordRestStatus('ok');
     return commandNames;
   }
 
@@ -268,6 +312,12 @@ export function createBridgeApplication(dependencies = {}) {
       acceptingResources = true;
       context.isStopping = false;
       stopPromise = null;
+      healthController?.abort();
+      healthGeneration++;
+      healthController = new AbortController();
+      healthLifecycle = 'starting';
+      healthFinalAllowed = false;
+      context.healthGeneration = healthGeneration;
       await prepare(false);
       try {
         await registerAndVerify();
@@ -281,6 +331,7 @@ export function createBridgeApplication(dependencies = {}) {
         context.setGatewayStatus(context.gateway?.getStatus?.() ?? { state: 'connecting' });
         context.legacyPollers = await dependencies.startLegacyPollers(context);
         started = true;
+        healthLifecycle = 'running';
         context.startedAt = isoTimestamp(dependencies.now?.() ?? Date.now());
         await safePublishHealth();
         const setHealthInterval = dependencies.setInterval ?? globalThis.setInterval;
@@ -299,6 +350,13 @@ export function createBridgeApplication(dependencies = {}) {
       if (!started && !context.gateway && !context.legacyPollers) return undefined;
       acceptingResources = false;
       context.isStopping = true;
+      healthController?.abort();
+      healthGeneration++;
+      healthController = new AbortController();
+      healthLifecycle = 'stopping';
+      healthFinalAllowed = true;
+      context.healthGeneration = healthGeneration;
+      healthPublication = Promise.resolve();
       const clearHealthInterval = dependencies.clearInterval ?? globalThis.clearInterval;
       if (healthTimer !== null) {
         clearHealthInterval(healthTimer);
@@ -343,7 +401,9 @@ export function createBridgeApplication(dependencies = {}) {
         }
         started = false;
         context.gatewayStatus = { state: 'stopped' };
-        await safePublishHealth();
+        await safePublishHealth({ forceFinal: true });
+        healthFinalAllowed = false;
+        healthLifecycle = 'stopped';
         if (failures.length > 0) {
           throw new Error(`Discord bridge shutdown failed: ${[...new Set(failures)].join(',')}`);
         }
@@ -800,7 +860,7 @@ function createProductionBridgeDependencies({ runOnce = false } = {}) {
     async createInteractionHandler(context) {
       const rest = createInteractionRestClient({ applicationId: context.config.discordApplicationId });
       const readQuota = () => readJsonFile(quotaStatePath, { observedAt: null, limits: [] });
-      const api = (route) => discordRequest({ token: context.token, route });
+      const api = (route) => context.trackDiscordRest(() => discordRequest({ token: context.token, route }));
       const healthDependencies = {
         config: context.config,
         loadToken: () => loadDiscordToken({ toolDir, powershellPath: context.executables.powershellPath }),
@@ -872,8 +932,8 @@ function createProductionBridgeDependencies({ runOnce = false } = {}) {
           }
         },
         healthDependencies,
-        respond: (body, interaction) => rest.callback(interaction, body),
-        editOriginal: (body, interaction) => rest.editOriginal(interaction, body),
+        respond: (body, interaction) => context.trackDiscordRest(() => rest.callback(interaction, body)),
+        editOriginal: (body, interaction) => context.trackDiscordRest(() => rest.editOriginal(interaction, body)),
       });
       return (interaction) => router.handle(interaction);
     },
@@ -899,7 +959,7 @@ function createProductionBridgeDependencies({ runOnce = false } = {}) {
         await initializeInboxCursors({
           state,
           channelIds,
-          getLatest: (channelId) => getLatestDiscordMessageId({ token, channelId }),
+          getLatest: (channelId) => context.trackDiscordRest(() => getLatestDiscordMessageId({ token, channelId })),
         });
         await commitInboxState({ state, persistState: saveState });
       }
@@ -964,6 +1024,7 @@ function createProductionBridgeDependencies({ runOnce = false } = {}) {
                   config,
                   state,
                   channelId,
+                  getMessages: (options) => context.trackDiscordRest(() => getDiscordMessagesAfter(options)),
                 continueRequest: async (payload) => {
                   try {
                     return await startContinuation({
@@ -1016,7 +1077,7 @@ function createProductionBridgeDependencies({ runOnce = false } = {}) {
     persistTaskIndex: (context) => writeTaskIndexAtomic(taskIndexPath, context.taskIndex),
     persistInboxState: (context) => context.inboxReadOnly ? undefined : saveState(context.inboxState),
     persistRolloutState: (context) => writeRolloutWatcherState(rolloutWatcherStatePath, context.rolloutState),
-    publishHealth: async (context) => {
+    publishHealth: async (context, { signal, shouldCommit, forceFinal } = {}) => {
       const status = context.getSystemStatus();
       await writeBridgeHealthAtomic(bridgeHealthPath, {
         gateway: status.gateway,
@@ -1025,7 +1086,7 @@ function createProductionBridgeDependencies({ runOnce = false } = {}) {
         startedAt: context.startedAt,
         lastActivityAt: latestTimestamp(status.timestamps),
         latestEventCategory: status.latestErrorCategory,
-      });
+      }, { signal, shouldCommit, bypassQueue: Boolean(forceFinal) });
     },
     logHealthFailure: (category) => log(category),
   };
