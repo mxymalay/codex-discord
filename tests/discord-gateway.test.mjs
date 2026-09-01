@@ -1,0 +1,227 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+
+import { createGatewayClient } from '../discord-gateway-lib.mjs';
+
+class FakeWebSocket {
+  constructor(url) {
+    this.url = url;
+    this.sent = [];
+    this.listeners = new Map();
+  }
+
+  addEventListener(type, listener) {
+    const listeners = this.listeners.get(type) ?? [];
+    listeners.push(listener);
+    this.listeners.set(type, listeners);
+  }
+
+  send(frame) {
+    this.sent.push(JSON.parse(frame));
+  }
+
+  close() {
+    this.emit('close', { code: 1000 });
+  }
+
+  receive(frame) {
+    this.emit('message', { data: JSON.stringify(frame) });
+  }
+
+  emit(type, event = {}) {
+    for (const listener of this.listeners.get(type) ?? []) listener(event);
+  }
+}
+
+function createFakeTimers() {
+  let now = 0;
+  let nextId = 1;
+  const entries = new Map();
+
+  return {
+    now: () => now,
+    random: () => 0,
+    setTimeout(callback, milliseconds) {
+      const id = nextId++;
+      entries.set(id, { callback, due: now + milliseconds });
+      return id;
+    },
+    clearTimeout(id) {
+      entries.delete(id);
+    },
+    async advance(milliseconds) {
+      const deadline = now + milliseconds;
+      while (true) {
+        const ready = [...entries.entries()]
+          .filter(([, entry]) => entry.due <= deadline)
+          .sort(([, left], [, right]) => left.due - right.due)[0];
+        if (!ready) break;
+        const [id, entry] = ready;
+        entries.delete(id);
+        now = entry.due;
+        await entry.callback();
+      }
+      now = deadline;
+    },
+  };
+}
+
+function createHarness() {
+  const sockets = [];
+  const timers = createFakeTimers();
+  const interactions = [];
+  const statuses = [];
+  const client = createGatewayClient({
+    token: 'test-token',
+    fetchImpl: async () => new Response(JSON.stringify({ url: 'wss://gateway.discord.test' })),
+    WebSocketImpl: class extends FakeWebSocket {
+      constructor(url) {
+        super(url);
+        sockets.push(this);
+      }
+    },
+    onInteraction: async (value) => interactions.push(value.id),
+    onStatus: (status) => statuses.push(status),
+    timers,
+  });
+  return { client, interactions, sockets, statuses, timers };
+}
+
+test('identifies after HELLO and dispatches an interaction only once', async () => {
+  const { client, interactions, sockets } = createHarness();
+  await client.start();
+  const socket = sockets[0];
+  socket.receive({ op: 10, d: { heartbeat_interval: 45_000 } });
+  assert.deepEqual(socket.sent[0], {
+    op: 2,
+    d: {
+      token: 'test-token',
+      intents: 1,
+      properties: { os: 'windows', browser: 'codex-discord', device: 'codex-discord' },
+    },
+  });
+
+  socket.receive({ op: 0, t: 'READY', s: 1, d: { session_id: 'session-1', resume_gateway_url: 'wss://resume.test' } });
+  socket.receive({ op: 0, t: 'INTERACTION_CREATE', s: 2, d: { id: 'interaction-1' } });
+  socket.receive({ op: 0, t: 'INTERACTION_CREATE', s: 2, d: { id: 'interaction-1' } });
+  await Promise.resolve();
+
+  assert.deepEqual(interactions, ['interaction-1']);
+  assert.deepEqual(client.getStatus(), {
+    state: 'ready', sessionId: 'session-1', lastHeartbeatAt: null, lastAckAt: null,
+    lastEventAt: 0, reconnectCount: 0, lastError: null,
+  });
+});
+
+test('resumes with the previous session and latest sequence after reconnect', async () => {
+  const { client, sockets, timers } = createHarness();
+  await client.start();
+  sockets[0].receive({ op: 10, d: { heartbeat_interval: 45_000 } });
+  sockets[0].receive({ op: 0, t: 'READY', s: 41, d: { session_id: 'session-1', resume_gateway_url: 'wss://resume.test' } });
+  sockets[0].receive({ op: 7, d: null });
+  await timers.advance(1_000);
+
+  assert.equal(sockets[1].url, 'wss://resume.test?v=10&encoding=json');
+  sockets[1].receive({ op: 10, d: { heartbeat_interval: 45_000 } });
+  assert.deepEqual(sockets[1].sent[0], {
+    op: 6,
+    d: { token: 'test-token', session_id: 'session-1', seq: 41 },
+  });
+  assert.equal(client.getStatus().reconnectCount, 1);
+});
+
+test('invalid session clears resumable state and identifies on the next connection', async () => {
+  const { client, sockets, timers } = createHarness();
+  await client.start();
+  sockets[0].receive({ op: 10, d: { heartbeat_interval: 45_000 } });
+  sockets[0].receive({ op: 0, t: 'READY', s: 1, d: { session_id: 'session-1', resume_gateway_url: 'wss://resume.test' } });
+  sockets[0].receive({ op: 9, d: false });
+  await timers.advance(1_000);
+  sockets[1].receive({ op: 10, d: { heartbeat_interval: 45_000 } });
+
+  assert.deepEqual(sockets[1].sent[0], {
+    op: 2,
+    d: {
+      token: 'test-token',
+      intents: 1,
+      properties: { os: 'windows', browser: 'codex-discord', device: 'codex-discord' },
+    },
+  });
+  assert.equal(client.getStatus().sessionId, null);
+});
+
+test('reconnects when a heartbeat is not acknowledged before the next interval', async () => {
+  const { client, sockets, timers } = createHarness();
+  await client.start();
+  sockets[0].receive({ op: 10, d: { heartbeat_interval: 10 } });
+  await timers.advance(0);
+  assert.deepEqual(sockets[0].sent[1], { op: 1, d: null });
+
+  await timers.advance(10);
+  await timers.advance(1_000);
+  assert.equal(sockets.length, 2);
+  assert.equal(client.getStatus().state, 'connecting');
+});
+
+test('reports only sanitized status data when the gateway request fails', async () => {
+  const statuses = [];
+  const client = createGatewayClient({
+    token: 'super-secret-token',
+    fetchImpl: async () => { throw new Error('failed with super-secret-token and interaction-body'); },
+    WebSocketImpl: FakeWebSocket,
+    onInteraction: async () => {},
+    onStatus: (status) => statuses.push(status),
+    timers: createFakeTimers(),
+  });
+
+  await assert.rejects(() => client.start(), /Discord Gateway connection failed/);
+  const serialized = JSON.stringify({ status: client.getStatus(), statuses });
+  assert.equal(serialized.includes('super-secret-token'), false);
+  assert.equal(serialized.includes('interaction-body'), false);
+});
+
+test('sanitizes WebSocket construction failures before they reach consumers', async () => {
+  const statuses = [];
+  const client = createGatewayClient({
+    token: 'super-secret-token',
+    fetchImpl: async () => new Response(JSON.stringify({ url: 'wss://gateway.discord.test' })),
+    WebSocketImpl: class {
+      constructor() {
+        throw new Error('WebSocket rejected super-secret-token');
+      }
+    },
+    onInteraction: async () => {},
+    onStatus: (status) => statuses.push(status),
+    timers: createFakeTimers(),
+  });
+
+  await assert.rejects(() => client.start(), /Discord Gateway connection failed/);
+  const serialized = JSON.stringify({ status: client.getStatus(), statuses });
+  assert.equal(serialized.includes('super-secret-token'), false);
+});
+
+test('allows a client to retry start after a transient gateway URL failure', async () => {
+  const sockets = [];
+  let attempts = 0;
+  const client = createGatewayClient({
+    token: 'test-token',
+    fetchImpl: async () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error('temporary failure');
+      return new Response(JSON.stringify({ url: 'wss://gateway.discord.test' }));
+    },
+    WebSocketImpl: class extends FakeWebSocket {
+      constructor(url) {
+        super(url);
+        sockets.push(this);
+      }
+    },
+    onInteraction: async () => {},
+    onStatus: () => {},
+    timers: createFakeTimers(),
+  });
+
+  await assert.rejects(() => client.start(), /Discord Gateway connection failed/);
+  await client.start();
+  assert.equal(sockets.length, 1);
+});
