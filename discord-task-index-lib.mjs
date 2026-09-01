@@ -206,8 +206,11 @@ async function readBoundedEntries(filePath, offset, limits, fileSystem, headRegi
   const tailStart = Math.max(head.parsedEnd, nominalTailStart);
   let tail = await readBytes(filePath, tailStart, offset - tailStart, fileSystem);
   if (tailStart > head.parsedEnd) {
-    const firstNewline = tail.indexOf(0x0a);
-    tail = firstNewline < 0 ? Buffer.alloc(0) : tail.subarray(firstNewline + 1);
+    const preceding = await readBytes(filePath, tailStart - 1, 1, fileSystem);
+    if (preceding[0] !== 0x0a) {
+      const firstNewline = tail.indexOf(0x0a);
+      tail = firstNewline < 0 ? Buffer.alloc(0) : tail.subarray(firstNewline + 1);
+    }
   }
   return {
     entries: [...head.entries, ...parseJsonLines(tail.toString('utf8'))],
@@ -423,6 +426,7 @@ export async function buildTaskIndex({
   }));
   const worktreeRoot = configuredWorktreeRoot(discordWorktreeRoot, previousIndex);
   const recordsById = new Map();
+  const unsafePreviousKeys = new Set();
 
   for (const rolloutPath of await listRolloutFiles(sessionsRoot, fileSystem)) {
     const filenameThreadId = standardRolloutThreadId(rolloutPath);
@@ -477,12 +481,14 @@ export async function buildTaskIndex({
           sidebarEntry,
           mappings.get(identityKey(previous.threadId)),
         ));
+      } else if (previous && sidebarEntry) {
+        unsafePreviousKeys.add(identityKey(previous.threadId));
       }
     }
   }
 
   for (const key of sidebarEntries.keys()) {
-    if (recordsById.has(key)) continue;
+    if (recordsById.has(key) || unsafePreviousKeys.has(key)) continue;
     const previous = previousById.get(key);
     if (!previous) continue;
     const retained = durableRecord(previous);

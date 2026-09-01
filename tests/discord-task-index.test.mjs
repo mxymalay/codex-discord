@@ -149,6 +149,50 @@ test('indexes forced-large rollouts from bounded head and tail reads without cla
   }
 });
 
+test('keeps the first tail entry when its read window starts exactly at a JSONL line boundary', async () => {
+  const paths = await fixture();
+  const threadId = '019cdef0-1111-7890-abcd-1234567890ab';
+  const rolloutPath = paths.rollout(`2026-09-01T00-00-00-${threadId}`);
+  try {
+    await writeJsonl(paths.sessionIndexPath, [{ id: threadId, thread_name: '尾部边界任务' }]);
+    const head = [
+      meta(threadId),
+      event('2026-09-01T00:01:00.000Z', 'task_started', { turn_id: 'boundary-turn' }),
+    ].map(line).join('');
+    const middle = line(event('2026-09-01T00:02:00.000Z', 'agent_message', { message: 'x'.repeat(1_200) }));
+    const tail = line(event('2026-09-01T00:03:00.000Z', 'task_complete', {
+      turn_id: 'boundary-turn',
+      last_agent_message: '边界结果',
+    }));
+    await fs.mkdir(path.dirname(rolloutPath), { recursive: true });
+    await fs.writeFile(rolloutPath, `${head}${middle}${tail}`, 'utf8');
+
+    const index = await buildTaskIndex({
+      ...paths,
+      readLimits: {
+        wholeFileBytes: Buffer.byteLength(head),
+        headBytes: Buffer.byteLength(head),
+        tailBytes: Buffer.byteLength(tail),
+        sidebarChunkBytes: 17,
+      },
+      nowMs: Date.parse('2026-09-01T00:04:00.000Z'),
+    });
+
+    assert.equal(index.tasks[0].status, 'completed');
+    assert.equal(index.tasks[0].completedAt, '2026-09-01T00:03:00.000Z');
+    assert.equal(index.tasks[0].runtimeMs, null);
+    assert.equal((await readTaskDetail(index.tasks[0], {
+      readLimits: {
+        wholeFileBytes: Buffer.byteLength(head),
+        headBytes: Buffer.byteLength(head),
+        tailBytes: Buffer.byteLength(tail),
+      },
+    })).resultText, '边界结果');
+  } finally {
+    await fs.rm(paths.root, { recursive: true, force: true });
+  }
+});
+
 test('forced-large detail and search expose bounded head and tail content but not middle-only content', async () => {
   const paths = await fixture();
   const rolloutPath = paths.rollout('bounded-detail');
@@ -365,6 +409,49 @@ test('keeps rebuilding when one rollout becomes unreadable and retains its match
     assert.deepEqual(index.tasks.map((item) => item.threadId).sort(), [healthyId, unreadableId].sort());
     assert.equal(index.tasks.find((item) => item.threadId === unreadableId).taskName, '不可读任务的新标题');
     assert.equal(index.tasks.find((item) => item.threadId === unreadableId).status, 'completed');
+  } finally {
+    await fs.rm(paths.root, { recursive: true, force: true });
+  }
+});
+
+test('does not restore a prior record when the current unreadable rollout is at a different path', async () => {
+  const paths = await fixture();
+  const threadId = '019cdef0-eeee-7890-abcd-1234567890ab';
+  const currentRollout = paths.rollout(`2026-09-01T00-00-00-${threadId}`);
+  const priorRollout = path.join(paths.root, 'old-sessions', `rollout-${threadId}.jsonl`);
+  const fileSystem = new Proxy(fs, {
+    get(target, property) {
+      if (property !== 'open') return Reflect.get(target, property);
+      return async (filePath, ...args) => {
+        if (path.resolve(String(filePath)) === path.resolve(currentRollout)) {
+          const error = new Error('current fixture rollout is unreadable');
+          error.code = 'EACCES';
+          throw error;
+        }
+        return target.open(filePath, ...args);
+      };
+    },
+  });
+  try {
+    await writeJsonl(paths.sessionIndexPath, [{ id: threadId, thread_name: '当前路径任务' }]);
+    await writeJsonl(currentRollout, [meta(threadId)]);
+    const prior = {
+      threadId,
+      taskName: '旧路径任务',
+      status: 'completed',
+      lastActivityAt: '2026-09-01T00:01:00.000Z',
+      rolloutPath: priorRollout,
+      offset: 123,
+    };
+
+    const index = await buildTaskIndex({
+      ...paths,
+      fileSystem,
+      previousIndex: { version: 1, generatedAt: prior.lastActivityAt, tasks: [prior] },
+      nowMs: Date.parse('2026-09-01T00:02:00.000Z'),
+    });
+
+    assert.deepEqual(index.tasks, []);
   } finally {
     await fs.rm(paths.root, { recursive: true, force: true });
   }
