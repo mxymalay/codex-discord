@@ -124,6 +124,28 @@ test('indexes sidebar user roots, uses the last sidebar title, and excludes ever
   }
 });
 
+test('deduplicates mixed-case rollout IDs and preserves the newest record canonical ID', async () => {
+  const paths = await fixture();
+  try {
+    await writeJsonl(paths.sessionIndexPath, [{ id: 'RoOt-DuP', thread_name: '唯一主任务' }]);
+    await writeJsonl(paths.rollout('older'), [
+      meta('ROOT-DUP'),
+      event('2026-09-01T00:01:00.000Z', 'user_message', { message: '较早活动' }),
+    ]);
+    await writeJsonl(paths.rollout('newer'), [
+      meta('root-dup'),
+      event('2026-09-01T00:05:00.000Z', 'user_message', { message: '最新活动' }),
+    ]);
+
+    const index = await buildTaskIndex({ ...paths, nowMs: Date.parse('2026-09-01T00:06:00.000Z') });
+    assert.equal(index.tasks.length, 1);
+    assert.equal(index.tasks[0].threadId, 'root-dup');
+    assert.equal(index.tasks[0].lastActivityAt, '2026-09-01T00:05:00.000Z');
+  } finally {
+    await fs.rm(paths.root, { recursive: true, force: true });
+  }
+});
+
 test('derives running and failed status and sums only timestamped turn runtime', async () => {
   const paths = await fixture();
   try {

@@ -315,9 +315,10 @@ export async function buildTaskIndex({
       latestMapping: mappings.get(identityKey(threadId)),
     });
     if (!record) continue;
-    const current = recordsById.get(threadId);
+    const key = identityKey(threadId);
+    const current = recordsById.get(key);
     if (!current || (validTime(record.lastActivityAt) ?? 0) > (validTime(current.lastActivityAt) ?? 0)) {
-      recordsById.set(threadId, record);
+      recordsById.set(key, record);
     }
   }
 
