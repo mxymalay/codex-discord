@@ -136,6 +136,41 @@ test('bridge composition starts registration, index and gateway without disablin
   ]);
 });
 
+test('bridge publishes sanitized health at startup, state changes, heartbeat, and final stop without affecting shutdown', async () => {
+  const events = [];
+  const published = [];
+  const timers = [];
+  const app = createBridgeApplication(makeBridgeDependencies(events, {
+    publishHealth: async (context) => { published.push(context.getSystemStatus()); },
+    setInterval(callback, milliseconds) { timers.push({ callback, milliseconds, cleared: false }); return timers.length - 1; },
+    clearInterval(id) { timers[id].cleared = true; },
+  }));
+
+  await app.start();
+  const afterStart = published.length;
+  assert.ok(afterStart >= 1);
+  assert.equal(timers[0].milliseconds, 10_000);
+  app.recordActivity('lastQueueRetryAt', '2026-09-01T00:00:10.000Z');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(published.length, afterStart + 1);
+  await timers[0].callback();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(published.length, afterStart + 2);
+  await app.stop();
+  assert.equal(timers[0].cleared, true);
+  assert.equal(published.length, afterStart + 3);
+});
+
+test('bridge contains health publication failures as a sanitized category', async () => {
+  const events = [];
+  const app = createBridgeApplication(makeBridgeDependencies(events, {
+    publishHealth: async () => { throw new Error('Token must-not-appear'); },
+  }));
+  await app.start();
+  assert.equal(app.context.latestErrorCategory, 'bridge-health-write-failed');
+  await app.stop();
+});
+
 test('older v2 inbox state gains the newer empty containers before strict validation', async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-older-v2-inbox-'));
   const inboxPath = path.join(root, 'discord-inbox-state.json');

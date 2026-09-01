@@ -410,6 +410,43 @@ finally {
     Remove-Item -LiteralPath $reviewRuntimeRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
 
+$healthStatusRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('codex-bridge-health-status-' + [guid]::NewGuid().ToString('N'))
+try {
+    New-Item -ItemType Directory -Path $healthStatusRoot -Force | Out-Null
+    $healthPath = Join-Path $healthStatusRoot 'discord-bridge-health.json'
+    @{
+        version = 1
+        observedAt = '2026-09-01T13:10:00.000Z'
+        gateway = @{ state = 'ready' }
+        discordRest = @{ state = 'ok' }
+        queueCount = 3
+        startedAt = '2026-09-01T13:00:00.000Z'
+        lastActivityAt = '2026-09-01T13:09:00.000Z'
+        latestEventCategory = 'queue-retry-failed'
+    } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $healthPath -Encoding UTF8
+
+    $healthStatus = Get-CodexControlStatus -Operations @{
+        GetProcesses = { $processes }
+        GetTask = { [pscustomobject]@{ installed=$true; enabled=$true; running=$true } }
+        GetRuntime = { [pscustomobject]@{ processId=501; creationTimeUtc='2026-09-01T13:00:00.0000000Z'; mode='scheduled' } }
+        Now = { [datetimeoffset]'2026-09-01T13:10:10.000Z' }
+    } -ToolDir $healthStatusRoot
+    if (-not $healthStatus.ok -or -not $healthStatus.service.running -or -not $healthStatus.service.autoStartEnabled -or $healthStatus.service.mode -ne 'scheduled' -or $healthStatus.discord.state -ne 'ready' -or $healthStatus.queueCount -ne 3 -or -not $healthStatus.desktop.running) {
+        throw 'status did not merge the validated runtime, fixed task, health snapshot, queue, and desktop plan'
+    }
+    Set-Content -LiteralPath $healthPath -Value '{not-json' -Encoding UTF8
+    $corruptHealthStatus = Get-CodexControlStatus -Operations @{
+        GetProcesses = { $processes }
+        GetTask = { [pscustomobject]@{ installed=$true; enabled=$true; running=$false } }
+        GetRuntime = { $null }
+        Now = { [datetimeoffset]'2026-09-01T13:10:10.000Z' }
+    } -ToolDir $healthStatusRoot
+    if ($corruptHealthStatus.discord.state -ne 'unknown' -or $corruptHealthStatus.queueCount -ne 0) { throw 'corrupt health did not fail closed as unknown' }
+}
+finally {
+    Remove-Item -LiteralPath $healthStatusRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 $entrypoint = Join-Path $sourceRoot 'codex-control.ps1'
 $invalidJson = @(& pwsh -NoProfile -File $entrypoint -Action 'arbitrary-action' 2>$null)
 if ($LASTEXITCODE -eq 0) { throw 'entrypoint accepted an arbitrary action' }

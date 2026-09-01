@@ -684,6 +684,67 @@ function Stop-CodexDesktop {
     }
 }
 
+function Test-ControlHealthPropertySet {
+    param([Parameter(Mandatory)][object]$Value, [Parameter(Mandatory)][string[]]$Names)
+    if ($null -eq $Value) { return $false }
+    $actual = @($Value.PSObject.Properties.Name | Sort-Object)
+    $expected = @($Names | Sort-Object)
+    return (($actual -join '|') -ceq ($expected -join '|'))
+}
+
+function Test-ControlHealthState {
+    param([object]$Value)
+    return @('idle','connecting','ready','reconnecting','stopped','ok','offline','failed','unknown') -ccontains [string]$Value
+}
+
+function Test-ControlHealthCategory {
+    param([object]$Value)
+    return @('bridge-health-write-failed','startup-failed','gateway-timeout','gateway-frame-invalid','gateway-hello-invalid','gateway-reconnect-requested','gateway-disconnected','gateway-connect-failed','interaction-handler-failed','queue-retry-failed','channel-poll-failed','index-refresh-failed','rollout-poll-failed','rollout-state-save-failed','turn-completion-connection-lost','continuation-started','continuation-queued','message-ignored','unknown') -ccontains [string]$Value
+}
+
+function Read-SanitizedBridgeHealth {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$ToolDir, [datetimeoffset]$Now = [datetimeoffset]::UtcNow)
+
+    try {
+        $root = [System.IO.Path]::GetFullPath($ToolDir)
+        $path = Join-Path $root 'discord-bridge-health.json'
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
+        $item = Get-Item -LiteralPath $path -ErrorAction Stop
+        if ($item.Length -gt 65536) { return $null }
+        $value = Get-Content -LiteralPath $path -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -DateKind String -ErrorAction Stop
+        if (-not (Test-ControlHealthPropertySet -Value $value -Names @('version','observedAt','gateway','discordRest','queueCount','startedAt','lastActivityAt','latestEventCategory'))) { return $null }
+        if ([int]$value.version -ne 1 -or -not (Test-ControlHealthPropertySet -Value $value.gateway -Names @('state')) -or -not (Test-ControlHealthPropertySet -Value $value.discordRest -Names @('state'))) { return $null }
+        if (-not (Test-ControlHealthState $value.gateway.state) -or -not (Test-ControlHealthState $value.discordRest.state) -or -not (Test-ControlHealthCategory $value.latestEventCategory)) { return $null }
+        if ($value.queueCount -isnot [int] -and $value.queueCount -isnot [long]) { return $null }
+        if ($value.queueCount -lt 0 -or $value.queueCount -gt 1000000) { return $null }
+        $observed = [datetimeoffset]::Parse([string]$value.observedAt).ToUniversalTime()
+        if (($Now.ToUniversalTime() - $observed).TotalSeconds -gt 30 -or ($observed - $Now.ToUniversalTime()).TotalSeconds -gt 5) { return $null }
+        foreach ($timestamp in @($value.startedAt, $value.lastActivityAt)) { if ($null -ne $timestamp) { [void][datetimeoffset]::Parse([string]$timestamp) } }
+        return [pscustomobject][ordered]@{ gatewayState=[string]$value.gateway.state; discordRestState=[string]$value.discordRest.state; queueCount=[int]$value.queueCount; lastActivityAt=$value.lastActivityAt; latestEventCategory=[string]$value.latestEventCategory }
+    }
+    catch { return $null }
+}
+
+function Read-BridgeQueueState {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$ToolDir)
+
+    try {
+        $root = [System.IO.Path]::GetFullPath($ToolDir)
+        $path = Join-Path $root 'discord-inbox-state.json'
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return [pscustomobject]@{ state='unknown'; count=0 } }
+        $item = Get-Item -LiteralPath $path -ErrorAction Stop
+        if ($item.Length -gt 1048576) { return [pscustomobject]@{ state='unknown'; count=0 } }
+        $value = Get-Content -LiteralPath $path -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        if ($null -eq $value -or [int]$value.version -ne 2 -or $null -eq $value.pendingContinuations) { return [pscustomobject]@{ state='unknown'; count=0 } }
+        $items = @($value.pendingContinuations.PSObject.Properties.Value)
+        if (@($items | Where-Object { $null -eq $_ -or $_.PSObject.Properties.Name -notcontains 'status' }).Count -gt 0) { return [pscustomobject]@{ state='unknown'; count=0 } }
+        return [pscustomobject]@{ state='ready'; count=@($items | Where-Object { [string]$_.status -ceq 'queued' }).Count }
+    }
+    catch { return [pscustomobject]@{ state='unknown'; count=0 } }
+}
+
 function Get-CodexControlStatus {
     [CmdletBinding()]
     param(
@@ -699,12 +760,38 @@ function Get-CodexControlStatus {
         if (-not $plan.IsValid) {
             return [pscustomobject]@{ ok=$false; errorCategory=$plan.ErrorCategory }
         }
+        $service = [pscustomobject]@{ ok=$false; running=$false; autoStartEnabled=$false; runtime=$null }
+        if ($Operations.ContainsKey('GetTask') -and $Operations.GetTask -is [scriptblock]) {
+            $service = Get-CodexBridgeServiceStatus -Operations $Operations -ToolDir $ToolDir
+        }
+        $now = [datetimeoffset]::UtcNow
+        if ($Operations.ContainsKey('Now') -and $Operations.Now -is [scriptblock]) { $now = [datetimeoffset](& $Operations.Now) }
+        $health = Read-SanitizedBridgeHealth -ToolDir $ToolDir -Now $now
+        $queue = Read-BridgeQueueState -ToolDir $ToolDir
+        $queueCount = if ($queue.state -eq 'ready') { [int]$queue.count } elseif ($null -ne $health) { [int]$health.queueCount } else { 0 }
         return [pscustomobject][ordered]@{
             ok = $true
+            service = [pscustomobject][ordered]@{
+                running = [bool]($service.ok -and $service.running)
+                autoStartEnabled = [bool]($service.ok -and $service.autoStartEnabled)
+                mode = $(if ($service.ok -and $null -ne $service.runtime -and $null -ne $service.runtime.mode) { [string]$service.runtime.mode } else { 'unknown' })
+            }
+            discord = [pscustomobject][ordered]@{
+                state = $(if ($null -ne $health) { $health.gatewayState } else { 'unknown' })
+                restState = $(if ($null -ne $health) { $health.discordRestState } else { 'unknown' })
+                lastActivityAt = $(if ($null -ne $health) { $health.lastActivityAt } else { $null })
+                healthState = $(if ($null -ne $health) { 'ready' } else { 'unknown' })
+                queueState = $queue.state
+            }
+            desktop = [pscustomobject][ordered]@{
+                running = (@($plan.Roots).Count -gt 0)
+                processCount = @($plan.ProcessIds).Count
+            }
             codexDesktop = [pscustomobject][ordered]@{
                 running = (@($plan.Roots).Count -gt 0)
                 processCount = @($plan.ProcessIds).Count
             }
+            queueCount = $queueCount
         }
     }
     catch {
