@@ -273,7 +273,7 @@ export function createBridgeApplication(dependencies = {}) {
     else if (started) publishHealthSoon();
   };
   context.setDiscordRestStatus = (state) => {
-    context.discordRestStatus = { state: String(state ?? 'unknown'), lastSuccessAt: state === 'ok' ? (context.timestamps.lastRegistrationAt ?? isoTimestamp()) : null };
+    context.discordRestStatus = { state: String(state ?? 'unknown'), lastSuccessAt: state === 'ok' ? isoTimestamp() : context.discordRestStatus.lastSuccessAt };
     if (started) publishHealthSoon();
   };
   context.setLatestErrorCategory = (category) => {

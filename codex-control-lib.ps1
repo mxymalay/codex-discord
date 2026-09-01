@@ -767,6 +767,7 @@ function Get-CodexControlStatus {
         $now = [datetimeoffset]::UtcNow
         if ($Operations.ContainsKey('Now') -and $Operations.Now -is [scriptblock]) { $now = [datetimeoffset](& $Operations.Now) }
         $health = Read-SanitizedBridgeHealth -ToolDir $ToolDir -Now $now
+        if (-not ($service.ok -and $service.running)) { $health = $null }
         $queue = Read-BridgeQueueState -ToolDir $ToolDir
         $queueCount = if ($queue.state -eq 'ready') { [int]$queue.count } elseif ($null -ne $health) { [int]$health.queueCount } else { 0 }
         return [pscustomobject][ordered]@{

@@ -15,7 +15,7 @@ const HEALTH_CATEGORIES = new Set([
   'rollout-poll-failed', 'rollout-state-save-failed', 'turn-completion-connection-lost',
   'continuation-started', 'continuation-queued', 'message-ignored', 'unknown',
 ]);
-const healthWriteQueues = new Map();
+const healthWriters = new Map();
 
 function failed(action, errorCategory) {
   return { ok: false, action, errorCategory };
@@ -151,7 +151,7 @@ export async function writeBridgeHealthAtomic(targetPath, status, { fsImpl = fs,
   const canCommit = () => !signal?.aborted && shouldCommit();
   if (!canCommit()) return;
   const queueKey = path.resolve(targetPath);
-  const previous = healthWriteQueues.get(queueKey) ?? Promise.resolve();
+  const previous = healthWriters.get(queueKey) ?? Promise.resolve();
   const writeOperation = async () => {
     if (!canCommit()) return;
     const directory = path.dirname(targetPath);
@@ -170,11 +170,16 @@ export async function writeBridgeHealthAtomic(targetPath, status, { fsImpl = fs,
       }
     }
   };
-  const write = bypassQueue ? Promise.resolve().then(writeOperation) : previous.catch(() => {}).then(writeOperation);
-  if (!bypassQueue) healthWriteQueues.set(queueKey, write);
+  const write = previous.catch(() => {}).then(writeOperation);
+  if (!bypassQueue) healthWriters.set(queueKey, write);
   try {
     await write;
   } finally {
-    if (!bypassQueue && healthWriteQueues.get(queueKey) === write) healthWriteQueues.delete(queueKey);
+    if (!bypassQueue && healthWriters.get(queueKey) === write) healthWriters.delete(queueKey);
   }
+}
+
+export function getBridgeHealthWriterStats(targetPath) {
+  const pending = healthWriters.get(path.resolve(targetPath));
+  return { activePreparations: pending ? 1 : 0, pendingOrdinary: pending ? 1 : 0 };
 }

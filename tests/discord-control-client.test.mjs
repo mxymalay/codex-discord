@@ -6,7 +6,7 @@ import path from 'node:path';
 import { PassThrough } from 'node:stream';
 import test from 'node:test';
 
-import { runCodexControlAction, writeBridgeHealthAtomic } from '../discord-control-client.mjs';
+import { getBridgeHealthWriterStats, runCodexControlAction, writeBridgeHealthAtomic } from '../discord-control-client.mjs';
 
 function fakeChild({ stdout = '', stderr = '', exitCode = 0, error = null, neverClose = false } = {}) {
   const child = new EventEmitter();
@@ -151,4 +151,49 @@ test('aborted health writes clean their temp file without committing after a new
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }
+});
+
+test('forced final commit waits for an in-flight old rename and commits last', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-bridge-health-commit-order-'));
+  const target = path.join(root, 'discord-bridge-health.json');
+  let releaseRename;
+  let firstRename = true;
+  const fsImpl = {
+    writeFile: fs.writeFile.bind(fs), rm: fs.rm.bind(fs),
+    async rename(source, destination) {
+      if (firstRename) { firstRename = false; await new Promise((resolve) => { releaseRename = resolve; }); }
+      await fs.rename(source, destination);
+    },
+  };
+  try {
+    const old = writeBridgeHealthAtomic(target, { gateway: { state: 'ready' } }, { fsImpl });
+    while (!releaseRename) await new Promise((resolve) => setImmediate(resolve));
+    const final = writeBridgeHealthAtomic(target, { gateway: { state: 'stopped' } }, { fsImpl, bypassQueue: true });
+    releaseRename();
+    await Promise.all([old, final]);
+    assert.equal(JSON.parse(await fs.readFile(target, 'utf8')).gateway.state, 'stopped');
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
+});
+
+test('hung ordinary preparation coalesces to one active and one latest pending write', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-bridge-health-coalesce-'));
+  const target = path.join(root, 'discord-bridge-health.json');
+  let release;
+  let writes = 0;
+  const fsImpl = {
+    async writeFile(file, contents) { writes++; if (writes === 1) await new Promise((resolve) => { release = resolve; }); await fs.writeFile(file, contents, 'utf8'); },
+    rename: fs.rename.bind(fs), rm: fs.rm.bind(fs),
+  };
+  try {
+    const first = writeBridgeHealthAtomic(target, { queueCount: 1 }, { fsImpl });
+    await new Promise((resolve) => setImmediate(resolve));
+    const later = Array.from({ length: 20 }, (_, queueCount) => writeBridgeHealthAtomic(target, { queueCount: queueCount + 2 }, { fsImpl }));
+    const stats = getBridgeHealthWriterStats(target);
+    assert.equal(stats.activePreparations, 1);
+    assert.equal(stats.pendingOrdinary, 1);
+    assert.equal(writes, 1);
+    release();
+    await Promise.all([first, ...later]);
+    assert.equal(JSON.parse(await fs.readFile(target, 'utf8')).queueCount, 21);
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
 });
