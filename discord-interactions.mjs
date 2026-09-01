@@ -1253,6 +1253,16 @@ async function handleComponent(dependencies, interaction) {
   return respond(dependencies, interaction, privateResponse('内容已过期或按钮无效，请重新执行命令。'));
 }
 
+function isStateMutationInteraction(interaction) {
+  const type = Number(interaction?.type);
+  const name = String(interaction?.data?.name ?? '');
+  const customId = String(interaction?.data?.custom_id ?? '');
+  if ([2, 4].includes(type)) return ['新建任务', '继续任务'].includes(name);
+  if (type === 5) return customId.startsWith('new:') || customId.startsWith('continue:');
+  if (type === 3) return customId.startsWith('cancel:') || customId.startsWith('continue-open:');
+  return false;
+}
+
 /** Create the private, single-user Interaction router. */
 export function createInteractionRouter(dependencies = {}) {
   dependencies.uiState ??= new Map();
@@ -1266,6 +1276,12 @@ export function createInteractionRouter(dependencies = {}) {
           return respond(dependencies, interaction, { type: 8, data: { choices: [] } });
         }
         return respond(dependencies, interaction, privateResponse('此交互无权使用或不可用。'));
+      }
+      if (dependencies.mutationDisabledCategory === 'continuation-state-corrupt' && isStateMutationInteraction(interaction)) {
+        if (Number(interaction?.type) === 4) {
+          return respond(dependencies, interaction, { type: 8, data: { choices: [] } });
+        }
+        return respond(dependencies, interaction, privateResponse('续接状态暂不可用；Bot 当前为只读模式，请修复本机状态后重试。'));
       }
       if (Number(interaction?.type) === 4) {
         const commandName = String(interaction?.data?.name ?? '');

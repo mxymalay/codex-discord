@@ -124,6 +124,66 @@ test('indexes sidebar user roots, uses the last sidebar title, and excludes ever
   }
 });
 
+test('retains previous root metadata after rollout cleanup until current rollout content returns', async () => {
+  const paths = await fixture();
+  const rolloutPath = paths.rollout('retained-root');
+  const previous = {
+    threadId: 'retained-root',
+    projectId: 'project-retained',
+    projectName: 'Retained Project',
+    taskName: '保留的任务名',
+    status: 'completed',
+    createdAt: '2026-08-30T01:00:00.000Z',
+    lastActivityAt: '2026-08-30T02:00:00.000Z',
+    startedAt: null,
+    completedAt: null,
+    runtimeMs: null,
+    rolloutPath,
+    offset: 321,
+    worktreePath: 'C:\\safe\\worktrees\\retained-root',
+    worktreeBranch: 'codex/discord-retained-root',
+    taskText: 'must not be copied into the index',
+  };
+  try {
+    await writeJsonl(paths.sessionIndexPath, [{ id: 'RETAINED-ROOT', thread_name: '侧边栏仍存在' }]);
+
+    const retainedIndex = await buildTaskIndex({
+      ...paths,
+      previousIndex: { version: 1, generatedAt: '2026-08-30T02:00:00.000Z', tasks: [previous] },
+      nowMs: Date.parse('2026-09-01T03:00:00.000Z'),
+    });
+
+    assert.equal(retainedIndex.tasks.length, 1);
+    assert.deepEqual(retainedIndex.tasks[0], Object.fromEntries(
+      Object.entries(previous).filter(([field]) => field !== 'taskText'),
+    ));
+    const unavailable = await readTaskDetail(retainedIndex.tasks[0]);
+    assert.equal(unavailable.contentAvailable, false);
+    assert.equal(unavailable.taskText, '');
+    assert.equal(unavailable.resultText, '');
+
+    await writeJsonl(rolloutPath, [
+      meta('retained-root', { project_id: 'project-current', project_name: 'Current Project' }),
+      event('2026-09-01T03:01:00.000Z', 'task_started', { turn_id: 'turn-current' }),
+      event('2026-09-01T03:02:00.000Z', 'task_complete', { turn_id: 'turn-current', last_agent_message: '当前结果' }),
+    ]);
+    const rebuilt = await buildTaskIndex({
+      ...paths,
+      previousIndex: retainedIndex,
+      nowMs: Date.parse('2026-09-01T03:03:00.000Z'),
+    });
+
+    assert.equal(rebuilt.tasks.length, 1);
+    assert.equal(rebuilt.tasks[0].taskName, '侧边栏仍存在');
+    assert.equal(rebuilt.tasks[0].projectId, 'project-current');
+    assert.equal(rebuilt.tasks[0].lastActivityAt, '2026-09-01T03:02:00.000Z');
+    assert.equal(rebuilt.tasks[0].runtimeMs, 60_000);
+    assert.equal((await readTaskDetail(rebuilt.tasks[0])).contentAvailable, true);
+  } finally {
+    await fs.rm(paths.root, { recursive: true, force: true });
+  }
+});
+
 test('deduplicates mixed-case rollout IDs and preserves the newest record canonical ID', async () => {
   const paths = await fixture();
   try {

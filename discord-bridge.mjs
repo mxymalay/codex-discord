@@ -1,8 +1,10 @@
-import { promises as fs } from 'node:fs';
+import { constants as fsConstants, promises as fs } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import {
+  assertValidInboxStateV2,
+  assertValidLegacyInboxState,
   cancelContinuationPersisted,
   classifyReply,
   commitInboxState,
@@ -104,6 +106,7 @@ export function createBridgeApplication(dependencies = {}) {
     executables: null,
     taskIndex: null,
     inboxState: null,
+    inboxReadOnly: false,
     projectCatalog: null,
     interactionHandler: null,
     gateway: null,
@@ -301,9 +304,111 @@ function mask(value, visible = 6) {
   return text.length > visible ? `…${text.slice(-visible)}` : text;
 }
 
-async function log(message) {
-  const line = `${new Date().toISOString()} ${message}\n`;
-  await fs.appendFile(logPath, line, 'utf8').catch(() => {});
+const persistentLogCategories = new Set([
+  'bridge-event', 'bridge-started', 'bridge-fatal', 'continuation-state-corrupt',
+  'completion-watcher-started', 'rollout-poll-failed', 'rollout-state-save-failed',
+  'queue-retry-failed', 'channel-poll-failed', 'index-refresh-failed', 'message-ignored',
+  'turn-completed', 'turn-failed', 'turn-cancelled', 'turn-finished',
+  'turn-completion-connection-lost', 'continuation-started', 'continuation-queued',
+  'continuation-uncertain', 'continuation-failed', 'continuation-result',
+]);
+
+function stableLogId(value) {
+  const candidate = String(value ?? '').trim();
+  return /^[A-Za-z0-9_-]{6,128}$/u.test(candidate) ? mask(candidate, 8) : null;
+}
+
+export function formatPersistentLogEvent(category, fields = {}, at = new Date()) {
+  const stableCategory = persistentLogCategories.has(String(category)) ? String(category) : 'bridge-event';
+  const parts = [`${isoTimestamp(at)} event=${stableCategory}`];
+  for (const [input, output] of [
+    ['taskId', 'task'], ['threadId', 'thread'], ['turnId', 'turn'],
+    ['requestId', 'request'], ['channelId', 'channel'], ['messageId', 'message'],
+  ]) {
+    const identifier = stableLogId(fields?.[input]);
+    if (identifier) parts.push(`${output}=${identifier}`);
+  }
+  const exitCode = Number(fields?.exitCode);
+  if (Number.isInteger(exitCode)) parts.push(`exitCode=${exitCode}`);
+  const durationMs = Number(fields?.durationMs);
+  if (Number.isFinite(durationMs) && durationMs >= 0) parts.push(`durationMs=${Math.floor(durationMs)}`);
+  return parts.join(' ');
+}
+
+export async function writePersistentLogEvent({ filePath, category, fields = {}, now = () => new Date() }) {
+  const timestamp = typeof now === 'function' ? now() : now;
+  const line = `${formatPersistentLogEvent(category, fields, timestamp)}\n`;
+  await fs.appendFile(filePath, line, 'utf8').catch(() => {});
+}
+
+async function log(category, fields = {}) {
+  await writePersistentLogEvent({ filePath: logPath, category, fields });
+}
+
+function corruptBackupTimestamp(now) {
+  return isoTimestamp(typeof now === 'function' ? now() : now).replaceAll(':', '-');
+}
+
+async function copyCorruptInboxBackup(inboxPath, now) {
+  const parsed = path.parse(inboxPath);
+  const timestamp = corruptBackupTimestamp(now);
+  for (let suffix = 0; suffix < 1_000; suffix += 1) {
+    const discriminator = suffix === 0 ? '' : `-${suffix}`;
+    const backupPath = path.join(parsed.dir, `${parsed.name}.corrupt-${timestamp}${discriminator}${parsed.ext || '.json'}`);
+    try {
+      await fs.copyFile(inboxPath, backupPath, fsConstants.COPYFILE_EXCL);
+      return backupPath;
+    } catch (error) {
+      if (error?.code !== 'EEXIST') throw error;
+    }
+  }
+  throw new Error('Discord continuation state backup limit exceeded');
+}
+
+/** Load and migrate durable continuation state without replaying a malformed file. */
+export async function loadInboxStateWithRecovery({
+  inboxPath,
+  encryptText,
+  persistState,
+  writeLog = log,
+  now = () => new Date(),
+}) {
+  let state;
+  try {
+    let raw;
+    try {
+      raw = await fs.readFile(inboxPath, 'utf8');
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+      state = createEmptyInboxState();
+    }
+    if (raw !== undefined) {
+      try {
+        state = JSON.parse(raw);
+      } catch {
+        const error = new Error('Discord continuation state is corrupt');
+        error.code = 'CONTINUATION_STATE_CORRUPT';
+        throw error;
+      }
+      if (state?.version === 2) assertValidInboxStateV2(state, { allowLegacyPlaintext: true });
+      else assertValidLegacyInboxState(state);
+    }
+    await migrateLegacyPendingReplies({ state, encryptText });
+    migrateInboxState(state);
+    assertValidInboxStateV2(state);
+    recoverContinuationAttempts(state);
+    await commitInboxState({ state, persistState });
+    return { state, readOnly: false, errorCategory: null };
+  } catch (error) {
+    if (error?.code !== 'CONTINUATION_STATE_CORRUPT') throw error;
+    await copyCorruptInboxBackup(inboxPath, now);
+    await writeLog('continuation-state-corrupt');
+    return {
+      state: createEmptyInboxState(),
+      readOnly: true,
+      errorCategory: 'continuation-state-corrupt',
+    };
+  }
 }
 
 function expandAbsoluteRoot(value, token, environmentValue) {
@@ -364,7 +469,13 @@ function trackContinuationCompletion(started, request, token, trackActiveResourc
   const tracked = started.completion
       .then(async (params) => {
         const status = String(params?.turn?.status ?? 'unknown');
-        await log(`turn completed thread=${mask(request.threadId, 8)} turn=${mask(started.turnId, 8)} status=${status}`);
+        const category = ({
+          completed: 'turn-completed',
+          failed: 'turn-failed',
+          cancelled: 'turn-cancelled',
+          canceled: 'turn-cancelled',
+        })[status] ?? 'turn-finished';
+        await log(category, { threadId: request.threadId, turnId: started.turnId });
         if (status === 'failed' && request.source === 'reply') {
           await sendDiscordReply({
             token,
@@ -375,7 +486,7 @@ function trackContinuationCompletion(started, request, token, trackActiveResourc
         }
       })
       .catch(async () => {
-        await log(`turn completion connection lost thread=${mask(request.threadId, 8)} turn=${mask(started.turnId, 8)}`);
+        await log('turn-completion-connection-lost', { threadId: request.threadId, turnId: started.turnId });
       })
   trackActiveResource?.({
     kind: 'continuation',
@@ -464,7 +575,17 @@ async function startContinuation({ token, config, state, request, trackActiveRes
     ),
   });
   const outcome = await finalizeContinuationOutcome({ result, state, request, token });
-  await log(`continuation ${result.status} source=${request.source} request=${mask(request.requestId)} thread=${mask(request.threadId, 8)} turn=${mask(result.turnId, 8)}`);
+  const category = ({
+    started: 'continuation-started',
+    queued: 'continuation-queued',
+    uncertain: 'continuation-uncertain',
+    failed: 'continuation-failed',
+  })[String(result?.status ?? '')] ?? 'continuation-result';
+  await log(category, {
+    requestId: request.requestId,
+    threadId: request.threadId,
+    turnId: result.turnId,
+  });
   return outcome;
 }
 
@@ -513,7 +634,7 @@ export async function pollChannel({
         }
       } else {
         await recordInboxMessageDurably(state, channelId, String(message.id), false, persistState);
-        await writeLog(`message ignored message=${mask(message.id)} channel=${mask(channelId)} reason=${accepted.reason}`);
+        await writeLog('message-ignored', { messageId: message.id, channelId });
       }
       cursor = String(state.cursors[channelId]);
     }
@@ -589,21 +710,21 @@ function createProductionBridgeDependencies({ runOnce = false } = {}) {
       return index;
     },
     async loadInboxState(context) {
-      const state = await readJsonFile(inboxStatePath, createEmptyInboxState());
-      await migrateLegacyPendingReplies({
-        state,
+      const loaded = await loadInboxStateWithRecovery({
+        inboxPath: inboxStatePath,
         encryptText: (text) => encryptPendingReplyText({
           toolDir,
           powershellPath: context.executables.powershellPath,
           text,
         }),
+        persistState: saveState,
       });
-      migrateInboxState(state);
-      recoverContinuationAttempts(state);
-      await commitInboxState({ state, persistState: saveState });
-      return state;
+      context.inboxReadOnly = loaded.readOnly;
+      if (loaded.errorCategory) context.latestErrorCategory = loaded.errorCategory;
+      return loaded.state;
     },
     async recoverTaskCreations(context) {
+      if (context.inboxReadOnly) return [];
       await recoverInterruptedTaskCreations({
         state: context.inboxState,
         worktreeRoot: context.config.discordWorktreeRoot,
@@ -648,8 +769,9 @@ function createProductionBridgeDependencies({ runOnce = false } = {}) {
         worktreeRoot: context.config.discordWorktreeRoot,
         creationState: context.inboxState,
         continuationState: context.inboxState,
-        persistCreationState: saveState,
-        persistContinuationState: saveState,
+        persistCreationState: context.inboxReadOnly ? undefined : saveState,
+        persistContinuationState: context.inboxReadOnly ? undefined : saveState,
+        mutationDisabledCategory: context.inboxReadOnly ? 'continuation-state-corrupt' : null,
         codexPath: context.executables.codexPath,
         processCwd: toolDir,
         createNewTaskOnce: async (options) => {
@@ -707,16 +829,18 @@ function createProductionBridgeDependencies({ runOnce = false } = {}) {
       const channelIds = [String(config.discordTaskChannelId), String(config.discordConfirmationChannelId)];
       const rolloutState = await readRolloutWatcherState(rolloutWatcherStatePath, { sessionsRoot });
       context.rolloutState = rolloutState;
-      await initializeInboxCursors({
-        state,
-        channelIds,
-        getLatest: (channelId) => getLatestDiscordMessageId({ token, channelId }),
-      });
-      await commitInboxState({ state, persistState: saveState });
+      if (!context.inboxReadOnly) {
+        await initializeInboxCursors({
+          state,
+          channelIds,
+          getLatest: (channelId) => getLatestDiscordMessageId({ token, channelId }),
+        });
+        await commitInboxState({ state, persistState: saveState });
+      }
       await initializeRolloutWatcherState({ sessionsRoot, state: rolloutState });
       await writeRolloutWatcherState(rolloutWatcherStatePath, rolloutState);
-      await log(`bridge started channels=${channelIds.map((id) => mask(id)).join(',')} codex=${path.basename(config.discordCodexPath)}`);
-      await log(`completion watcher started files=${Object.keys(rolloutState.files).length}`);
+      await log('bridge-started');
+      await log('completion-watcher-started');
 
       let stopping = false;
       let wake = null;
@@ -745,42 +869,44 @@ function createProductionBridgeDependencies({ runOnce = false } = {}) {
               context.recordActivity('lastRolloutProgressAt');
               rolloutState.lastProgressAt = context.timestamps.lastRolloutProgressAt;
             }
-          } catch (error) {
+          } catch {
             context.latestErrorCategory = 'rollout-poll-failed';
-            await log(`completion watcher poll failed error=${error?.message ?? 'unknown'}`);
+            await log('rollout-poll-failed');
           } finally {
-            await writeRolloutWatcherState(rolloutWatcherStatePath, rolloutState).catch(async (error) => {
-              await log(`completion watcher state save failed error=${error?.message ?? 'unknown'}`);
+            await writeRolloutWatcherState(rolloutWatcherStatePath, rolloutState).catch(async () => {
+              await log('rollout-state-save-failed');
             });
           }
-          try {
-            await retryPendingTurns({
-              token,
-              config,
-              state,
-              onRetry: () => context.recordActivity('lastQueueRetryAt'),
-              trackActiveResource: context.trackActiveResource,
-            });
-          } catch (error) {
-            context.latestErrorCategory = 'queue-retry-failed';
-            await log(`pending retry failed error=${error?.message ?? 'unknown'}`);
-          }
-          for (const channelId of channelIds) {
-            if (stopping) break;
+          if (!context.inboxReadOnly) {
             try {
-              await pollChannel({
+              await retryPendingTurns({
                 token,
                 config,
                 state,
-                channelId,
-                continueRequest: (payload) => startContinuation({
-                  ...payload,
-                  trackActiveResource: context.trackActiveResource,
-                }),
+                onRetry: () => context.recordActivity('lastQueueRetryAt'),
+                trackActiveResource: context.trackActiveResource,
               });
-            } catch (error) {
-              context.latestErrorCategory = 'channel-poll-failed';
-              await log(`poll failed channel=${mask(channelId)} error=${error?.message ?? 'unknown'}`);
+            } catch {
+              context.latestErrorCategory = 'queue-retry-failed';
+              await log('queue-retry-failed');
+            }
+            for (const channelId of channelIds) {
+              if (stopping) break;
+              try {
+                await pollChannel({
+                  token,
+                  config,
+                  state,
+                  channelId,
+                  continueRequest: (payload) => startContinuation({
+                    ...payload,
+                    trackActiveResource: context.trackActiveResource,
+                  }),
+                });
+              } catch {
+                context.latestErrorCategory = 'channel-poll-failed';
+                await log('channel-poll-failed', { channelId });
+              }
             }
           }
           const now = Date.now();
@@ -797,9 +923,9 @@ function createProductionBridgeDependencies({ runOnce = false } = {}) {
               replaceIndex(context.taskIndex, rebuilt);
               await writeTaskIndexAtomic(taskIndexPath, context.taskIndex);
               context.recordActivity('lastIndexUpdateAt', rebuilt.generatedAt);
-            } catch (error) {
+            } catch {
               context.latestErrorCategory = 'index-refresh-failed';
-              await log(`task index refresh failed error=${error?.message ?? 'unknown'}`);
+              await log('index-refresh-failed');
             }
             lastIndexRefresh = now;
           }
@@ -816,7 +942,7 @@ function createProductionBridgeDependencies({ runOnce = false } = {}) {
       };
     },
     persistTaskIndex: (context) => writeTaskIndexAtomic(taskIndexPath, context.taskIndex),
-    persistInboxState: (context) => saveState(context.inboxState),
+    persistInboxState: (context) => context.inboxReadOnly ? undefined : saveState(context.inboxState),
     persistRolloutState: (context) => writeRolloutWatcherState(rolloutWatcherStatePath, context.rolloutState),
   };
 }
@@ -853,8 +979,8 @@ async function main() {
 const isBridgeEntryPoint = process.argv[1] &&
   path.resolve(process.argv[1]).toLocaleLowerCase() === fileURLToPath(import.meta.url).toLocaleLowerCase();
 if (isBridgeEntryPoint) {
-  main().catch(async (error) => {
-    await log(`bridge fatal error=${error?.message ?? 'unknown'}`);
+  main().catch(async () => {
+    await log('bridge-fatal');
     process.exitCode = 1;
   });
 }

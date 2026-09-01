@@ -322,6 +322,17 @@ export async function buildTaskIndex({
     }
   }
 
+  for (const key of sidebarEntries.keys()) {
+    if (recordsById.has(key)) continue;
+    const previous = previousById.get(key);
+    if (!previous) continue;
+    const retained = Object.fromEntries(taskRecordFields
+      .filter((field) => Object.hasOwn(previous, field))
+      .map((field) => [field, previous[field]]));
+    if (!stringOrNull(retained.threadId)) continue;
+    recordsById.set(key, retained);
+  }
+
   const tasks = [...recordsById.values()].sort((left, right) =>
     (validTime(right.lastActivityAt) ?? 0) - (validTime(left.lastActivityAt) ?? 0) || left.threadId.localeCompare(right.threadId));
   return { version: indexVersion, generatedAt: new Date(Number(nowMs)).toISOString(), tasks };

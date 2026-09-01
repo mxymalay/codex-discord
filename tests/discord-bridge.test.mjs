@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
@@ -8,6 +9,7 @@ import test from 'node:test';
 
 import { startNewCodexTask } from '../discord-task-create-lib.mjs';
 import { createBridgeApplication, finalizeContinuationOutcome, getDiscordBotMember, pollChannel } from '../discord-bridge.mjs';
+import { createInteractionRouter } from '../discord-interactions.mjs';
 
 import {
   AppServerClient,
@@ -132,6 +134,164 @@ test('bridge composition starts registration, index and gateway without disablin
   assert.deepEqual(events.slice(-4), [
     'gateway-stopped', 'legacy-pollers-stopped', 'index-persisted', 'inbox-persisted',
   ]);
+});
+
+test('corrupt inbox is preserved while an isolated read-only bridge still starts its Gateway', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-corrupt-inbox-'));
+  const fixedNow = new Date('2026-09-01T06:07:08.009Z');
+  const privateNeedle = 'private-token https://discord.com/api/webhooks/123 C:\\Users\\private\\state.json';
+  const corruptInputs = new Map([
+    ['invalid-json', `{ "version": 2, "pendingContinuations": "${privateNeedle}"`],
+    ['invalid-schema', JSON.stringify({
+      ...createEmptyInboxState(),
+      pendingContinuations: {
+        unknown: {
+          queueId: 'unknown', source: 'slash', requestId: 'private-request', threadId: 'private-thread',
+          status: 'queued', encryptedText: privateNeedle,
+        },
+      },
+    })],
+    ['unsupported-version', JSON.stringify({
+      ...createEmptyInboxState(),
+      version: 3,
+      pendingContinuations: {
+        unknown: {
+          queueId: 'unknown', source: 'slash', requestId: 'private-request', threadId: 'private-thread',
+          status: 'queued', encryptedText: privateNeedle, summary: 'unknown replay',
+          createdAt: '2026-09-01T00:00:00.000Z', queuedAt: '2026-09-01T00:00:00.000Z', attempts: 0,
+        },
+      },
+    })],
+  ]);
+
+  try {
+    const bridgeModule = await import('../discord-bridge.mjs');
+    let recovered;
+    for (const [name, raw] of corruptInputs) {
+      const caseRoot = path.join(root, name);
+      const inboxPath = path.join(caseRoot, 'discord-inbox-state.json');
+      await fs.mkdir(caseRoot, { recursive: true });
+      await fs.writeFile(inboxPath, raw, 'utf8');
+      const logCategories = [];
+
+      recovered = await bridgeModule.loadInboxStateWithRecovery({
+        inboxPath,
+        now: () => fixedNow,
+        encryptText: async () => { throw new Error('legacy encryption must not inspect corrupt state'); },
+        persistState: async () => { throw new Error('corrupt evidence must not be overwritten'); },
+        writeLog: async (category) => { logCategories.push(category); },
+      });
+
+      assert.deepEqual(recovered.state, createEmptyInboxState());
+      assert.equal(recovered.readOnly, true);
+      assert.equal(recovered.errorCategory, 'continuation-state-corrupt');
+      assert.equal(JSON.stringify(recovered.state).includes('private-request'), false);
+      assert.equal(await fs.readFile(inboxPath, 'utf8'), raw);
+      const backups = (await fs.readdir(caseRoot)).filter((entry) =>
+        /^discord-inbox-state\.corrupt-2026-09-01T06-07-08\.009Z(?:-\d+)?\.json$/u.test(entry));
+      assert.equal(backups.length, 1);
+      assert.equal(await fs.readFile(path.join(caseRoot, backups[0]), 'utf8'), raw);
+      assert.deepEqual(logCategories, ['continuation-state-corrupt']);
+    }
+
+    const events = [];
+    const responses = [];
+    const app = createBridgeApplication(makeBridgeDependencies(events, {
+      async loadInboxState(context) {
+        context.inboxReadOnly = recovered.readOnly;
+        context.latestErrorCategory = recovered.errorCategory;
+        return recovered.state;
+      },
+      async recoverTaskCreations(context) {
+        assert.equal(context.inboxReadOnly, true);
+        events.push('task-creation-recovery-skipped');
+      },
+      createInteractionHandler(context) {
+        const router = createInteractionRouter({
+          config: { discordGuildId: '222', discordAllowedUserId: '333' },
+          taskIndex: { generatedAt: fixedNow.toISOString(), tasks: [] },
+          mutationDisabledCategory: context.latestErrorCategory,
+          respond: async (body) => { responses.push(body); },
+        });
+        return (interaction) => router.handle(interaction);
+      },
+      async startGateway(context) {
+        events.push('gateway-started');
+        const interaction = (name) => ({
+          id: `command-${name}`,
+          token: `private-${name}`,
+          application_id: '111',
+          type: 2,
+          guild_id: '222',
+          member: { user: { id: '333' } },
+          data: { name, options: [] },
+        });
+        await context.interactionHandler(interaction('帮助'));
+        await context.interactionHandler(interaction('新建任务'));
+        return { getStatus: () => ({ state: 'ready' }), async stop() { events.push('gateway-stopped'); } };
+      },
+    }));
+
+    await app.start();
+
+    assert.equal(events.includes('gateway-started'), true);
+    assert.equal(app.getSystemStatus().latestErrorCategory, 'continuation-state-corrupt');
+    assert.match(responses[0]?.data?.content ?? '', /任务列表/);
+    assert.match(responses[1]?.data?.content ?? '', /暂不可用/);
+    assert.equal(JSON.stringify(responses).includes(privateNeedle), false);
+    await app.stop();
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('persistent Node and PowerShell guard logs keep only stable operational fields', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'codex-stable-logs-'));
+  const nodeLogPath = path.join(root, 'discord-bridge.log');
+  const privateNeedle = 'private-token https://discord.com/api/webhooks/123 C:\\Users\\private\\state.json 用户原文';
+  try {
+    const bridgeModule = await import('../discord-bridge.mjs');
+    await bridgeModule.writePersistentLogEvent({
+      filePath: nodeLogPath,
+      category: 'rollout-poll-failed',
+      fields: {
+        threadId: '11111111-1111-4111-8111-123456789abc',
+        exitCode: 17,
+        durationMs: 42,
+        error: privateNeedle,
+        path: 'C:\\Users\\private\\state.json',
+        url: 'https://discord.com/api/webhooks/123',
+        token: 'private-token',
+        userText: '用户原文',
+      },
+      now: () => new Date('2026-09-01T07:08:09.010Z'),
+    });
+    await bridgeModule.writePersistentLogEvent({
+      filePath: nodeLogPath,
+      category: privateNeedle,
+      fields: {},
+      now: () => new Date('2026-09-01T07:08:10.011Z'),
+    });
+    const nodeLog = await fs.readFile(nodeLogPath, 'utf8');
+
+    const startupLibrary = path.resolve('discord-bridge-startup.ps1').replaceAll("'", "''");
+    const powershell = spawnSync('pwsh', ['-NoProfile', '-Command', [
+      `. '${startupLibrary}'`,
+      `$entry = Format-BridgeGuardLogEntry -Category '${privateNeedle}' -ExitCode 17 -DurationMs 42 -Timestamp ([DateTimeOffset]::Parse('2026-09-01T07:08:09.010Z'))`,
+      '[Console]::Out.Write($entry)',
+    ].join('; ')], { encoding: 'utf8', windowsHide: true });
+    assert.equal(powershell.status, 0, powershell.stderr);
+
+    const combined = `${nodeLog}\n${powershell.stdout}\n${powershell.stderr}`;
+    for (const forbidden of ['private-token', 'discord.com', 'webhooks', 'C:\\Users\\private', '用户原文']) {
+      assert.equal(combined.includes(forbidden), false, `persistent log leaked ${forbidden}`);
+    }
+    assert.match(nodeLog, /event=rollout-poll-failed\b.*thread=…56789abc\b.*exitCode=17\b.*durationMs=42\b/u);
+    assert.match(nodeLog, /event=bridge-event\b/u);
+    assert.match(powershell.stdout, /event=guard-event\b.*exitCode=17\b.*durationMs=42\b/u);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
 });
 
 test('shutdown isolates a poller stop failure and still attempts gateway and every persistence boundary', async () => {

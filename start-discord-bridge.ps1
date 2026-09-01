@@ -7,10 +7,16 @@ $ErrorActionPreference = 'Stop'
 $toolDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $bridgePath = Join-Path $toolDir 'discord-bridge.mjs'
 $logPath = Join-Path $toolDir 'discord-bridge-guard.log'
+. (Join-Path $toolDir 'discord-bridge-startup.ps1')
 
 function Write-BridgeGuardLog {
-    param([string]$Message)
-    Add-Content -LiteralPath $logPath -Value ('{0} {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message) -Encoding UTF8
+    param(
+        [Parameter(Mandatory)][string]$Category,
+        [Nullable[int]]$ExitCode,
+        [Nullable[long]]$DurationMs
+    )
+    $entry = Format-BridgeGuardLogEntry -Category $Category -ExitCode $ExitCode -DurationMs $DurationMs
+    Add-Content -LiteralPath $logPath -Value $entry -Encoding UTF8
 }
 
 if (-not (Test-Path -LiteralPath $bridgePath)) {
@@ -25,8 +31,9 @@ if (-not $createdNew) {
 }
 
 try {
-    Write-BridgeGuardLog 'Discord bridge guard started.'
+    Write-BridgeGuardLog -Category 'guard-started'
     while ($true) {
+        $attempt = [System.Diagnostics.Stopwatch]::StartNew()
         try {
             $nodeCommand = Get-Command node -ErrorAction Stop
             $nodePath = $nodeCommand.Source
@@ -39,10 +46,12 @@ try {
             }
             & $nodePath $bridgePath
             $exitCode = $LASTEXITCODE
-            Write-BridgeGuardLog ("Discord bridge exited with code $exitCode; restarting.")
+            $attempt.Stop()
+            Write-BridgeGuardLog -Category 'bridge-exited' -ExitCode $exitCode -DurationMs $attempt.ElapsedMilliseconds
         }
         catch {
-            Write-BridgeGuardLog ("Discord bridge failed: {0}" -f $_.Exception.Message)
+            $attempt.Stop()
+            Write-BridgeGuardLog -Category 'bridge-launch-failed' -DurationMs $attempt.ElapsedMilliseconds
         }
         Start-Sleep -Seconds 5
     }

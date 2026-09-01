@@ -29,6 +29,171 @@ const CONTINUATION_STATUSES = new Set(['queued', 'resuming', 'submitting', 'atte
 const TERMINAL_CONTINUATION_STATUSES = new Set(['delivered', 'cancelled', 'failed']);
 const TERMINAL_CREATION_STATUSES = new Set(['started', 'first-turn-failed', 'failed-before-thread', 'recovered-failed']);
 const inboxStateCommitQueues = new WeakMap();
+const PROCESSED_INTERACTION_STATUSES = new Set(['queued', 'resuming', 'attempting', 'uncertain', 'started', 'failed']);
+const TASK_CREATION_STATUSES = new Set([
+  'creating', 'workspace-ready', 'thread-starting', 'thread-created', 'started',
+  'first-turn-failed', 'failed-before-thread', 'recovering', 'cleanup-proven',
+  'worktree-removed', 'recovered-failed',
+]);
+
+function isRecord(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function hasOnlyKeys(value, allowed) {
+  return Object.keys(value).every((key) => allowed.has(key));
+}
+
+function isNonEmptyString(value) {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+function isOptionalString(value) {
+  return value === undefined || value === null || typeof value === 'string';
+}
+
+function isOptionalTimestamp(value) {
+  return value === undefined || (typeof value === 'string' && Number.isFinite(Date.parse(value)));
+}
+
+function validMapping(value) {
+  if (value === undefined) return true;
+  const allowed = new Set(['threadId', 'cwd', 'channelId', 'eventName', 'createdAt']);
+  return isRecord(value) && hasOnlyKeys(value, allowed) &&
+    isNonEmptyString(value.threadId) && isOptionalString(value.cwd) &&
+    isOptionalString(value.channelId) && isOptionalString(value.eventName) &&
+    isOptionalTimestamp(value.createdAt);
+}
+
+function validContinuationEntry(key, value, { allowLegacyPlaintext = false } = {}) {
+  if (!isRecord(value)) return false;
+  const allowed = new Set([
+    'queueId', 'source', 'requestId', 'threadId', 'cwd', 'encryptedText', 'summary',
+    'channelId', 'replyToMessageId', 'referencedMessageId', 'mapping', 'createdAt',
+    'queuedAt', 'lastAttemptAt', 'attempts', 'status', 'submittingAt', 'submittedAt',
+    'uncertainAt', 'confirmedAt', 'ackClaimedAt', 'deliveredAt', 'cancelledAt',
+    'failedAt', 'failureReason', 'turnId',
+  ]);
+  if (allowLegacyPlaintext) allowed.add('text');
+  const timestamps = [
+    value.createdAt, value.queuedAt, value.lastAttemptAt, value.submittingAt,
+    value.submittedAt, value.uncertainAt, value.confirmedAt, value.ackClaimedAt,
+    value.deliveredAt, value.cancelledAt, value.failedAt,
+  ];
+  return hasOnlyKeys(value, allowed) && value.queueId === key &&
+    ['reply', 'slash'].includes(value.source) && isNonEmptyString(value.requestId) &&
+    isNonEmptyString(value.threadId) && CONTINUATION_STATUSES.has(value.status) &&
+    Number.isInteger(value.attempts) && value.attempts >= 0 &&
+    Number.isFinite(Date.parse(value.createdAt)) && Number.isFinite(Date.parse(value.queuedAt)) &&
+    timestamps.slice(2).every(isOptionalTimestamp) &&
+    ['cwd', 'encryptedText', 'summary', 'channelId', 'replyToMessageId',
+      'referencedMessageId', 'failureReason', 'turnId'].every((field) => isOptionalString(value[field])) &&
+    (!allowLegacyPlaintext || isOptionalString(value.text)) && validMapping(value.mapping);
+}
+
+function validProcessedInteraction(value) {
+  const allowed = new Set(['requestId', 'status', 'queueId', 'turnId', 'reason', 'processedAt']);
+  return isRecord(value) && hasOnlyKeys(value, allowed) && isNonEmptyString(value.requestId) &&
+    PROCESSED_INTERACTION_STATUSES.has(value.status) &&
+    ['queueId', 'turnId', 'reason'].every((field) => isOptionalString(value[field])) &&
+    Number.isFinite(Date.parse(value.processedAt));
+}
+
+function validWorkspace(value) {
+  if (value === undefined) return true;
+  const allowed = new Set([
+    'mode', 'cwd', 'runtimeWorkspaceRoots', 'branchName', 'worktreePath', 'operationId',
+    'sourceRoot', 'repositoryRoot',
+  ]);
+  return isRecord(value) && hasOnlyKeys(value, allowed) && ['local', 'worktree'].includes(value.mode) &&
+    isNonEmptyString(value.cwd) && Array.isArray(value.runtimeWorkspaceRoots) &&
+    value.runtimeWorkspaceRoots.every(isNonEmptyString) && isOptionalString(value.branchName) &&
+    isOptionalString(value.worktreePath) && isNonEmptyString(value.operationId) &&
+    isOptionalString(value.sourceRoot) && isOptionalString(value.repositoryRoot);
+}
+
+function validCleanupProof(value) {
+  if (value === undefined) return true;
+  const fields = ['repositoryRoot', 'sourceRoot', 'worktreePath', 'branchName', 'branchRef', 'branchOid'];
+  return isRecord(value) && hasOnlyKeys(value, new Set(fields)) && fields.every((field) => isNonEmptyString(value[field]));
+}
+
+function validTaskCreationRecord(value) {
+  if (!isRecord(value)) return false;
+  const allowed = new Set([
+    'status', 'threadId', 'turnId', 'taskName', 'workspace', 'errorCategory',
+    'recoveryStartedAt', 'recoveredAt', 'cleanupProof',
+  ]);
+  return hasOnlyKeys(value, allowed) && TASK_CREATION_STATUSES.has(value.status) &&
+    ['threadId', 'turnId', 'taskName', 'errorCategory'].every((field) => isOptionalString(value[field])) &&
+    isOptionalTimestamp(value.recoveryStartedAt) && isOptionalTimestamp(value.recoveredAt) &&
+    validWorkspace(value.workspace) && validCleanupProof(value.cleanupProof);
+}
+
+function validLegacyPendingReply(key, value) {
+  if (!isRecord(value)) return false;
+  const allowed = new Set([
+    'messageId', 'referencedMessageId', 'channelId', 'threadId', 'cwd', 'text',
+    'encryptedText', 'summary', 'mapping', 'queuedAt', 'createdAt', 'lastAttemptAt',
+    'attempts', 'status',
+  ]);
+  const messageId = value.messageId ?? key;
+  return hasOnlyKeys(value, allowed) && isNonEmptyString(messageId) &&
+    ['referencedMessageId', 'channelId', 'threadId', 'cwd', 'text', 'encryptedText',
+      'summary', 'status'].every((field) => isOptionalString(value[field])) &&
+    isOptionalTimestamp(value.queuedAt) && isOptionalTimestamp(value.createdAt) &&
+    isOptionalTimestamp(value.lastAttemptAt) &&
+    (value.attempts === undefined || (Number.isInteger(value.attempts) && value.attempts >= 0)) &&
+    validMapping(value.mapping);
+}
+
+function corruptInboxStateError() {
+  const error = new Error('Discord continuation state is corrupt');
+  error.code = 'CONTINUATION_STATE_CORRUPT';
+  return error;
+}
+
+/** Reject malformed v2 state before any migration or recovery can inspect queue entries. */
+export function assertValidInboxStateV2(candidate, { allowLegacyPlaintext = false } = {}) {
+  const allowed = new Set([
+    'version', 'initialized', 'cursors', 'processedMessageIds', 'pendingContinuations',
+    'processedInteractions', 'createdTasksByInteraction',
+  ]);
+  if (allowLegacyPlaintext) allowed.add('pendingReplies');
+  const valid = isRecord(candidate) && hasOnlyKeys(candidate, allowed) && candidate.version === 2 &&
+    typeof candidate.initialized === 'boolean' && isRecord(candidate.cursors) &&
+    Object.entries(candidate.cursors).every(([key, value]) => isNonEmptyString(key) && isNonEmptyString(value)) &&
+    Array.isArray(candidate.processedMessageIds) && candidate.processedMessageIds.every(isNonEmptyString) &&
+    isRecord(candidate.pendingContinuations) && Object.entries(candidate.pendingContinuations)
+      .every(([key, value]) => validContinuationEntry(key, value, { allowLegacyPlaintext })) &&
+    Array.isArray(candidate.processedInteractions) && candidate.processedInteractions.every(validProcessedInteraction) &&
+    isRecord(candidate.createdTasksByInteraction) && Object.values(candidate.createdTasksByInteraction).every(validTaskCreationRecord) &&
+    (!Object.hasOwn(candidate, 'pendingReplies') || (isRecord(candidate.pendingReplies) &&
+      Object.entries(candidate.pendingReplies).every(([key, value]) => validLegacyPendingReply(key, value))));
+  if (!valid) throw corruptInboxStateError();
+  return candidate;
+}
+
+/** Accept only the known v1 fields; legacy state never carries a replayable v2 queue. */
+export function assertValidLegacyInboxState(candidate) {
+  const allowed = new Set([
+    'version', 'initialized', 'cursors', 'processedMessageIds', 'pendingReplies',
+    'createdTasksByInteraction',
+  ]);
+  const valid = isRecord(candidate) && hasOnlyKeys(candidate, allowed) &&
+    (candidate.version === undefined || candidate.version === 1) &&
+    (candidate.initialized === undefined || typeof candidate.initialized === 'boolean') &&
+    (candidate.cursors === undefined || (isRecord(candidate.cursors) &&
+      Object.entries(candidate.cursors).every(([key, value]) => isNonEmptyString(key) && isNonEmptyString(value)))) &&
+    (candidate.processedMessageIds === undefined || (Array.isArray(candidate.processedMessageIds) &&
+      candidate.processedMessageIds.every(isNonEmptyString))) &&
+    (candidate.pendingReplies === undefined || (isRecord(candidate.pendingReplies) &&
+      Object.entries(candidate.pendingReplies).every(([key, value]) => validLegacyPendingReply(key, value)))) &&
+    (candidate.createdTasksByInteraction === undefined || (isRecord(candidate.createdTasksByInteraction) &&
+      Object.values(candidate.createdTasksByInteraction).every(validTaskCreationRecord)));
+  if (!valid) throw corruptInboxStateError();
+  return candidate;
+}
 
 function continuationQueueId(source, requestId) {
   return createHash('sha256').update(`${source}\0${requestId}`, 'utf8').digest().subarray(0, 12).toString('base64url');
