@@ -37,10 +37,11 @@ public static class CodexBridgeJobNative {
 '@
 }
 function Get-BridgeJobName { param([Parameter(Mandatory)][string]$ToolDir) return ('Local\CodexDiscordBridgeJob-' + (Get-ControlPathHash $ToolDir)) }
+function New-BridgeExtendedLimitInformation { Initialize-BridgeJobNative; $info=New-Object CodexBridgeJobNative+Extended; $info.basic.LimitFlags=0x2000; return $info }
 function New-BridgeSupervisorJob {
  param([Parameter(Mandatory)][string]$ToolDir,[Parameter(Mandatory)][System.Diagnostics.Process]$Process)
  Initialize-BridgeJobNative; $job=[CodexBridgeJobNative]::CreateJobObject([IntPtr]::Zero,(Get-BridgeJobName $ToolDir)); if($job -eq [IntPtr]::Zero){throw 'bridge-job-create-failed'}
- try { $info=New-Object CodexBridgeJobNative+Extended; $info.basic.flags=0x2000; if(-not [CodexBridgeJobNative]::SetInformationJobObject($job,9,[ref]$info,[Runtime.InteropServices.Marshal]::SizeOf($info))){throw 'bridge-job-configure-failed'}; [void]$Process.Handle; if(-not [CodexBridgeJobNative]::AssignProcessToJobObject($job,$Process.Handle)){throw 'bridge-job-assign-failed'}; return $job } catch { [CodexBridgeJobNative]::CloseHandle($job)|Out-Null; throw }
+ try { $info=New-BridgeExtendedLimitInformation; if(-not [CodexBridgeJobNative]::SetInformationJobObject($job,9,[ref]$info,[Runtime.InteropServices.Marshal]::SizeOf($info))){throw 'bridge-job-configure-failed'}; [void]$Process.Handle; if(-not [CodexBridgeJobNative]::AssignProcessToJobObject($job,$Process.Handle)){throw 'bridge-job-assign-failed'}; return $job } catch { [CodexBridgeJobNative]::CloseHandle($job)|Out-Null; throw }
 }
 function Close-BridgeJob { param([IntPtr]$Handle) if($Handle -ne [IntPtr]::Zero){[CodexBridgeJobNative]::CloseHandle($Handle)|Out-Null} }
 

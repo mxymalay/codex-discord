@@ -417,6 +417,8 @@ function Stop-CodexBridgeRuntime {
     foreach ($name in $required) {
         if (-not $Operations.ContainsKey($name) -or $Operations[$name] -isnot [scriptblock]) { return [pscustomobject]@{ ok=$false; errorCategory='invalid-service-operations' } }
     }
+    $bound = $null
+    $job = $null
     try {
         $bound = & $Operations.OpenBridgeProcess ([int]$Runtime.processId)
         if (-not (Test-CodexBridgeBoundRuntimeIdentity -BoundProcess $bound -Runtime $Runtime)) { return [pscustomobject]@{ ok=$false; errorCategory='runtime-identity-revalidation-failed' } }
@@ -446,7 +448,7 @@ function Stop-CodexBridgeRuntime {
         return [pscustomobject]@{ ok=$true }
     }
     catch { return [pscustomobject]@{ ok=$false; errorCategory='runtime-stop-failed' } }
-    finally { if ($null -ne $bound -and $Operations.ContainsKey('CloseBridgeProcess')) { & $Operations.CloseBridgeProcess $bound } }
+    finally { if ($null -ne $bound -and $Operations.ContainsKey('CloseBridgeProcess')) { try { & $Operations.CloseBridgeProcess $bound } catch {} } }
 }
 
 function Get-CodexBridgeServiceStatus {
@@ -567,6 +569,7 @@ function Invoke-CodexBridgeServiceAction {
             if ($complete) { return [pscustomobject][ordered]@{ ok=$true; action=$Action; service=$finalStatus } }
             if ($attempt -lt ($PollAttempts - 1) -and $Operations.ContainsKey('Sleep') -and $Operations.Sleep -is [scriptblock]) { & $Operations.Sleep $PollMilliseconds }
         }
+        if ($null -eq $finalStatus -or -not $finalStatus.ok) { $finalStatus = [pscustomobject]@{ ok=$false; state='unknown'; errorCategory='service-status-unavailable' } }
         return [pscustomobject][ordered]@{ ok=$false; action=$Action; errorCategory='service-action-incomplete'; service=$finalStatus }
     }
     catch { return New-ServiceActionFailure 'service-action-failed' }
