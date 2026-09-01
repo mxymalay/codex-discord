@@ -834,6 +834,95 @@ git commit -m "feat: offer safe takeover for queued continuations"
 
 ---
 
+### Task 10: Reliable Discord-Origin Tasks, Project Attribution, Markdown, and Source-Channel Routing
+
+**Files:**
+- Modify: `discord-task-index-lib.mjs`
+- Modify: `discord-task-create-lib.mjs`
+- Modify: `discord-bridge-lib.mjs`
+- Modify: `discord-interactions.mjs`
+- Modify: `discord-bridge.mjs`
+- Modify: `rollout-completion-watcher-lib.mjs`
+- Modify: `dispatcher.ps1`
+- Modify: `tests/discord-task-index.test.mjs`
+- Modify: `tests/discord-task-create.test.mjs`
+- Modify: `tests/discord-bridge.test.mjs`
+- Modify: `tests/discord-interactions.test.mjs`
+- Modify: `tests/rollout-completion-watcher.test.mjs`
+- Modify: `tests/discord-bot-dispatcher.tests.ps1`
+
+**Incident evidence and required behavior:**
+- Discord interaction `1544329941024374935` created root thread `01a05d0a-5a8f-71f2-b5e1-96fe962224b5` at 20:55:55 and completed normally at 21:08:15, but dispatcher logged `Non-sidebar/subagent turn skipped` because the root was absent from the desktop sidebar index.
+- A Discord-created root is a user-owned main task even when the desktop sidebar database does not list it. Its subagents remain internal and must never be promoted.
+- Every Discord-originated new task or continuation sends its completed/confirmation result to the guild channel in which that Discord interaction or reply originated. Desktop-originated completion/confirmation and quota events continue to use the three configured fixed channels.
+- Every Discord-originated root turn also streams its own commentary and concise tool progress to the originating channel. It never streams child-agent events, raw tool output, source code dumps, full command lines, tokens, or private absolute paths. Desktop-originated turns remain notification-only.
+- `/任务列表`, detail, and search must include Discord-created roots and must infer saved projects for desktop tasks whose rollout/sidebar metadata omit project fields.
+- All slash-command renderers use consistent Discord Markdown headings and bold field labels while escaping user-controlled metadata and suppressing mentions.
+
+**Interfaces:**
+- `inferSavedProject({ cwd, worktreePath, projectId, projectName }, projects)` canonicalizes Windows paths and selects the saved project with the longest containing root. Explicit valid project identity wins; a Discord worktree uses its persisted creation selection rather than matching the generated worktree path.
+- Inbox state persists a bounded `discordTurnOrigins` map keyed by exact turn id with `threadId`, `guildId`, `channelId`, `source`, `createdAt`, optional project identity, and delivery state. It never stores an Interaction token.
+- Each origin record persists a rollout byte cursor plus bounded event/message dedupe ids. Restart resumes after the last durably sent root event.
+- `resolveDiscordOrigin(notification, state)` returns an origin only when turn id, thread id, guild id, and channel snowflake all validate and match exactly.
+- Completion dispatch may add a trusted internal `discord-origin-channel-id` to the notification. `dispatcher.ps1` accepts that override only for task completion/confirmation events and a valid 17–20 digit channel id; quota and desktop-originated events ignore it.
+- If the origin channel send fails, one attempt goes to the configured task/confirmation fallback channel with a short routing warning. Delivery is marked only after a successful send.
+
+- [ ] **Step 1: Write failing project-attribution tests**
+
+Cover explicit project metadata, case-insensitive canonical Windows roots, longest-root selection, sibling-prefix rejection, saved worktree provenance, and tasks outside every project. Prove the current production pattern (`cwd` under `C:\Users\86166\Desktop\ygf` with null metadata) resolves to `ygf` rather than `无项目`.
+
+- [ ] **Step 2: Write failing provenance and source-channel tests**
+
+Cover new-task modal and slash/reply continuation origins, exact guild/channel/turn/thread binding, state migration and bounded retention, root-vs-subagent discrimination, desktop fallback routing, invalid/cross-guild channel rejection, send failure fallback, progress cursor restart recovery, and duplicate suppression.
+
+- [ ] **Step 3: Reproduce the 20:56 incident as a regression test**
+
+Use a synthetic Discord-created root absent from the sidebar index, followed by `task_complete`. Assert it remains a main task, is merged into list/detail/search, routes to its origin channel, records delivery, and does not replay after restart. A child agent rollout with the same root thread id must still be skipped.
+
+Before completion, feed root commentary, tool start/completion, long/raw tool output, and child-agent events. Assert commentary and sanitized one-line tool state reach the origin channel in order; raw output/code/secrets/absolute private paths and child-agent events never appear. Coalesce bursts to respect Discord rate limits without dropping the latest state.
+
+- [ ] **Step 4: Write failing Markdown contract tests**
+
+Assert visible Markdown structure for task list/detail/search, new-task receipt, continuation queue/receipt, quota, system status, health report, help, and errors. Field labels such as `项目`, `任务`, `状态`, `额度`, `距上次变化`, and `距下次更新还有` are bold; user-controlled values remain escaped and mentions remain disabled.
+
+- [ ] **Step 5: Implement project inference and merge Discord-created roots**
+
+Warm the saved-project catalog before the first index build and pass a stable project snapshot plus creation state into startup and periodic rebuilds. Merge only persisted root `threadId` values from `createdTasksByInteraction`; update their status and result from the exact root rollout. Never merge child-agent rollout ids.
+
+- [ ] **Step 6: Persist turn origins at the successful start boundary**
+
+For new tasks and every Discord-originated continuation, persist origin metadata immediately after an exact `turnId` is known and before reporting success. Preserve the record after continuation queue pruning until a bounded terminal retention period expires. Send a durable `任务已开始` channel acknowledgement once the origin record commits.
+
+- [ ] **Step 7: Route, recover, and acknowledge reliably**
+
+Enrich terminal notifications from exact origin records. Tail only the exact root rollout for that turn and send root commentary plus sanitized tool lifecycle summaries to its source channel; persist the cursor only after each successful send. Keep failed/skipped origin deliveries pending, retry without duplicates, and recover completed Discord-created roots after restart. Persist the creation receipt outcome; if `editOriginal` fails while the Interaction token is still in memory, attempt one ephemeral follow-up and record only a redacted failure category if both fail.
+
+- [ ] **Step 8: Implement consistent Markdown rendering**
+
+Use renderer-owned Markdown around escaped values. Do not escape renderer syntax and do not allow user values to create headings, mentions, links, or code fences accidentally.
+
+- [ ] **Step 9: Run focused and complete regression suites**
+
+Run:
+
+```powershell
+node --test .\tests\discord-task-index.test.mjs .\tests\discord-task-create.test.mjs .\tests\discord-bridge.test.mjs .\tests\discord-interactions.test.mjs .\tests\rollout-completion-watcher.test.mjs
+pwsh -NoProfile -File .\tests\discord-bot-dispatcher.tests.ps1
+node --test .\tests\*.test.mjs
+$failed=@(); Get-ChildItem .\tests\*.tests.ps1 | ForEach-Object { & pwsh -NoProfile -File $_.FullName; if ($LASTEXITCODE -ne 0) { $failed += $_.Name } }; if ($failed.Count) { throw ($failed -join ', ') }
+```
+
+Expected: the incident regression sends start, root progress, and final output exactly once to the source channel; child/raw events are absent; desktop fixtures remain on fixed channels; every full suite passes.
+
+- [ ] **Step 10: Commit the reliability fix**
+
+```powershell
+git add discord-task-index-lib.mjs discord-task-create-lib.mjs discord-bridge-lib.mjs discord-interactions.mjs discord-bridge.mjs rollout-completion-watcher-lib.mjs dispatcher.ps1 tests/discord-task-index.test.mjs tests/discord-task-create.test.mjs tests/discord-bridge.test.mjs tests/discord-interactions.test.mjs tests/rollout-completion-watcher.test.mjs tests/discord-bot-dispatcher.tests.ps1
+git commit -m "fix: deliver Discord-origin task results reliably"
+```
+
+---
+
 ### Task 7: Native WinForms Control Program
 
 **Files:**
@@ -847,6 +936,7 @@ git commit -m "feat: offer safe takeover for queued continuations"
 - GUI supports `--status-json` for non-visual smoke testing; it prints backend JSON and exits without showing a window.
 - Build output: `CodexDiscordControl.exe` in an explicitly supplied output directory.
 - Installer creates/updates `Codex Discord 控制台.lnk` whose target is the live EXE and working directory is the live tool directory.
+- The Git repository is the recovery source of truth: C# source, build script, and installer are committed. If the installed EXE or Desktop shortcut was deleted, running `install-control-app.ps1` rebuilds the EXE from repository source, copies the fixed backend beside it, and restores the shortcut in one command.
 
 - [ ] **Step 1: Write a failing compiler and headless-status test**
 
@@ -855,7 +945,7 @@ git commit -m "feat: offer safe takeover for queued continuations"
 if ($LASTEXITCODE -ne 0) { throw 'control app build failed' }
 $exe = Join-Path $buildRoot 'CodexDiscordControl.exe'
 if (-not (Test-Path -LiteralPath $exe)) { throw 'control app executable missing' }
-$status = & $exe --status-json --tool-dir $sourceRoot | ConvertFrom-Json
+$status = & $exe --status-json | ConvertFrom-Json
 if ($null -eq $status.ok -or $null -eq $status.service) { throw 'headless status schema invalid' }
 ```
 
@@ -870,6 +960,8 @@ if ([System.IO.Path]::GetFullPath($shortcut.TargetPath) -ne [System.IO.Path]::Ge
     throw 'shortcut target is stale'
 }
 ```
+
+Delete the temporary installed EXE and shortcut, run the same installer again, and assert both are rebuilt/restored from committed project sources without relying on a pre-existing binary.
 
 - [ ] **Step 3: Run the GUI tests and verify they fail**
 
@@ -915,7 +1007,7 @@ private static readonly IReadOnlyDictionary<ControlAction,string> ActionNames =
 
 - [ ] **Step 6: Implement installation and shortcut update**
 
-Build into the requested `ToolDir`, then use `WScript.Shell.CreateShortcut` to set `TargetPath`, `WorkingDirectory`, and description. The installer accepts testable `SourceRoot`, `ToolDir`, and `DesktopPath` parameters but never deletes files outside those exact locations.
+Build from committed `control-app/CodexDiscordControl.cs` into the requested `ToolDir`, copy the fixed control backend beside the EXE, then use `WScript.Shell.CreateShortcut` to set `TargetPath`, `WorkingDirectory`, and description. The installer accepts testable `SourceRoot`, `ToolDir`, and `DesktopPath` parameters but never deletes files outside those exact locations. The EXE always resolves the backend beside itself; there is no `--tool-dir` override.
 
 - [ ] **Step 7: Run GUI build, headless status, and shortcut tests**
 
