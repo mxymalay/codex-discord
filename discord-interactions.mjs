@@ -570,6 +570,7 @@ function stateName(value) {
 export function renderSystemStatus(status = {}) {
   const index = status.index ?? {};
   const quota = status.quota ?? {};
+  const timestamps = status.timestamps ?? {};
   const category = safeCategory(status.latestErrorCategory ?? status.gateway?.lastError ?? status.rollout?.lastError);
   return [
     '## 系统状态',
@@ -580,6 +581,9 @@ export function renderSystemStatus(status = {}) {
     `任务索引：${finiteNumber(index.count) ?? 0} 项｜生成时间：${formatTimestamp(index.generatedAt)}`,
     `继续队列：${finiteNumber(status.queueCount) ?? 0} 项`,
     `额度快照：${formatTimestamp(quota.observedAt)}`,
+    `命令注册：${formatTimestamp(timestamps.lastRegistrationAt)}｜索引更新：${formatTimestamp(timestamps.lastIndexUpdateAt)}`,
+    `Gateway 事件：${formatTimestamp(timestamps.lastGatewayEventAt)}｜rollout 推进：${formatTimestamp(timestamps.lastRolloutProgressAt)}`,
+    `通知发送：${formatTimestamp(timestamps.lastNotificationSentAt)}｜任务创建：${formatTimestamp(timestamps.lastTaskCreationAt)}｜队列重试：${formatTimestamp(timestamps.lastQueueRetryAt)}`,
     `最近错误类别：${category}`,
   ].join('\n');
 }

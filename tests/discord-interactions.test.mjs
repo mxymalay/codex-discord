@@ -1352,12 +1352,24 @@ test('system status exposes sanitized categories without paths, tokens, or user 
     index: { generatedAt: '2026-09-01T03:45:00Z', count: 2 },
     queueCount: 1,
     quota: { observedAt: '2026-09-01T03:50:00Z' },
+    timestamps: {
+      lastRegistrationAt: '2026-09-01T03:01:00Z',
+      lastIndexUpdateAt: '2026-09-01T03:02:00Z',
+      lastGatewayEventAt: '2026-09-01T03:03:00Z',
+      lastRolloutProgressAt: '2026-09-01T03:04:00Z',
+      lastNotificationSentAt: '2026-09-01T03:05:00Z',
+      lastTaskCreationAt: '2026-09-01T03:06:00Z',
+      lastQueueRetryAt: '2026-09-01T03:07:00Z',
+    },
     latestErrorCategory: 'gateway-timeout',
   });
   assert.match(text, /Gateway/);
   assert.match(text, /任务索引/);
   assert.match(text, /继续队列/);
   assert.match(text, /gateway-timeout/);
+  assert.match(text, /命令注册.*03:01/s);
+  assert.match(text, /任务创建.*03:06/s);
+  assert.match(text, /队列重试.*03:07/s);
   assert.equal(text.includes('abc'), false);
   assert.equal(text.includes('private'), false);
   assert.equal(text.includes('secret.txt'), false);

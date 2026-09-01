@@ -11,15 +11,15 @@ function Get-DiscordBridgeTaskDefinition {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$ToolDir,
-        [Parameter(Mandatory)][string]$NodePath
+        [Parameter(Mandatory)][string]$PowerShellPath
     )
 
     $fullToolDir = [System.IO.Path]::GetFullPath($ToolDir)
-    $bridgePath = Join-Path $fullToolDir 'discord-bridge.mjs'
+    $startupPath = Join-Path $fullToolDir 'start-discord-bridge.ps1'
     return [pscustomobject][ordered]@{
         TaskName = 'Codex Discord Bridge'
-        Execute = [System.IO.Path]::GetFullPath($NodePath)
-        Arguments = ConvertTo-ScheduledTaskArgument -Value $bridgePath
+        Execute = [System.IO.Path]::GetFullPath($PowerShellPath)
+        Arguments = '-NoProfile -File ' + (ConvertTo-ScheduledTaskArgument -Value $startupPath)
         WorkingDirectory = $fullToolDir
     }
 }

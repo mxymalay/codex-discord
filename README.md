@@ -1,92 +1,112 @@
-# Codex 任务、确认与额度通知
+# Codex Discord 私有命令控制台
 
-这个工具接收 Codex 的 `agent-turn-complete` 事件，只为侧边栏主任务发送通知。子智能体、内部后台回合、自动标题、环境检查和中间过程不会发送。通知分成三个并列的 Discord 频道：
+这个工具把 Codex 的任务完成、待确认和周额度通知发送到三个独立的 Discord 频道，并在同一个私有 Bot 中提供 10 个中文 Slash Commands。桥接器只服务配置中的一个 Discord 服务器和一个授权用户；查询结果、按钮回执、Modal 回执和错误信息均为 Ephemeral，且禁用 mentions。
 
-- **任务完成**：主任务真正结束，绿色 Embed。
-- **任务待确认**：Codex 在等待方案选择、授权或下一步决定，橙色 Embed。
-- **额度变化**：周额度增加、减少与使用速度，蓝色 Embed。
+所有能力运行在一个 `Codex Discord Bridge` 进程中：Discord Gateway、Slash Commands、任务索引、新建/继续任务、通知回复补收、继续队列重试和 rollout 完成补发共享同一份状态。无需公网地址或第二个命令服务。
 
-每条任务通知分别显示项目名、任务名、任务和结果，并禁用 `@everyone` 等自动提及。
+## 安装
 
-## Discord 双向回复
-
-任务完成和任务待确认频道使用 Discord Bot 发送。直接“回复”某一条 Bot 通知即可自由输入，例如：
-
-```text
-再检查一次，重点验证 Windows 7。
-可以，但先备份，只执行前两项。
-结果可以，继续补一组回归测试。
-```
-
-桥接器只接受配置中指定的服务器、两个任务频道和唯一授权用户，并要求回复一条已映射的 Bot 通知。它会把文本续接到原 Codex 任务，不会另建任务。额度频道的回复一律忽略。
-
-如果原任务正在 Codex 桌面端打开，回复会进入本机队列；任务释放后每 30 秒自动重试，无需再发第二条。电脑关机时 Discord 会保存消息，下一次登录后补读。
-
-## Bot 配置与启动
-
-Bot Token 只从剪贴板读取，并使用当前 Windows 用户的 DPAPI 加密保存；不要把 Token 写进聊天、Discord 消息或普通配置文件。
+要求 Windows、PowerShell 7、Node.js，以及可从当前环境启动的 Codex。克隆仓库后，在仓库目录执行：
 
 ```powershell
-# 首次配置或重置 Token 后重新保存；把 <你的Discord用户ID> 换成数字 ID
-.\save-discord-token.ps1 -FromClipboard -AllowedUserId <你的Discord用户ID>
+Copy-Item .\config.example.json .\config.json
+```
 
-# 激活 Bot 三路通知
+编辑被 Git 忽略的 `config.json`，填入 Discord Application ID、Guild ID、唯一授权用户 ID，以及任务完成、待确认和额度三个频道 ID。不要把 Bot Token、Webhook 地址或个人目录写入受版本控制的文件。
+
+在 Discord Developer Portal 中创建私有应用，并只安装到目标服务器。Bot 至少需要查看三个目标频道、发送消息、嵌入链接和读取消息历史的权限；安装时启用 `bot` 与 `applications.commands` scopes。不要把 Bot 加入无关服务器。
+
+从剪贴板读取 Token，并用当前 Windows 用户的 DPAPI 保存：
+
+```powershell
+.\save-discord-token.ps1 -FromClipboard -AllowedUserId <Discord用户ID>
 .\activate-discord-bot.ps1
-
-# 安装并立即启动登录计划任务
 .\install-discord-bridge-task.ps1
 ```
 
-查看后台状态：
+`config.json` 和 `discord-token.dpapi` 都已被 `.gitignore` 排除。计划任务只启动 `start-discord-bridge.ps1`；guard 每次启动子进程时动态查找 Node 和 Codex，因此 Codex 更新或 CC Switch 切换后不会继续固定旧的可执行文件路径。
+
+首次安装或命令定义变化后，可单独注册并 GET 核验命令。该模式不会启动 Codex、Gateway、频道轮询或任务创建：
+
+```powershell
+node .\discord-bridge.mjs --register-commands --once
+```
+
+成功输出应确认 10 个 Guild Commands。正常服务由计划任务启动：
 
 ```powershell
 Get-ScheduledTask -TaskName 'Codex Discord Bridge'
 ```
 
-计划任务直接运行桥接进程；Task Scheduler 和现有通知守护器都会在异常退出后重新拉起。桥接器每次启动还会重新查找当前安装的 `codex.exe`，因此 Codex 更新或 CC Switch 切换后不依赖旧的版本目录。
+## Slash Commands
 
-## 漏发保护与去重
+- `/任务列表 [状态]`：显示最近 10 个侧边栏主任务。
+- `/任务详情 任务`：按需读取原始任务和最新结果，并支持私密分页。
+- `/任务搜索 关键词`：搜索项目、标题、任务正文和结果。
+- `/新建任务 项目`：从 Codex 已保存项目或“无项目”打开多行任务 Modal。
+- `/继续任务 任务`：向一个已有侧边栏主任务发送新的多行内容。
+- `/继续队列`：查看统一的通知回复/Slash 继续队列，并取消尚未开始的项。
+- `/额度`：只读最后一份本机周额度快照，不伪造刷新。
+- `/系统状态`：显示 Gateway、REST、通知、rollout、索引、队列、额度和最近活动时间。
+- `/系统测试 [类型]`：`快速`只做本机和 REST 检查；`完整`额外向三个频道各发送一条明确标注的测试通知。
+- `/帮助`：显示命令、隐私和离线限制。
 
-Codex 原生 `notify` 仍作为快速通道使用。桥接器同时增量监听本机 rollout 中的 `task_complete` 事件：原生通知没有在 6 秒内送达时自动补发；已经送达的回合按任务回合 ID 去重，不会重复通知。长结果通过 UTF-8 临时文件交给发送器，不受 Windows 命令行长度限制。
+自动补全、命令、按钮和 Modal 每次都会重新校验 Guild 和授权用户。任务详情与继续操作只接受已索引的侧边栏主任务；子智能体、后台回合、心跳和内部任务不会进入索引。
 
-监听游标、当前未完成回合和待重试通知都会持久化。Codex、CC Switch 或守护进程重启后会从上次位置继续；首次启用只基线既有完成记录，不会把历史任务重新发送。
+## 新建任务与工作目录
 
-## 判定规则
+`/新建任务` 只接受 App Server `project/list` 返回的已保存项目 ID 或固定的“无项目”选项，不接受 Discord 中输入的本机路径、Git ref 或 Shell 参数。
 
-任务确认优先于“已完成部分工作”：明确要求确认、选择或回复；只完成诊断并提供尚未执行的方案；实现完成但仍要求选择合并、推送或保留分支；缺少依赖并等待安装授权，都会进入任务待确认。除首句明确以“已完成、已修复、已实现”等完成语开头外，最终一句以问号结尾也会进入任务待确认。
+- Git 项目：在 `discordWorktreeRoot` 下创建 `codex/discord-...` 分支和隔离工作树。任务创建后保留工作树，以便继续执行。
+- 确认不是 Git 工作树的已保存项目：直接使用该项目的保存目录。
+- 无项目：使用 `discordProjectlessRoot`，默认可配置为 `%USERPROFILE%\Documents\Codex\Discord Tasks`。
 
-修改、构建、测试或交付已经完成，且不再等待用户动作时，才进入任务完成。
+工作树计划会在外部文件操作前持久化。若失败发生在 `thread/start` 前，启动恢复只清理能证明属于该操作的工作树和分支；线程一旦可能已经创建，就保留现场而不猜测删除。重复 Interaction ID 返回已持久化结果，不重复创建线程或工作树。
 
-## 额度提醒
+## 通知回复、队列与离线行为
 
-额度变化独立发送。工具比较 Codex 本机保存的官方用量快照，只要剩余百分比增加或降低就通知，并显示：
+任务完成和待确认通知仍支持直接回复任意文本。桥接器只接受授权用户对已映射 Bot 通知的回复，并续接原任务，不新建任务。额度频道回复一律忽略。
 
-```text
-额度：92% → 91%
-距上次变化：1小时12分钟
-本次使用速度：比上次更快
-距下次更新还有：4天18小时
-按当前速度连续使用：约2天6小时后用完
-按重置至今平均速度：约4天1小时后用完
+任务被桌面端占用时，通知回复和 `/继续任务` 共用持久化队列，每 30 秒重试。电脑关机或 Bot 离线期间不能执行 Slash Commands；Discord 仍保留普通频道回复，下一次登录后桥接器会从持久游标补读。已进入本地队列的内容在重启后继续恢复。
+
+Codex 原生 `notify` 仍是快速通知通道。桥接器同时监听 rollout 的 `task_complete`，在原生通知未送达时补发，并通过 turn ID 去重。两条旧路径都由单进程集成保留。
+
+## 系统测试
+
+快速检查不向频道发送消息，检查 Token 解密、Gateway、Discord REST、三个频道权限、任务索引、继续队列、临时原子写、额度状态和 rollout 监听。完整检查会产生三条真实且标记清楚的测试通知；它们不写任务消息映射、不创建 Codex 任务，也不修改额度历史。
+
+开发时可运行 focused 测试：
+
+```powershell
+node --test .\tests\discord-bridge.test.mjs .\tests\discord-commands.test.mjs .\tests\discord-gateway.test.mjs .\tests\discord-interactions.test.mjs
+pwsh -NoProfile -File .\tests\discord-bridge-startup.tests.ps1
 ```
 
-首次运行只建立基线。Codex 空闲时本机不会产生新快照，所以关机或未使用期间发生的恢复，会在下一次 Codex 刷新用量后提醒。
+完整验证：
 
-## 文件与日志
+```powershell
+pwsh -NoProfile -File .\tests\repository-hygiene.tests.ps1
+$failed = @(); Get-ChildItem .\tests\*.tests.ps1 | ForEach-Object { & pwsh -NoProfile -File $_.FullName; if ($LASTEXITCODE -ne 0) { $failed += $_.Name } }; if ($failed.Count) { throw ($failed -join ', ') }
+node --test .\tests\*.test.mjs
+node --check .\discord-bridge.mjs
+node --check .\discord-interactions.mjs
+git diff --check
+```
 
-- `config.json`：频道 ID、授权用户 ID、开关和旧 Webhook 回滚信息；不含明文 Bot Token。
+## 状态文件与恢复
+
+- `config.json`：私有 Guild、授权用户、频道和工作目录配置；不含明文 Token。
 - `discord-token.dpapi`：仅当前 Windows 用户可解密的 Bot Token。
-- `discord-message-map.json`：Discord 通知到 Codex 任务的映射。
-- `discord-inbox-state.json`：补读游标、已处理回复和待重试队列。
-- `rollout-watcher-state.json`：任务完成监听游标、当前回合和待补发队列。
-- `task-delivery-state.json`：已成功发送的任务回合 ID，用于原生通知与补发通知去重。
-- `mobile-notify.log`：通知发送日志。
-- `discord-bridge.log`：双向桥接日志，不记录 Token 和完整用户回复。
+- `discord-message-map.json`：正式任务通知到 Codex 任务的回复映射。
+- `discord-inbox-state.json`：频道游标、Interaction 去重、新建任务 journal 和统一继续队列。
+- `discord-task-index.json`：可重建的侧边栏主任务元数据；不保存完整对话。
+- `rollout-watcher-state.json`：rollout 文件偏移、活动回合和待补发通知。
+- `task-delivery-state.json`：原生通知与补发通知的 turn 去重状态。
+- `quota-state.json`：`/额度` 只读的最后已知额度快照。
+- `discord-bridge.log`：脱敏的组件类别和短 ID，不记录 Token 或完整用户输入。
 
-推送或桥接失败只写日志，不会使 Codex 主任务失败。
+索引丢失或损坏时从 `sessions` 与侧边栏索引重建。继续队列和任务创建 journal 不会根据不完整数据猜测重放外部操作。Token、配置、日志和运行时 JSON 不应提交、发布或用示例文件覆盖。
 
-## 旧通道与回滚
+## 停用与回滚
 
-旧 Discord Webhook 保存在 `config.json` 的 `legacyDiscordWebhooks` 中，但不会作为当前发送通道。旧 ntfy、Bark、PushPlus 和通用 Webhook 配置仍可通过 `setup.ps1` 使用。
-
-需要完全移除此工具时，把 `$env:USERPROFILE\.codex\config.toml` 中的 `notify` 改回 `config.json` 里 `previousNotify` 所列的命令，并停用 `Codex Discord Bridge` 计划任务。
+先停止或禁用 `Codex Discord Bridge` 计划任务。若要完全移除通知工具，再把 Codex 配置中的 `notify` 恢复为 `config.json` 的 `previousNotify` 记录。旧 ntfy、Bark、PushPlus 和通用 Webhook 配置仍由 `setup.ps1` 管理，不参与 Slash Command 控制台。

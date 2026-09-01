@@ -7,8 +7,8 @@ $ErrorActionPreference = 'Stop'
 $toolDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 . (Join-Path $toolDir 'discord-bridge-startup.ps1')
 
-$nodePath = (Get-Command node -ErrorAction Stop).Source
-$definition = Get-DiscordBridgeTaskDefinition -ToolDir $toolDir -NodePath $nodePath
+$powerShellPath = (Get-Command pwsh -ErrorAction Stop).Source
+$definition = Get-DiscordBridgeTaskDefinition -ToolDir $toolDir -PowerShellPath $powerShellPath
 $action = New-ScheduledTaskAction `
     -Execute $definition.Execute `
     -Argument $definition.Arguments `
@@ -34,7 +34,7 @@ $settings = New-ScheduledTaskSettingsSet `
     -Trigger $trigger `
     -Principal $principal `
     -Settings $settings `
-    -Description 'Receives authorized Discord replies and resumes their original Codex task.' `
+    -Description 'Runs the private Discord command console, notification reply bridge, and completion fallback.' `
     -Force)
 
 Start-ScheduledTask -TaskName $definition.TaskName

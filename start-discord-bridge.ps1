@@ -7,8 +7,6 @@ $ErrorActionPreference = 'Stop'
 $toolDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $bridgePath = Join-Path $toolDir 'discord-bridge.mjs'
 $logPath = Join-Path $toolDir 'discord-bridge-guard.log'
-$nodeCommand = Get-Command node -ErrorAction Stop
-$nodePath = $nodeCommand.Source
 
 function Write-BridgeGuardLog {
     param([string]$Message)
@@ -30,6 +28,15 @@ try {
     Write-BridgeGuardLog 'Discord bridge guard started.'
     while ($true) {
         try {
+            $nodeCommand = Get-Command node -ErrorAction Stop
+            $nodePath = $nodeCommand.Source
+            $codexCommand = Get-Command codex -ErrorAction SilentlyContinue
+            if ($null -eq $codexCommand) {
+                Remove-Item -LiteralPath 'Env:CODEX_DISCORD_CODEX_PATH' -ErrorAction SilentlyContinue
+            }
+            else {
+                $env:CODEX_DISCORD_CODEX_PATH = $codexCommand.Source
+            }
             & $nodePath $bridgePath
             $exitCode = $LASTEXITCODE
             Write-BridgeGuardLog ("Discord bridge exited with code $exitCode; restarting.")

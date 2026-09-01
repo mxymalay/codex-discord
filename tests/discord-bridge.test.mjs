@@ -7,7 +7,7 @@ import { PassThrough } from 'node:stream';
 import test from 'node:test';
 
 import { startNewCodexTask } from '../discord-task-create-lib.mjs';
-import { finalizeContinuationOutcome, pollChannel } from '../discord-bridge.mjs';
+import { createBridgeApplication, finalizeContinuationOutcome, getDiscordBotMember, pollChannel } from '../discord-bridge.mjs';
 
 import {
   AppServerClient,
@@ -59,6 +59,122 @@ const mapping = {
     },
   },
 };
+
+function makeBridgeDependencies(events, overrides = {}) {
+  const timestamps = [
+    '2026-09-01T00:00:01.000Z', '2026-09-01T00:00:02.000Z',
+    '2026-09-01T00:00:03.000Z', '2026-09-01T00:00:04.000Z',
+  ];
+  const gateway = {
+    getStatus: () => ({ state: 'ready', lastEventAt: Date.parse('2026-09-01T00:00:03.000Z') }),
+    async stop() { events.push('gateway-stopped'); },
+  };
+  return {
+    now: () => timestamps.shift() ?? '2026-09-01T00:00:04.000Z',
+    async loadConfig() { return config; },
+    validateConfig() {},
+    async loadToken() { return 'test-token'; },
+    async resolveExecutables() { events.push('executables-resolved'); return { codexPath: 'codex.exe', powershellPath: 'pwsh.exe' }; },
+    async registerCommands() { events.push('commands-registered'); },
+    async fetchRegisteredCommands() { return [
+      '任务列表', '任务详情', '任务搜索', '新建任务', '继续任务',
+      '继续队列', '额度', '系统状态', '系统测试', '帮助',
+    ].map((name) => ({ name })); },
+    async loadTaskIndex() { events.push('index-ready'); return { version: 1, generatedAt: '2026-09-01T00:00:00.000Z', tasks: [] }; },
+    async loadInboxState() { return createEmptyInboxState(); },
+    async recoverTaskCreations() { events.push('task-creation-recovered'); },
+    async warmProjectCatalog() { events.push('project-catalog-ready'); return { status: () => ({ warmed: true }) }; },
+    createInteractionHandler() { return async () => {}; },
+    async startGateway() { events.push('gateway-started'); return gateway; },
+    async startLegacyPollers() {
+      events.push('legacy-pollers-started');
+      return { async stop() { events.push('legacy-pollers-stopped'); } };
+    },
+    async persistTaskIndex() { events.push('index-persisted'); },
+    async persistInboxState() { events.push('inbox-persisted'); },
+    getActiveTurns: () => [],
+    ...overrides,
+  };
+}
+
+test('bridge composition starts registration, index and gateway without disabling existing pollers', async () => {
+  const events = [];
+  const app = createBridgeApplication(makeBridgeDependencies(events));
+
+  await app.start();
+
+  assert.deepEqual(events.filter((event) => event !== 'executables-resolved').slice(0, 6), [
+    'commands-registered', 'index-ready', 'task-creation-recovered',
+    'project-catalog-ready', 'gateway-started', 'legacy-pollers-started',
+  ]);
+  const status = app.getSystemStatus();
+  assert.equal(status.index.count, 0);
+  assert.equal(status.gateway.state, 'ready');
+  assert.match(status.timestamps.lastRegistrationAt, /^2026-09-01T/);
+  assert.match(status.timestamps.lastIndexUpdateAt, /^2026-09-01T/);
+
+  app.recordActivity('lastGatewayEventAt', '2026-09-01T00:00:05.000Z');
+  app.recordActivity('lastRolloutProgressAt', '2026-09-01T00:00:06.000Z');
+  app.recordActivity('lastNotificationSentAt', '2026-09-01T00:00:07.000Z');
+  app.recordActivity('lastTaskCreationAt', '2026-09-01T00:00:08.000Z');
+  app.recordActivity('lastQueueRetryAt', '2026-09-01T00:00:09.000Z');
+  assert.deepEqual(app.getSystemStatus().timestamps, {
+    lastRegistrationAt: '2026-09-01T00:00:01.000Z',
+    lastIndexUpdateAt: '2026-09-01T00:00:02.000Z',
+    lastGatewayEventAt: '2026-09-01T00:00:05.000Z',
+    lastRolloutProgressAt: '2026-09-01T00:00:06.000Z',
+    lastNotificationSentAt: '2026-09-01T00:00:07.000Z',
+    lastTaskCreationAt: '2026-09-01T00:00:08.000Z',
+    lastQueueRetryAt: '2026-09-01T00:00:09.000Z',
+  });
+
+  await app.stop();
+  assert.deepEqual(events.slice(-4), [
+    'legacy-pollers-stopped', 'gateway-stopped', 'index-persisted', 'inbox-persisted',
+  ]);
+});
+
+test('registration-only lifecycle verifies exactly ten commands without starting Codex or pollers', async () => {
+  const events = [];
+  const app = createBridgeApplication(makeBridgeDependencies(events, {
+    async resolveExecutables() { throw new Error('Codex must not be resolved'); },
+    async loadTaskIndex() { throw new Error('index must not load'); },
+    async startGateway() { throw new Error('gateway must not start'); },
+    async startLegacyPollers() { throw new Error('pollers must not start'); },
+  }));
+
+  const result = await app.registerCommandsOnce();
+
+  assert.deepEqual(result.commandNames, [
+    '任务列表', '任务详情', '任务搜索', '新建任务', '继续任务',
+    '继续队列', '额度', '系统状态', '系统测试', '帮助',
+  ]);
+  assert.deepEqual(events, ['commands-registered']);
+});
+
+test('registration verification fails closed when Discord returns a different command set', async () => {
+  const events = [];
+  const app = createBridgeApplication(makeBridgeDependencies(events, {
+    async fetchRegisteredCommands() { return [{ name: '帮助' }]; },
+  }));
+
+  await assert.rejects(() => app.registerCommandsOnce(), /Guild command verification failed/);
+});
+
+test('quick health resolves the current Bot identity before reading its Guild member', async () => {
+  const routes = [];
+  const member = await getDiscordBotMember({
+    guildId: '222',
+    request: async (route) => {
+      routes.push(route);
+      if (route === '/users/@me') return { id: '333', username: 'private-bot' };
+      return { user: { id: '333' }, roles: ['444'] };
+    },
+  });
+
+  assert.deepEqual(routes, ['/users/@me', '/guilds/222/members/333']);
+  assert.deepEqual(member, { user: { id: '333' }, roles: ['444'] });
+});
 
 function scriptedAppServerProcess({ threadId, turnId, resume = false }) {
   const child = new EventEmitter();
