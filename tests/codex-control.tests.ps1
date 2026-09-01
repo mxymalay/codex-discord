@@ -366,6 +366,18 @@ try {
     if (-not $idempotentEnable.ok -or $idempotentState.enables -ne 0 -or $idempotentState.starts -ne 0) {
         throw 'repeating long-term enable was not idempotent for an already scheduled runtime'
     }
+
+    $childEvents = [System.Collections.Generic.List[string]]::new()
+    $childBound = [pscustomobject]@{ ProcessId=706; StartTimeUtc='2026-09-01T13:00:00.0000000Z'; Process=[pscustomobject]@{} }
+    $childStop = Stop-CodexBridgeRuntime -Runtime ([pscustomobject]@{ processId=706; creationTimeUtc='2026-09-01T13:00:00.0000000Z'; mode='temporary' }) -Operations @{
+        OpenBridgeProcess = { param($id) $childBound }
+        GetBridgeDescendants = { param($bound) @([pscustomobject]@{ ProcessId=707; StartTimeUtc='2026-09-01T13:00:01.0000000Z'; Process=[pscustomobject]@{} }) }
+        StopRuntimeTree = { param($bound) $childEvents.Add('root') }
+        StopBoundProcess = { param($bound) $childEvents.Add("stop:$($bound.ProcessId)") }
+        WaitForRuntimeExit = { param($bound,$milliseconds) if ($bound.ProcessId -eq 707) { $false } else { $true } }
+        WaitForRuntimeRelease = { param($milliseconds) $true }
+    } -TimeoutMilliseconds 1
+    if ($childStop.ok -or $childStop.errorCategory -ne 'runtime-stop-timeout') { throw 'a live child after root exit was accepted as a complete stop' }
 }
 finally {
     Remove-Item -LiteralPath $reviewRuntimeRoot -Recurse -Force -ErrorAction SilentlyContinue

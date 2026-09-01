@@ -373,14 +373,25 @@ function New-CodexControlOperations {
             try {
                 $mutex = [System.Threading.Mutex]::OpenExisting('Local\CodexDiscordBridge')
             }
-            catch { return $true }
+            catch [System.Threading.WaitHandleCannotBeOpenedException] { return $true }
             try {
-                if (-not $mutex.WaitOne($Milliseconds)) { return $false }
+                $owned = $false
+                try { $owned = $mutex.WaitOne($Milliseconds) }
+                catch [System.Threading.AbandonedMutexException] { $owned = $true }
+                if (-not $owned) { return $false }
                 $mutex.ReleaseMutex()
                 return $true
             }
             finally { $mutex.Dispose() }
         }
+        GetBridgeDescendants = {
+            param([Parameter(Mandatory)][object]$BoundRoot)
+            $all = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop | ForEach-Object { [pscustomobject]@{ ProcessId=$_.ProcessId; ParentProcessId=$_.ParentProcessId; CreationDate=$_.CreationDate } })
+            $children = @{}; foreach ($record in $all) { $key=[string]$record.ParentProcessId; if (-not $children.ContainsKey($key)) { $children[$key]=@() }; $children[$key]+=$record }
+            $queue=[System.Collections.Generic.Queue[object]]::new(); $queue.Enqueue([pscustomobject]@{ Id=[int]$BoundRoot.ProcessId; Time=(ConvertTo-BridgeRuntimeTimeUtc $BoundRoot.StartTimeUtc) })
+            $bound=@(); while($queue.Count) { $parent=$queue.Dequeue(); foreach($child in @($children[[string]$parent.Id])) { $time=ConvertTo-ControlCreationTime $child.CreationDate; if($null -eq $time -or $time -le $parent.Time) { throw 'runtime tree unverifiable' }; $process=Get-Process -Id $child.ProcessId -ErrorAction Stop; [void]$process.Handle; $bound += [pscustomobject]@{ ProcessId=$process.Id; StartTimeUtc=$process.StartTime.ToUniversalTime(); Process=$process }; $queue.Enqueue([pscustomobject]@{Id=[int]$child.ProcessId;Time=$time}) } }; return $bound
+        }
+        StopBoundProcess = { param([Parameter(Mandatory)][object]$BoundProcess) $BoundProcess.Process.Kill() }
     }
 }
 
@@ -408,8 +419,16 @@ function Stop-CodexBridgeRuntime {
     try {
         $bound = & $Operations.OpenBridgeProcess ([int]$Runtime.processId)
         if (-not (Test-CodexBridgeBoundRuntimeIdentity -BoundProcess $bound -Runtime $Runtime)) { return [pscustomobject]@{ ok=$false; errorCategory='runtime-identity-revalidation-failed' } }
+        $descendants = @()
+        if ($Operations.ContainsKey('GetBridgeDescendants') -and $Operations.GetBridgeDescendants -is [scriptblock]) {
+            $descendants = @(& $Operations.GetBridgeDescendants $bound)
+            foreach ($child in $descendants) {
+                if ($null -eq $child -or $null -eq (Get-ControlProcessProperty -Process $child -Name 'ProcessId') -or $null -eq (Get-ControlProcessProperty -Process $child -Name 'StartTimeUtc')) { return [pscustomobject]@{ ok=$false; errorCategory='runtime-tree-unverifiable' } }
+            }
+        }
         & $Operations.StopRuntimeTree $bound
-        if (-not (& $Operations.WaitForRuntimeExit $bound $TimeoutMilliseconds)) { return [pscustomobject]@{ ok=$false; errorCategory='runtime-stop-timeout' } }
+        if ($descendants.Count -gt 0 -and $Operations.ContainsKey('StopBoundProcess') -and $Operations.StopBoundProcess -is [scriptblock]) { foreach ($child in $descendants) { & $Operations.StopBoundProcess $child } }
+        foreach ($process in @($bound) + @($descendants)) { if (-not (& $Operations.WaitForRuntimeExit $process $TimeoutMilliseconds)) { return [pscustomobject]@{ ok=$false; errorCategory='runtime-stop-timeout' } } }
         if (-not (& $Operations.WaitForRuntimeRelease $TimeoutMilliseconds)) { return [pscustomobject]@{ ok=$false; errorCategory='runtime-release-timeout' } }
         return [pscustomobject]@{ ok=$true }
     }
@@ -478,6 +497,11 @@ function Invoke-CodexBridgeServiceAction {
             return [pscustomobject]@{ ok=$false; action=$Action; errorCategory='invalid-service-operations' }
         }
     }
+    function New-ServiceActionFailure([string]$Category) {
+        $fresh = Get-CodexBridgeServiceStatus -Operations $Operations -ToolDir $ToolDir
+        if (-not $fresh.ok) { $fresh = [pscustomobject]@{ ok=$false; state='unknown'; errorCategory='service-status-unavailable' } }
+        return [pscustomobject]@{ ok=$false; action=$Action; errorCategory=$Category; service=$fresh }
+    }
     $status = Get-CodexBridgeServiceStatus -Operations $Operations -ToolDir $ToolDir
     if (-not $status.ok) { return [pscustomobject]@{ ok=$false; action=$Action; errorCategory=$status.errorCategory } }
     try {
@@ -492,7 +516,7 @@ function Invoke-CodexBridgeServiceAction {
             'stop-temporary' {
                 if ($status.runtime -and $status.runtime.mode -eq 'scheduled') { & $Operations.StopTask }
                 elseif ($status.running) {
-                    if ($Operations.ContainsKey('StopRuntimeTree')) { $stopped = Stop-CodexBridgeRuntime -Runtime $status.runtime -Operations $Operations -TimeoutMilliseconds ($PollAttempts * [Math]::Max(1,$PollMilliseconds)); if (-not $stopped.ok) { return [pscustomobject]@{ ok=$false; action=$Action; errorCategory=$stopped.errorCategory; service=$status } } }
+                    if ($Operations.ContainsKey('StopRuntimeTree')) { $stopped = Stop-CodexBridgeRuntime -Runtime $status.runtime -Operations $Operations -TimeoutMilliseconds ($PollAttempts * [Math]::Max(1,$PollMilliseconds)); if (-not $stopped.ok) { return New-ServiceActionFailure $stopped.errorCategory } }
                     else { & $Operations.StopRuntime $status.runtime }
                 }
                 elseif ($status.taskRunning) { & $Operations.StopTask }
@@ -501,7 +525,7 @@ function Invoke-CodexBridgeServiceAction {
                 if (-not $status.taskInstalled) { & $Operations.InstallTask }
                 if (-not $status.autoStartEnabled) { & $Operations.EnableTask }
                 if ($null -ne $status.runtime -and $status.runtime.mode -eq 'temporary') {
-                    if ($Operations.ContainsKey('StopRuntimeTree')) { $stopped = Stop-CodexBridgeRuntime -Runtime $status.runtime -Operations $Operations -TimeoutMilliseconds ($PollAttempts * [Math]::Max(1,$PollMilliseconds)); if (-not $stopped.ok) { return [pscustomobject]@{ ok=$false; action=$Action; errorCategory=$stopped.errorCategory; service=$status } } }
+                    if ($Operations.ContainsKey('StopRuntimeTree')) { $stopped = Stop-CodexBridgeRuntime -Runtime $status.runtime -Operations $Operations -TimeoutMilliseconds ($PollAttempts * [Math]::Max(1,$PollMilliseconds)); if (-not $stopped.ok) { return New-ServiceActionFailure $stopped.errorCategory } }
                     else { & $Operations.StopRuntime $status.runtime }
                 }
                 if (-not $status.running -or $null -eq $status.runtime -or $status.runtime.mode -ne 'scheduled') { & $Operations.StartTask }
@@ -510,7 +534,7 @@ function Invoke-CodexBridgeServiceAction {
                 if ($status.taskInstalled) { & $Operations.DisableTask }
                 if ($status.runtime -and $status.runtime.mode -eq 'scheduled') { & $Operations.StopTask }
                 elseif ($status.running) {
-                    if ($Operations.ContainsKey('StopRuntimeTree')) { $stopped = Stop-CodexBridgeRuntime -Runtime $status.runtime -Operations $Operations -TimeoutMilliseconds ($PollAttempts * [Math]::Max(1,$PollMilliseconds)); if (-not $stopped.ok) { return [pscustomobject]@{ ok=$false; action=$Action; errorCategory=$stopped.errorCategory; service=$status } } }
+                    if ($Operations.ContainsKey('StopRuntimeTree')) { $stopped = Stop-CodexBridgeRuntime -Runtime $status.runtime -Operations $Operations -TimeoutMilliseconds ($PollAttempts * [Math]::Max(1,$PollMilliseconds)); if (-not $stopped.ok) { return New-ServiceActionFailure $stopped.errorCategory } }
                     else { & $Operations.StopRuntime $status.runtime }
                 }
                 elseif ($status.taskRunning) { & $Operations.StopTask }
@@ -530,9 +554,7 @@ function Invoke-CodexBridgeServiceAction {
         }
         return [pscustomobject][ordered]@{ ok=$false; action=$Action; errorCategory='service-action-incomplete'; service=$finalStatus }
     }
-    catch {
-        return [pscustomobject]@{ ok=$false; action=$Action; errorCategory='service-action-failed' }
-    }
+    catch { return New-ServiceActionFailure 'service-action-failed' }
 }
 
 function Test-CodexBoundProcessIdentity {
