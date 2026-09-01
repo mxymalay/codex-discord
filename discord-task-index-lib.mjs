@@ -65,6 +65,53 @@ function identityKey(value) {
   return String(value ?? '').trim().toLocaleLowerCase();
 }
 
+function canonicalWindowsPath(value) {
+  const text = stringOrNull(value);
+  if (!text) return null;
+  try {
+    return path.win32.normalize(text.replaceAll('/', '\\')).replace(/[\\]+$/u, '').toLocaleLowerCase();
+  } catch {
+    return null;
+  }
+}
+
+function projectRoots(project) {
+  return (Array.isArray(project?.roots) ? project.roots : [])
+    .map((root) => typeof root === 'string' ? root : root?.path)
+    .map(canonicalWindowsPath)
+    .filter(Boolean);
+}
+
+/** Resolve a task to the saved Codex project whose canonical root contains it. */
+export function inferSavedProject({ cwd, worktreePath, projectId, projectName } = {}, projects = []) {
+  const saved = Array.isArray(projects) ? projects : [];
+  const explicitId = stringOrNull(projectId);
+  const explicitName = stringOrNull(projectName);
+  if (!explicitId && explicitName === '无项目') return { projectId: null, projectName: null };
+  const explicit = (explicitId
+    ? saved.find((project) => String(project?.id ?? '') === explicitId)
+    : null) ?? (explicitName
+    ? saved.find((project) => String(project?.name ?? '') === explicitName)
+    : null);
+  if (explicit) {
+    return { projectId: String(explicit.id), projectName: String(explicit.name ?? explicit.id) };
+  }
+
+  const candidates = [canonicalWindowsPath(cwd), canonicalWindowsPath(worktreePath)].filter(Boolean);
+  if (!candidates.length) return { projectId: null, projectName: null };
+  let match = null;
+  for (const project of saved) {
+    for (const root of projectRoots(project)) {
+      if (!candidates.some((candidate) => candidate === root || candidate.startsWith(`${root}\\`))) continue;
+      if (!match || root.length > match.root.length) match = { project, root };
+    }
+  }
+  return match ? {
+    projectId: String(match.project.id),
+    projectName: String(match.project.name ?? match.project.id),
+  } : { projectId: null, projectName: null };
+}
+
 function textValue(value) {
   if (typeof value === 'string') return value;
   if (!Array.isArray(value)) return '';
@@ -272,6 +319,33 @@ function projectMetadata(meta, sidebarEntry, previous) {
   };
 }
 
+function createdRootsByThread(createdTasksByInteraction) {
+  const roots = new Map();
+  for (const record of Object.values(createdTasksByInteraction ?? {})) {
+    const threadId = stringOrNull(record?.threadId);
+    if (!threadId || !['started', 'first-turn-failed'].includes(String(record?.status ?? ''))) continue;
+    roots.set(identityKey(threadId), record);
+  }
+  return roots;
+}
+
+function isTrustedCreatedRoot(meta, createdRecord, expectedThreadId) {
+  if (!createdRecord || !meta || typeof meta !== 'object') return false;
+  const metaId = stringOrNull(meta.id);
+  const persistedThreadId = stringOrNull(createdRecord.threadId);
+  if (!metaId || !persistedThreadId ||
+      identityKey(metaId) !== identityKey(persistedThreadId) ||
+      identityKey(metaId) !== identityKey(expectedThreadId)) return false;
+  const threadSource = String(meta.thread_source ?? '').trim().toLocaleLowerCase();
+  if (threadSource && threadSource !== 'user') return false;
+  if (String(meta.parent_thread_id ?? '').trim()) return false;
+  if (meta.source && typeof meta.source === 'object' && Object.entries(meta.source).some(
+    ([key, value]) => key.toLocaleLowerCase() === 'subagent' && value != null,
+  )) return false;
+  const sessionId = stringOrNull(meta.session_id);
+  return !sessionId || identityKey(sessionId) === identityKey(metaId);
+}
+
 function worktreeMetadata(meta, worktreeRoot) {
   const runtimeRoots = meta?.runtime_workspace_roots ?? meta?.runtimeWorkspaceRoots ?? [];
   const candidatePath = stringOrNull(meta?.worktree_path ?? meta?.worktreePath) ??
@@ -283,10 +357,10 @@ function worktreeMetadata(meta, worktreeRoot) {
   return { worktreePath: path.resolve(candidatePath), worktreeBranch: branch };
 }
 
-function buildRecord({ entries, middleSkipped, rolloutPath, offset, sidebarEntry, previous, nowMs, worktreeRoot, latestMapping }) {
+function buildRecord({ entries, middleSkipped, rolloutPath, offset, expectedThreadId, sidebarEntry, createdRecord, previous, nowMs, worktreeRoot, latestMapping, projects }) {
   const metadataEntry = entries.find((entry) => entry?.type === 'session_meta' && entry?.payload);
   const meta = metadataEntry?.payload;
-  if (!isUserRootSession(meta, sidebarEntry)) return null;
+  if (!isUserRootSession(meta, sidebarEntry) && !isTrustedCreatedRoot(meta, createdRecord, expectedThreadId)) return null;
 
   let createdMs = null;
   let lastActivityMs = null;
@@ -354,13 +428,24 @@ function buildRecord({ entries, middleSkipped, rolloutPath, offset, sidebarEntry
   const sidebarUpdatedMs = validTime(sidebarEntry?.updated_at ?? sidebarEntry?.updatedAt);
   if (sidebarCreatedMs != null) createdMs = createdMs == null ? sidebarCreatedMs : Math.min(createdMs, sidebarCreatedMs);
   if (sidebarUpdatedMs != null) lastActivityMs = lastActivityMs == null ? sidebarUpdatedMs : Math.max(lastActivityMs, sidebarUpdatedMs);
-  const project = projectMetadata(meta, sidebarEntry, previous);
+  const explicitProject = projectMetadata(meta, sidebarEntry, {
+    ...previous,
+    projectId: createdRecord?.projectId ?? previous?.projectId,
+    projectName: createdRecord?.projectName ?? previous?.projectName,
+  });
+  const inferredProject = inferSavedProject({
+    cwd: meta?.cwd ?? createdRecord?.workspace?.cwd,
+    worktreePath: createdRecord?.workspace?.worktreePath,
+    ...explicitProject,
+  }, projects);
+  const project = Array.isArray(projects) && projects.length > 0 ? inferredProject : explicitProject;
   const worktree = worktreeMetadata(meta, worktreeRoot);
   return {
     threadId: String(meta.id),
     projectId: project.projectId,
     projectName: project.projectName,
-    taskName: stringOrNull(sidebarEntry?.thread_name ?? sidebarEntry?.threadName ?? sidebarEntry?.name) ?? previous?.taskName ?? '未命名任务',
+    taskName: stringOrNull(sidebarEntry?.thread_name ?? sidebarEntry?.threadName ?? sidebarEntry?.name) ??
+      stringOrNull(createdRecord?.taskName) ?? previous?.taskName ?? '未命名任务',
     status,
     createdAt: isoTime(createdMs),
     lastActivityAt: isoTime(lastActivityMs),
@@ -412,6 +497,8 @@ export async function buildTaskIndex({
   previousIndex = emptyIndex(),
   nowMs = Date.now(),
   discordWorktreeRoot,
+  projects = [],
+  createdTasksByInteraction = {},
   readLimits,
   fileSystem = fs,
 }) {
@@ -425,6 +512,7 @@ export async function buildTaskIndex({
     return rolloutPath ? [[path.resolve(rolloutPath), record]] : [];
   }));
   const worktreeRoot = configuredWorktreeRoot(discordWorktreeRoot, previousIndex);
+  const createdRoots = createdRootsByThread(createdTasksByInteraction);
   const recordsById = new Map();
   const unsafePreviousKeys = new Set();
 
@@ -435,7 +523,8 @@ export async function buildTaskIndex({
     let sidebarEntry = sidebarEntries.get(key);
     let previous = filenameThreadId ? previousById.get(key) : previousByPath.get(path.resolve(rolloutPath));
     if (!filenameThreadId && previous) sidebarEntry = sidebarEntries.get(identityKey(previous.threadId));
-    if (filenameThreadId && !sidebarEntry) continue;
+    let createdRecord = createdRoots.get(key);
+    if (filenameThreadId && !sidebarEntry && !createdRecord) continue;
     try {
       const stat = await fileSystem.stat(rolloutPath);
       const offset = Number(stat.size);
@@ -447,10 +536,11 @@ export async function buildTaskIndex({
         if (!threadId) continue;
         key = identityKey(threadId);
         sidebarEntry = sidebarEntries.get(key);
-        if (!sidebarEntry) continue;
+        createdRecord = createdRoots.get(key);
+        if (!sidebarEntry && !createdRecord) continue;
         previous = previousById.get(key) ?? (identityKey(previous?.threadId) === key ? previous : undefined);
       }
-      if (previous && path.resolve(String(previous.rolloutPath ?? '')) === path.resolve(rolloutPath) &&
+      if (previous && sidebarEntry && path.resolve(String(previous.rolloutPath ?? '')) === path.resolve(rolloutPath) &&
           Number(previous.offset) === offset) {
         recordsById.set(key, refreshedPreviousRecord(previous, sidebarEntry, mappings.get(key)));
         continue;
@@ -461,11 +551,14 @@ export async function buildTaskIndex({
         middleSkipped: parsed.middleSkipped,
         rolloutPath,
         offset,
+        expectedThreadId: threadId,
         sidebarEntry,
+        createdRecord,
         previous,
         nowMs: Number(nowMs),
         worktreeRoot,
         latestMapping: mappings.get(key),
+        projects,
       });
       if (!record) continue;
       key = identityKey(record.threadId);

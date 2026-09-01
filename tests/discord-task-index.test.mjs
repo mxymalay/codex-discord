@@ -6,6 +6,7 @@ import test from 'node:test';
 
 import {
   buildTaskIndex,
+  inferSavedProject,
   isUserRootSession,
   readTaskDetail,
   readTaskIndex,
@@ -107,6 +108,123 @@ test('root eligibility fails closed on empty IDs and compares dispatcher identit
   assert.equal(isUserRootSession({ id: 'ROOT-A', session_id: 'root-a', thread_source: 'USER' }, { id: 'root-a' }), true);
   assert.equal(isUserRootSession({ id: 'ROOT-A', session_id: 'other', thread_source: 'USER' }, { id: 'root-a' }), false);
   assert.equal(isUserRootSession({ id: 'ROOT-A', thread_source: 'SUBAGENT' }, { id: 'root-a' }), false);
+});
+
+test('saved project inference prefers valid identity then the longest canonical Windows containing root', () => {
+  const projects = [
+    { id: 'parent', name: 'Workspace', roots: [{ path: 'C:\\Users\\86166\\Desktop' }] },
+    { id: 'ygf', name: 'ygf', roots: ['c:/users/86166/desktop/ygf/'] },
+    { id: 'other', name: 'Other', roots: ['C:\\Users\\86166\\Desktop\\ygf-old'] },
+  ];
+
+  assert.deepEqual(inferSavedProject({
+    cwd: 'C:\\Users\\86166\\Desktop\\YGF\\apps\\cashier',
+    projectId: 'parent',
+    projectName: 'stale name',
+  }, projects), { projectId: 'parent', projectName: 'Workspace' });
+  assert.deepEqual(inferSavedProject({
+    cwd: 'C:/Users/86166/Desktop/YGF/apps/cashier',
+  }, projects), { projectId: 'ygf', projectName: 'ygf' });
+  assert.deepEqual(inferSavedProject({
+    cwd: 'C:\\Users\\86166\\Desktop\\ygf-old-sibling\\app',
+  }, projects), { projectId: 'parent', projectName: 'Workspace' });
+  assert.deepEqual(inferSavedProject({
+    cwd: 'D:\\outside\\task',
+  }, projects), { projectId: null, projectName: null });
+
+  assert.deepEqual(inferSavedProject({
+    cwd: 'D:\\generated\\outside',
+    worktreePath: 'C:\\Users\\86166\\Desktop\\ygf\\.codex\\worktree',
+  }, projects), { projectId: 'ygf', projectName: 'ygf' });
+
+  assert.deepEqual(inferSavedProject({
+    cwd: 'C:\\Users\\86166\\Desktop\\ygf\\manually-projectless',
+    projectId: null,
+    projectName: '无项目',
+  }, projects), { projectId: null, projectName: null });
+
+  assert.deepEqual(inferSavedProject({
+    cwd: 'D:\\generated\\outside',
+    projectId: 'deleted-project-id',
+    projectName: 'ygf',
+  }, projects), { projectId: 'ygf', projectName: 'ygf' });
+});
+
+test('Discord managed worktree project provenance wins over generated path matching', () => {
+  const projects = [
+    { id: 'ygf', name: 'ygf', roots: ['C:\\Users\\86166\\Desktop\\ygf'] },
+    { id: 'worktrees', name: 'Generated', roots: ['G:\\CodexData\\.codex\\worktrees'] },
+  ];
+  assert.deepEqual(inferSavedProject({
+    cwd: 'G:\\CodexData\\.codex\\worktrees\\discord\\operation',
+    worktreePath: 'G:\\CodexData\\.codex\\worktrees\\discord\\operation',
+    projectId: 'ygf',
+    projectName: 'ygf',
+  }, projects), { projectId: 'ygf', projectName: 'ygf' });
+});
+
+test('indexes a persisted Discord-created root absent from sidebar but never promotes its child rollout', async () => {
+  const paths = await fixture();
+  const rootId = '01a05d0a-5a8f-71f2-b5e1-96fe962224b5';
+  const childId = '01a05d0a-aaaa-71f2-b5e1-96fe962224b5';
+  const mismatchedFilenameId = '01a05d0a-bbbb-71f2-b5e1-96fe962224b5';
+  const mismatchedMetadataId = '01a05d0a-cccc-71f2-b5e1-96fe962224b5';
+  try {
+    await fs.writeFile(paths.sessionIndexPath, '', 'utf8');
+    await writeJsonl(paths.rollout(`2026-09-01T20-55-55-${rootId}`), [
+      meta(rootId, { cwd: 'C:\\Users\\86166\\Desktop\\ygf\\app' }),
+      event('2026-09-01T20:55:56.000Z', 'task_started', { turn_id: 'turn-root' }),
+      event('2026-09-01T21:08:15.000Z', 'task_complete', { turn_id: 'turn-root', last_agent_message: '完成' }),
+    ]);
+    await writeJsonl(paths.rollout(`2026-09-01T20-56-00-${childId}`), [
+      meta(childId, {
+        thread_source: 'subagent', parent_thread_id: rootId,
+        source: { subagent: { name: 'worker' } },
+      }),
+      event('2026-09-01T20:56:01.000Z', 'task_started', { turn_id: 'turn-child' }),
+      event('2026-09-01T20:57:00.000Z', 'task_complete', { turn_id: 'turn-child', last_agent_message: '内部结果' }),
+    ]);
+    await writeJsonl(paths.rollout(`2026-09-01T20-58-00-${mismatchedFilenameId}`), [
+      meta(mismatchedMetadataId),
+      event('2026-09-01T20:58:01.000Z', 'task_started', { turn_id: 'turn-mismatched' }),
+      event('2026-09-01T20:59:00.000Z', 'task_complete', { turn_id: 'turn-mismatched', last_agent_message: '不可信结果' }),
+    ]);
+
+    const index = await buildTaskIndex({
+      ...paths,
+      nowMs: Date.parse('2026-09-01T21:08:16.000Z'),
+      projects: [{ id: 'ygf', name: 'ygf', roots: ['C:\\Users\\86166\\Desktop\\ygf'] }],
+      createdTasksByInteraction: {
+        '1544329941024374935': {
+          status: 'started', threadId: rootId, turnId: 'turn-root', taskName: 'Discord 新任务',
+          projectId: 'ygf', projectName: 'ygf',
+          workspace: {
+            mode: 'worktree', cwd: 'G:\\CodexData\\.codex\\worktrees\\discord\\incident',
+            worktreePath: 'G:\\CodexData\\.codex\\worktrees\\discord\\incident',
+            runtimeWorkspaceRoots: ['G:\\CodexData\\.codex\\worktrees\\discord\\incident'],
+            operationId: '1544329941024374935',
+          },
+        },
+        '1544329941024374936': {
+          status: 'started', threadId: mismatchedFilenameId, turnId: 'turn-mismatched', taskName: '不应提升的任务',
+          workspace: { mode: 'local', cwd: 'C:\\workspace\\mismatch', operationId: '1544329941024374936' },
+        },
+      },
+    });
+
+    assert.deepEqual(index.tasks.map((item) => item.threadId), [rootId]);
+    assert.equal(index.tasks[0].status, 'completed');
+    assert.equal(index.tasks[0].projectName, 'ygf');
+    assert.equal(index.tasks[0].taskName, 'Discord 新任务');
+    const detail = await readTaskDetail(index.tasks[0]);
+    assert.equal(detail.resultText, '完成');
+    assert.deepEqual(
+      (await searchTasks({ index, keyword: 'Discord 新任务' })).map((item) => item.threadId),
+      [rootId],
+    );
+  } finally {
+    await fs.rm(paths.root, { recursive: true, force: true });
+  }
 });
 
 test('indexes forced-large rollouts from bounded head and tail reads without claiming an exact runtime', async () => {

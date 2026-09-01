@@ -52,6 +52,7 @@ function commandInteraction(name, options = {}, overrides = {}) {
     token: overrides.token ?? 'interaction-token-must-not-be-stored',
     application_id: '111',
     type: 2,
+    channel_id: overrides.channelId ?? '777777777777777777',
     ...identity(overrides.userId, overrides.guildId),
     data: {
       name,
@@ -66,6 +67,7 @@ function autocompleteInteraction(name, focused, overrides = {}) {
     id: overrides.id ?? `autocomplete-${name}`,
     token: overrides.token ?? 'autocomplete-token-must-not-be-stored',
     type: 4,
+    channel_id: overrides.channelId ?? '777777777777777777',
     ...identity(overrides.userId, overrides.guildId),
     data: { name, options: [{ name: optionName, type: 3, value: focused, focused: true }] },
   };
@@ -76,6 +78,7 @@ function modalSubmit(customId, text, overrides = {}) {
     id: overrides.id ?? 'modal-submit-1',
     token: overrides.token ?? 'modal-token-must-not-be-stored',
     type: 5,
+    channel_id: overrides.channelId ?? '777777777777777777',
     ...identity(overrides.userId, overrides.guildId),
     data: {
       custom_id: customId,
@@ -89,6 +92,7 @@ function componentInteraction(customId, overrides = {}) {
     id: overrides.id ?? 'component-1',
     token: overrides.token ?? 'component-token-must-not-be-stored',
     type: 3,
+    channel_id: overrides.channelId ?? '777777777777777777',
     ...identity(overrides.userId, overrides.guildId),
     message: { id: overrides.messageId ?? 'takeover-message-1' },
     data: { custom_id: customId, component_type: 2 },
@@ -131,6 +135,8 @@ function deterministicRandom() {
 function makeDependencies(overrides = {}) {
   const responses = [];
   const edits = [];
+  const followups = [];
+  const receiptOutcomes = [];
   const projects = overrides.projects ?? [{ id: 'project-1', name: 'POS', roots: ['C:\\saved\\POS'] }];
   const events = overrides.events ?? [];
   const taskIndex = overrides.taskIndex ?? { generatedAt: new Date(NOW).toISOString(), tasks: [task(1), task(2)] };
@@ -180,12 +186,16 @@ function makeDependencies(overrides = {}) {
     persistContinuationState: overrides.persistContinuationState ?? (async () => {}),
     respond: overrides.respond ?? (async (body) => { responses.push(body); }),
     editOriginal: overrides.editOriginal ?? (async (body) => { edits.push(body); return { id: 'takeover-message-1' }; }),
+    followup: overrides.followup ?? (async (body) => { followups.push(body); return { id: 'creation-followup-1' }; }),
+    recordCreationReceiptOutcome: overrides.recordCreationReceiptOutcome ?? (async (interactionId, outcome) => {
+      receiptOutcomes.push({ interactionId, outcome: structuredClone(outcome) });
+    }),
     randomBytes: overrides.randomBytes ?? deterministicRandom(),
     now: overrides.now ?? (() => NOW),
     uiState: overrides.uiState ?? new Map(),
     ...overrides,
   };
-  return { dependencies, responses, edits, events, taskIndex };
+  return { dependencies, responses, edits, followups, receiptOutcomes, events, taskIndex };
 }
 
 async function submitContinuationModal(router, responses, {
@@ -1496,7 +1506,7 @@ test('continuation queue renderer does not mark a short summary as truncated', (
   const rendered = renderContinuationQueue([{
     queueId: 'queue-short123', source: 'slash', threadId: 'root-1', summary: '短摘要', status: 'queued',
   }]);
-  assert.match(rendered, /内容：短摘要\n/);
+  assert.match(rendered, /\*\*内容：\*\* 短摘要\n/);
   assert.equal(rendered.includes('短摘…'), false);
 });
 
@@ -1565,6 +1575,10 @@ test('modal submission defers before authoritative refresh and creation, passes 
   assert.equal(creationInput.state, dependencies.creationState);
   assert.equal(creationInput.selection.projectId, 'project-1');
   assert.equal(creationInput.text, '检查支付流程');
+  assert.deepEqual(creationInput.discordOrigin, {
+    guildId: '222', channelId: '777777777777777777', source: 'new-task',
+    projectId: 'project-1', projectName: 'POS',
+  });
   assert.equal(responses[0].type, 5);
   assert.equal(responses[0].data.flags & 64, 64);
   assert.deepEqual(responses[0].data.allowed_mentions, { parse: [] });
@@ -1574,6 +1588,50 @@ test('modal submission defers before authoritative refresh and creation, passes 
   assert.equal(taskIndex.tasks.length, 1);
   assert.equal(taskIndex.tasks[0].threadId, 'thread-created-1');
   assert.equal(taskIndex.tasks[0].worktreeBranch, 'codex/discord-test');
+});
+
+test('20:56 creation receipt falls back once to a private follow-up when original edit fails', async () => {
+  const calls = [];
+  const { dependencies, responses, followups, receiptOutcomes } = makeDependencies({
+    editOriginal: async () => { calls.push('edit'); throw new Error('secret Discord error C:\\private\\path'); },
+    followup: async (body) => { calls.push('followup'); followups.push(body); return { id: 'followup-2056' }; },
+  });
+  const router = createInteractionRouter(dependencies);
+  await router.handle(commandInteraction('新建任务', { 项目: 'project-1' }));
+  const customId = responses.shift().data.custom_id;
+
+  await router.handle(modalSubmit(customId, '20:56 从 Discord 新建任务', { id: 'interaction-2056' }));
+
+  assert.deepEqual(calls, ['edit', 'followup']);
+  assert.equal(followups.length, 1);
+  assert.equal(followups[0].flags & 64, 64);
+  assert.deepEqual(followups[0].allowed_mentions, { parse: [] });
+  assert.match(followups[0].content, /任务创建成功/u);
+  assert.equal(JSON.stringify(followups).includes('secret Discord error'), false);
+  assert.deepEqual(receiptOutcomes, [{
+    interactionId: 'interaction-2056',
+    outcome: { status: 'followup-sent', messageId: 'followup-2056' },
+  }]);
+});
+
+test('creation receipt records a fixed failure category when original and follow-up delivery both fail', async () => {
+  const calls = [];
+  const { dependencies, responses, receiptOutcomes } = makeDependencies({
+    editOriginal: async () => { calls.push('edit'); throw new Error('edit token should stay private'); },
+    followup: async () => { calls.push('followup'); throw new Error('followup token should stay private'); },
+  });
+  const router = createInteractionRouter(dependencies);
+  await router.handle(commandInteraction('新建任务', { 项目: 'project-1' }));
+  const customId = responses.shift().data.custom_id;
+
+  const returned = await router.handle(modalSubmit(customId, '创建后回执失败', { id: 'interaction-no-receipt' }));
+
+  assert.deepEqual(calls, ['edit', 'followup']);
+  assert.deepEqual(receiptOutcomes, [{
+    interactionId: 'interaction-no-receipt',
+    outcome: { status: 'failed', errorCategory: 'creation-receipt-delivery-failed' },
+  }]);
+  assert.equal(JSON.stringify(returned).includes('token should stay private'), false);
 });
 
 test('duplicate modal delivery creates and inserts exactly once', async () => {
@@ -1725,6 +1783,10 @@ test('task detail continue button is protected and opens the shared continuation
   assert.equal(responses.shift().type, 5);
   assert.equal(requests.length, 1);
   assert.equal(requests[0].threadId, 'root-1');
+  assert.equal(requests[0].guildId, '222');
+  assert.equal(requests[0].channelId, '777777777777777777');
+  assert.equal(requests[0].projectId, 'project-1');
+  assert.equal(requests[0].projectName, 'POS');
 });
 
 test('sweep removes UI state at the exact fifteen-minute boundary', async () => {
@@ -1760,6 +1822,47 @@ test('quota renderer handles no snapshot, stale data, trends, reset, and both pr
   assert.match(text, /当前速度/);
   assert.match(text, /平均速度/);
   assert.match(text, /快照时间/);
+});
+
+test('task, quota, status, and help renderers own consistent Markdown labels around escaped values', () => {
+  const hostile = task(1, { projectName: '**项目** @everyone', taskName: '# 任务' });
+  const list = renderTaskList([hostile]);
+  const detail = renderTaskDetail({ ...hostile, taskText: '正文', resultText: '结果' });
+  const search = renderSearchResults([hostile], '# 条件');
+  const queue = renderContinuationQueue([{
+    queueId: 'queue-markdown1', source: 'slash', threadId: hostile.threadId,
+    projectName: hostile.projectName, taskName: hostile.taskName, summary: '@everyone # 继续', status: 'queued',
+  }]);
+  const quota = renderQuota({
+    observedAt: new Date(NOW).toISOString(),
+    limits: [{
+      windowMinutes: 10_080, remainingPercent: 42, previousRemainingPercent: 45,
+      lastChangeAt: new Date(NOW - 60_000).toISOString(), resetsAt: Math.floor((NOW + 86_400_000) / 1_000),
+      usedPercent: 58, lastUsageRatePerHour: 2,
+    }],
+  }, { nowMs: NOW });
+  const status = renderSystemStatus({ gateway: { state: 'ready' }, index: { count: 1 } });
+  const help = renderHelp();
+
+  for (const rendered of [list, detail, search]) {
+    assert.match(rendered, /\*\*项目：\*\*/u);
+    assert.match(rendered, /\*\*任务：\*\*/u);
+    assert.match(rendered, /\*\*状态：\*\*/u);
+    assert.equal(rendered.includes('@everyone'), false);
+    assert.equal(rendered.includes('\n# 任务'), false);
+  }
+  for (const label of ['额度', '距上次变化', '距下次更新还有']) {
+    assert.match(quota, new RegExp(`\\*\\*${label}：\\*\\*`, 'u'));
+  }
+  for (const label of ['项目', '任务', '内容', '状态']) {
+    assert.match(queue, new RegExp(`\\*\\*${label}：\\*\\*`, 'u'));
+  }
+  assert.equal(queue.includes('@everyone'), false);
+  for (const label of ['Gateway', '任务索引', '继续队列', '最近错误类别']) {
+    assert.match(status, new RegExp(`\\*\\*${label}：\\*\\*`, 'u'));
+  }
+  assert.match(help, /^# Codex Discord 命令帮助/mu);
+  assert.match(help, /\*\*\/任务列表\*\*/u);
 });
 
 test('quota renderer uses the persisted acceleration when no previous rate sample remains', () => {

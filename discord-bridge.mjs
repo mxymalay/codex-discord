@@ -49,12 +49,14 @@ import {
   createNewTaskOnce,
   createProjectCatalog,
   listCodexProjects,
+  recordTaskCreationReceiptOutcome,
   recoverInterruptedTaskCreations,
 } from './discord-task-create-lib.mjs';
 import { probeTemporaryAtomicWrite } from './discord-health-lib.mjs';
 import {
   dispatchNotificationViaPowerShell,
   initializeRolloutWatcherState,
+  pollDiscordOriginEvents,
   pollRolloutCompletions,
   readRolloutWatcherState,
   writeRolloutWatcherState,
@@ -412,11 +414,11 @@ export function createBridgeApplication(dependencies = {}) {
       try {
         await prepare(false);
         await registerAndVerify();
-        context.taskIndex = await dependencies.loadTaskIndex(context);
-        recordActivity('lastIndexUpdateAt');
         context.inboxState = await dependencies.loadInboxState(context);
         await dependencies.recoverTaskCreations(context);
         context.projectCatalog = await dependencies.warmProjectCatalog(context);
+        context.taskIndex = await dependencies.loadTaskIndex(context);
+        recordActivity('lastIndexUpdateAt');
         context.interactionHandler = await dependencies.createInteractionHandler(context);
         context.gateway = await dependencies.startGateway(context);
         context.setGatewayStatus(context.gateway?.getStatus?.() ?? { state: 'connecting' });
@@ -842,6 +844,7 @@ export async function pollChannel({
           cwd: accepted.mapping.cwd,
           text: accepted.text,
           channelId: accepted.channelId,
+          guildId: config.discordGuildId,
           replyToMessageId: accepted.messageId,
         });
         const outcome = await continueRequest({ token, config, state, request });
@@ -914,6 +917,8 @@ export function createProductionBridgeDependencies({
       messageMapPath: mappingPath,
       previousIndex,
       discordWorktreeRoot: context.config.discordWorktreeRoot,
+      projects: context.projectCatalog?.snapshot?.() ?? [],
+      createdTasksByInteraction: context.inboxState?.createdTasksByInteraction ?? {},
       nowMs,
     });
     const stableSnapshot = structuredClone(rebuilt);
@@ -1051,6 +1056,15 @@ export function createProductionBridgeDependencies({
           }
           return result;
         },
+        recordCreationReceiptOutcome: (interactionId, outcome) => recordTaskCreationReceiptOutcome({
+          state: context.inboxState,
+          interactionId,
+          status: outcome?.status,
+          messageId: outcome?.messageId,
+          errorCategory: outcome?.errorCategory,
+          now: new Date(),
+          persistState: persistInboxStateImpl,
+        }),
         readTaskDetail,
         searchTasks,
         getQuotaState: readQuota,
@@ -1128,6 +1142,7 @@ export function createProductionBridgeDependencies({
         healthDependencies,
         respond: (body, interaction) => context.trackDiscordRest(() => rest.callback(interaction, body)),
         editOriginal: (body, interaction) => context.trackDiscordRest(() => rest.editOriginal(interaction, body)),
+        followup: (body, interaction) => context.trackDiscordRest(() => rest.followup(interaction, body)),
       });
       return (interaction) => router.handle(interaction);
     },
@@ -1174,9 +1189,24 @@ export function createProductionBridgeDependencies({
         do {
           const progressBefore = rolloutProgressFingerprint(rolloutState);
           try {
+            if (!context.inboxReadOnly) {
+              try {
+                await pollDiscordOriginEvents({
+                  sessionsRoot,
+                  inboxState: state,
+                  persistInboxState: persistInboxStateImpl,
+                  dispatchMessage: trackedReply,
+                });
+              } catch {
+                context.setLatestErrorCategory('origin-progress-failed');
+                await log('origin-progress-failed');
+              }
+            }
             await pollRolloutCompletions({
               sessionsRoot,
               state: rolloutState,
+              inboxState: context.inboxReadOnly ? undefined : state,
+              persistInboxState: context.inboxReadOnly ? undefined : persistInboxStateImpl,
               dispatchNotification: async (notification) => {
                 await dispatchNotificationViaPowerShell({
                   notification,

@@ -344,7 +344,7 @@ function displayText(value, fallback, maximum = 80) {
 }
 
 function metadataText(value, fallback = '未知', maximum = 80) {
-  const singleLine = text(value, fallback).replace(/\s+/gu, ' ');
+  const singleLine = text(value, fallback).replace(/@/gu, '＠').replace(/\s+/gu, ' ');
   const escaped = singleLine.replace(/([\\`*_{}\[\]()#+.!|>~-])/gu, '\\$1');
   return escaped.length <= maximum ? escaped : `${escaped.slice(0, Math.max(0, maximum - 1))}…`;
 }
@@ -416,8 +416,9 @@ export function renderTaskList(tasks, { status = '全部' } = {}) {
   return [
     `## 最近任务（${metadataText(desired, '全部')}）`,
     ...values.map((item, index) => [
-      `${index + 1}. **${metadataText(item?.projectName, '无项目')} / ${metadataText(item?.taskName, '未命名任务')}**`,
-      `   状态：${metadataText(statusLabel(item?.status))}｜最后活动：${formatTimestamp(item?.lastActivityAt)}｜运行时间：${formatDuration(item?.runtimeMs)}`,
+      `${index + 1}. **项目：** ${metadataText(item?.projectName, '无项目')}`,
+      `   **任务：** ${metadataText(item?.taskName, '未命名任务')}`,
+      `   **状态：** ${metadataText(statusLabel(item?.status))}｜**最后活动：** ${formatTimestamp(item?.lastActivityAt)}｜**运行时间：** ${formatDuration(item?.runtimeMs)}`,
     ].join('\n')),
   ].join('\n');
 }
@@ -466,9 +467,10 @@ function continuationQueueView(items, taskIndex = null) {
       const taskName = item?.taskName ?? task?.taskName ?? `任务 …${String(item?.threadId ?? '').slice(-8)}`;
       const source = item?.source === 'reply' ? '通知回复' : 'Slash 命令';
       return [
-        `${index + 1}. **${metadataText(projectName, '无项目')} / ${metadataText(taskName, '未命名任务')}**（…${metadataText(String(item?.queueId ?? '').slice(-8), '未知', 16)}）`,
-        `   内容：${metadataText(continuationSummaryText(item?.summary), '（无可用摘要）', 140)}`,
-        `   来源：${source}｜加入：${formatTimestamp(item?.createdAt ?? item?.queuedAt)}｜最后尝试：${formatTimestamp(item?.lastAttemptAt)}｜状态：${continuationStatusLabel(item?.status)}`,
+        `${index + 1}. **项目：** ${metadataText(projectName, '无项目')}`,
+        `   **任务：** ${metadataText(taskName, '未命名任务')}｜**队列编号：** …${metadataText(String(item?.queueId ?? '').slice(-8), '未知', 16)}`,
+        `   **内容：** ${metadataText(continuationSummaryText(item?.summary), '（无可用摘要）', 140)}`,
+        `   **来源：** ${source}｜**加入：** ${formatTimestamp(item?.createdAt ?? item?.queuedAt)}｜**最后尝试：** ${formatTimestamp(item?.lastAttemptAt)}｜**状态：** ${continuationStatusLabel(item?.status)}`,
       ].join('\n');
     };
   const displayed = [];
@@ -496,12 +498,13 @@ export function renderTaskDetail(detail) {
   const resultText = text(detail.resultText, detail.contentAvailable === false ? '内容暂不可用，请稍后重试。' : '（暂无结果）');
   return [
     `# ${metadataText(detail.taskName, '未命名任务', 200)}`,
-    `项目：${metadataText(detail.projectName, '无项目', 200)}`,
-    `状态：${metadataText(statusLabel(detail.status), '未知', 100)}`,
-    `任务 ID：…${metadataText(text(detail.threadId).slice(-8), '未知', 16)}`,
-    `开始时间：${formatTimestamp(detail.startedAt ?? detail.createdAt)}`,
-    `最后活动：${formatTimestamp(detail.lastActivityAt)}`,
-    `运行时间：${formatDuration(detail.runtimeMs)}`,
+    `**项目：** ${metadataText(detail.projectName, '无项目', 200)}`,
+    `**任务：** ${metadataText(detail.taskName, '未命名任务', 200)}`,
+    `**状态：** ${metadataText(statusLabel(detail.status), '未知', 100)}`,
+    `**任务 ID：** …${metadataText(text(detail.threadId).slice(-8), '未知', 16)}`,
+    `**开始时间：** ${formatTimestamp(detail.startedAt ?? detail.createdAt)}`,
+    `**最后活动：** ${formatTimestamp(detail.lastActivityAt)}`,
+    `**运行时间：** ${formatDuration(detail.runtimeMs)}`,
     '',
     '## 原始任务',
     taskText,
@@ -516,8 +519,11 @@ export function renderSearchResults(results, keyword) {
   if (!values.length) return `没有找到与“${metadataText(keyword, '', 100)}”匹配的主任务。`;
   return [
     `## 搜索结果：${metadataText(keyword, '', 100)}`,
-    ...values.map((item, index) =>
-      `${index + 1}. **${metadataText(item?.projectName, '无项目')} / ${metadataText(item?.taskName, '未命名任务')}**｜${metadataText(statusLabel(item?.status))}｜${formatTimestamp(item?.lastActivityAt)}`),
+    ...values.map((item, index) => [
+      `${index + 1}. **项目：** ${metadataText(item?.projectName, '无项目')}`,
+      `   **任务：** ${metadataText(item?.taskName, '未命名任务')}`,
+      `   **状态：** ${metadataText(statusLabel(item?.status))}｜**最后活动：** ${formatTimestamp(item?.lastActivityAt)}`,
+    ].join('\n')),
   ].join('\n');
 }
 
@@ -581,19 +587,21 @@ export function renderQuota(state, { nowMs = Date.now() } = {}) {
       trend = acceleration > 0 ? '这次使用速度变得更快！' : '这次使用速度变得更慢！';
     }
   }
-  const transition = previous === null ? `当前剩余：${percent(remaining)}%` : `额度：${percent(previous)}% → ${percent(remaining)}%`;
+  const transition = previous === null
+    ? `**额度：** 当前剩余 ${percent(remaining)}%`
+    : `**额度：** ${percent(previous)}% → ${percent(remaining)}%`;
   const resetText = Number.isFinite(resetMs) && resetMs > Number(nowMs)
     ? formatDuration(resetMs - Number(nowMs))
     : '未知或已经到期';
   return [
     '## Codex 周额度',
     transition,
-    `距上次变化：${Number.isFinite(lastChangeMs) ? formatDuration(Math.max(0, Number(nowMs) - lastChangeMs)) : '未知'}`,
-    trend,
-    `距下次更新还有：${resetText}`,
-    `如果以当前速度连续，${exhaustion(remaining, currentRate, resetMs, observedMs)}`,
-    `如果以重置至今平均速度，${exhaustion(remaining, averageRate, resetMs, observedMs)}`,
-    `快照时间：${formatTimestamp(state.observedAt)}${age > 15 * 60_000 ? '（数据已过期）' : ''}`,
+    `**距上次变化：** ${Number.isFinite(lastChangeMs) ? formatDuration(Math.max(0, Number(nowMs) - lastChangeMs)) : '未知'}`,
+    `**使用速度：** ${trend}`,
+    `**距下次更新还有：** ${resetText}`,
+    `**按当前速度：** ${exhaustion(remaining, currentRate, resetMs, observedMs)}`,
+    `**按重置至今平均速度：** ${exhaustion(remaining, averageRate, resetMs, observedMs)}`,
+    `**快照时间：** ${formatTimestamp(state.observedAt)}${age > 15 * 60_000 ? '（数据已过期）' : ''}`,
   ].join('\n');
 }
 
@@ -614,17 +622,17 @@ export function renderSystemStatus(status = {}) {
   const category = safeCategory(status.latestErrorCategory ?? status.gateway?.lastError ?? status.rollout?.lastError);
   return [
     '## 系统状态',
-    `Gateway：${stateName(status.gateway)}`,
-    `Discord REST：${stateName(status.discordRest)}`,
-    `通知监听：${stateName(status.notificationListener)}｜最近成功：${formatTimestamp(status.notificationListener?.lastSuccessAt)}`,
-    `完成补发：${stateName(status.rollout)}｜最近推进：${formatTimestamp(status.rollout?.lastProgressAt)}`,
-    `任务索引：${finiteNumber(index.count) ?? 0} 项｜生成时间：${formatTimestamp(index.generatedAt)}`,
-    `继续队列：${finiteNumber(status.queueCount) ?? 0} 项`,
-    `额度快照：${formatTimestamp(quota.observedAt)}`,
-    `命令注册：${formatTimestamp(timestamps.lastRegistrationAt)}｜索引更新：${formatTimestamp(timestamps.lastIndexUpdateAt)}`,
-    `Gateway 事件：${formatTimestamp(timestamps.lastGatewayEventAt)}｜rollout 推进：${formatTimestamp(timestamps.lastRolloutProgressAt)}`,
-    `通知发送：${formatTimestamp(timestamps.lastNotificationSentAt)}｜任务创建：${formatTimestamp(timestamps.lastTaskCreationAt)}｜队列重试：${formatTimestamp(timestamps.lastQueueRetryAt)}`,
-    `最近错误类别：${category}`,
+    `**Gateway：** ${stateName(status.gateway)}`,
+    `**Discord REST：** ${stateName(status.discordRest)}`,
+    `**通知监听：** ${stateName(status.notificationListener)}｜**最近成功：** ${formatTimestamp(status.notificationListener?.lastSuccessAt)}`,
+    `**完成补发：** ${stateName(status.rollout)}｜**最近推进：** ${formatTimestamp(status.rollout?.lastProgressAt)}`,
+    `**任务索引：** ${finiteNumber(index.count) ?? 0} 项｜**生成时间：** ${formatTimestamp(index.generatedAt)}`,
+    `**继续队列：** ${finiteNumber(status.queueCount) ?? 0} 项`,
+    `**额度快照：** ${formatTimestamp(quota.observedAt)}`,
+    `**命令注册：** ${formatTimestamp(timestamps.lastRegistrationAt)}｜**索引更新：** ${formatTimestamp(timestamps.lastIndexUpdateAt)}`,
+    `**Gateway 事件：** ${formatTimestamp(timestamps.lastGatewayEventAt)}｜**rollout 推进：** ${formatTimestamp(timestamps.lastRolloutProgressAt)}`,
+    `**通知发送：** ${formatTimestamp(timestamps.lastNotificationSentAt)}｜**任务创建：** ${formatTimestamp(timestamps.lastTaskCreationAt)}｜**队列重试：** ${formatTimestamp(timestamps.lastQueueRetryAt)}`,
+    `**最近错误类别：** ${category}`,
   ].join('\n');
 }
 
@@ -644,7 +652,7 @@ export function renderHelp() {
   };
   return [
     '# Codex Discord 命令帮助',
-    ...COMMAND_NAMES.map((name) => `- /${name} — ${descriptions[name]}`),
+    ...COMMAND_NAMES.map((name) => `- **/${name}** — ${descriptions[name]}`),
     '',
     '所有消息结果仅调用者可见，并且不会触发 Discord mentions。',
     '电脑或 Bot 离线时命令不可执行；已有本地队列会在电脑恢复并登录后继续处理。',
@@ -665,6 +673,10 @@ function userId(interaction) {
 
 function guildId(interaction) {
   return String(interaction?.guild_id ?? '');
+}
+
+function channelId(interaction) {
+  return String(interaction?.channel_id ?? '');
 }
 
 function nowValue(dependencies) {
@@ -863,9 +875,9 @@ function creationReceipt(result, selection) {
   const mode = result?.workspace?.mode === 'worktree' ? 'Git 隔离工作树' : '保存目录';
   let receipt;
   if (result?.status === 'first-turn-failed') {
-    receipt = `任务线程已保留，但首轮启动失败。\n项目：${projectName}\n任务：${taskName}\n任务 ID：…${suffix}\n运行方式：${mode}\n工作目录：${safeWorkspaceName(result?.workspace)}`;
+    receipt = `## 任务创建结果\n任务线程已保留，但首轮启动失败。\n**项目：** ${projectName}\n**任务：** ${taskName}\n**状态：** 首轮启动失败\n**任务 ID：** …${suffix}\n**运行方式：** ${mode}\n**工作目录：** ${safeWorkspaceName(result?.workspace)}`;
   } else {
-    receipt = `任务创建成功。\n项目：${projectName}\n任务：${taskName}\n任务 ID：…${suffix}\n运行方式：${mode}\n工作目录：${safeWorkspaceName(result?.workspace)}`;
+    receipt = `## 任务创建结果\n任务创建成功。\n**项目：** ${projectName}\n**任务：** ${taskName}\n**状态：** 正在运行\n**任务 ID：** …${suffix}\n**运行方式：** ${mode}\n**工作目录：** ${safeWorkspaceName(result?.workspace)}`;
   }
   return receipt.length <= 2_000 ? receipt : `${receipt.slice(0, 1_999)}…`;
 }
@@ -917,6 +929,41 @@ async function editOriginal(dependencies, interaction, payload) {
   const body = mentionSafePayload(payload);
   await dependencies.editOriginal?.(body, interaction);
   return body;
+}
+
+async function recordCreationReceiptOutcome(dependencies, interaction, outcome) {
+  try {
+    await dependencies.recordCreationReceiptOutcome?.(String(interaction?.id ?? ''), outcome);
+  } catch {
+    // Receipt delivery already happened (or already failed); persistence cannot safely be retried here.
+  }
+}
+
+async function deliverCreationReceipt(dependencies, interaction, receipt) {
+  const body = mentionSafePayload({ content: receipt });
+  try {
+    const message = await dependencies.editOriginal?.(body, interaction);
+    await recordCreationReceiptOutcome(dependencies, interaction, {
+      status: 'original-edited',
+      ...(message?.id ? { messageId: String(message.id) } : {}),
+    });
+    return body;
+  } catch {
+    const fallback = privatePayload({ content: receipt });
+    try {
+      if (typeof dependencies.followup !== 'function') throw new Error('Follow-up delivery unavailable');
+      const message = await dependencies.followup(fallback, interaction);
+      await recordCreationReceiptOutcome(dependencies, interaction, {
+        status: 'followup-sent',
+        ...(message?.id ? { messageId: String(message.id) } : {}),
+      });
+      return fallback;
+    } catch {
+      const failed = { status: 'failed', errorCategory: 'creation-receipt-delivery-failed' };
+      await recordCreationReceiptOutcome(dependencies, interaction, failed);
+      return privatePayload({ content: '任务已处理，但 Discord 回执发送失败；请使用 /任务列表 查询结果。' });
+    }
+  }
 }
 
 async function defer(dependencies, interaction) {
@@ -1479,15 +1526,15 @@ function modalStateError(dependencies, interaction, state, kind = 'new-task') {
 
 function continuationReceipt(result) {
   if (result?.status === 'started') {
-    return `已开始继续执行。${result?.turnId ? `本轮 ID：…${String(result.turnId).slice(-8)}` : ''}`;
+    return `## 继续任务结果\n**状态：** 已开始继续执行${result?.turnId ? `\n**本轮 ID：** …${String(result.turnId).slice(-8)}` : ''}`;
   }
   if (result?.status === 'queued') {
-    return `已排队；目标任务释放后会自动送达。队列编号：…${String(result?.queueId ?? '').slice(-8)}`;
+    return `## 继续任务结果\n**状态：** 已排队\n目标任务释放后会自动送达。\n**队列编号：** …${String(result?.queueId ?? '').slice(-8)}`;
   }
   if (result?.status === 'uncertain') {
-    return 'Codex 启动结果不确定；为避免重复执行不会自动重试，请打开原任务确认实际状态。';
+    return '## 继续任务结果\n**状态：** 启动结果不确定\n为避免重复执行不会自动重试，请打开原任务确认实际状态。';
   }
-  return '没有成功续接原 Codex 任务；不会新建任务，请稍后重试。';
+  return '## 继续任务结果\n**状态：** 续接失败\n没有成功续接原 Codex 任务；不会新建任务，请稍后重试。';
 }
 
 async function handleContinueModal(dependencies, submissions, interaction, stateId, state) {
@@ -1518,6 +1565,10 @@ async function handleContinueModal(dependencies, submissions, interaction, state
           threadId: record.threadId,
           cwd: record.worktreePath,
           text: continuationText,
+          guildId: guildId(interaction),
+          channelId: channelId(interaction),
+          projectId: record.projectId,
+          projectName: record.projectName,
           createdAt: new Date(nowValue(dependencies)).toISOString(),
         });
       } catch {
@@ -1620,6 +1671,13 @@ async function handleModal(dependencies, submissions, interaction) {
           fileSystem: dependencies.fileSystem,
           persistState: dependencies.persistCreationState,
           now: new Date(nowValue(dependencies)),
+          discordOrigin: {
+            guildId: guildId(interaction),
+            channelId: channelId(interaction),
+            source: 'new-task',
+            projectId: selection.projectId,
+            projectName: selection.projectName,
+          },
         });
       } catch {
         return '任务创建失败；未创建可继续的任务。请检查系统状态后重试。';
@@ -1632,7 +1690,7 @@ async function handleModal(dependencies, submissions, interaction) {
     promise.then((receipt) => { submission.receipt = receipt; }).catch(() => {});
   }
   const receipt = submission.receipt ?? await submission.promise;
-  return editOriginal(dependencies, interaction, { content: receipt });
+  return deliverCreationReceipt(dependencies, interaction, receipt);
 }
 
 function componentStateError(dependencies, interaction, state) {

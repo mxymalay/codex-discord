@@ -34,11 +34,13 @@ import {
   listContinuations,
   listRetryableContinuations,
   markContinuationDelivered,
+  persistDiscordTurnOrigin,
   migrateInboxState,
   migrateLegacyPendingReplies,
   recordInboxMessage,
   recoverContinuationAttempts,
   removePendingReply,
+  resolveDiscordOrigin,
   resolveCodexExecutable,
   resumeCodexThread,
   writeJsonAtomic,
@@ -82,7 +84,10 @@ test('production interaction wiring refreshes the shared index and uses only bou
   const rebuilt = { version: 1, generatedAt: '2026-09-01T08:00:00.000Z', tasks: [{ threadId: 'fresh-root' }] };
   const production = bridgeModule.createProductionBridgeDependencies({
     runOnce: true,
-    buildTaskIndexImpl: async (options) => { events.push(['build', options.previousIndex]); return rebuilt; },
+    buildTaskIndexImpl: async (options) => {
+      events.push(['build', options.previousIndex, options.projects, options.createdTasksByInteraction]);
+      return rebuilt;
+    },
     writeTaskIndexAtomicImpl: async (_targetPath, index) => { events.push(['write', structuredClone(index)]); },
     runCodexControlActionImpl: async (options) => {
       controlCalls.push(options);
@@ -109,7 +114,7 @@ test('production interaction wiring refreshes the shared index and uses only bou
     taskIndex: originalIndex,
     inboxState: createEmptyInboxState(),
     inboxReadOnly: false,
-    projectCatalog: {},
+    projectCatalog: { snapshot: () => [{ id: 'project-1', name: 'POS', roots: ['C:\\saved\\POS'] }] },
     trackDiscordRest: (operation) => operation(),
     trackActiveResource: (resource) => resource,
     getSystemStatus: () => ({}),
@@ -125,6 +130,8 @@ test('production interaction wiring refreshes the shared index and uses only bou
   assert.deepEqual(refreshed.tasks, [{ threadId: 'fresh-root' }]);
   assert.deepEqual(events.map((event) => event[0]), ['build', 'write', 'activity']);
   assert.equal(events[0][1], originalIndex);
+  assert.deepEqual(events[0][2], [{ id: 'project-1', name: 'POS', roots: ['C:\\saved\\POS'] }]);
+  assert.strictEqual(events[0][3], context.inboxState.createdTasksByInteraction);
 
   assert.deepEqual(await interactionDependencies.getCodexControlStatus(), { ok: true, desktop: { running: true } });
   assert.deepEqual(await interactionDependencies.stopCodexDesktop(), { ok: true, stoppedProcessCount: 1 });
@@ -362,7 +369,10 @@ function makeBridgeDependencies(events, overrides = {}) {
     async loadTaskIndex() { events.push('index-ready'); return { version: 1, generatedAt: '2026-09-01T00:00:00.000Z', tasks: [] }; },
     async loadInboxState() { return createEmptyInboxState(); },
     async recoverTaskCreations() { events.push('task-creation-recovered'); },
-    async warmProjectCatalog() { events.push('project-catalog-ready'); return { status: () => ({ warmed: true }) }; },
+    async warmProjectCatalog() {
+      events.push('project-catalog-ready');
+      return { status: () => ({ warmed: true }), snapshot: () => [] };
+    },
     createInteractionHandler() { return async () => {}; },
     async startGateway() { events.push('gateway-started'); return gateway; },
     async startLegacyPollers() {
@@ -383,8 +393,8 @@ test('bridge composition starts registration, index and gateway without disablin
   await app.start();
 
   assert.deepEqual(events.filter((event) => event !== 'executables-resolved').slice(0, 6), [
-    'commands-registered', 'index-ready', 'task-creation-recovered',
-    'project-catalog-ready', 'gateway-started', 'legacy-pollers-started',
+    'commands-registered', 'task-creation-recovered', 'project-catalog-ready',
+    'index-ready', 'gateway-started', 'legacy-pollers-started',
   ]);
   const status = app.getSystemStatus();
   assert.equal(status.index.count, 0);
@@ -1499,6 +1509,27 @@ test('Discord REST requests always send the required Bot user agent', async () =
   assert.match(observedHeaders['User-Agent'], /^DiscordBot \(.+, \d+\.\d+\.\d+\)$/);
 });
 
+test('source-channel progress sends deterministic Discord nonce without a fake reply reference', async () => {
+  const requests = [];
+  await bridgeLib.sendDiscordReply({
+    token: 'test-token',
+    channelId: '777777777777777777',
+    content: '### 任务进度\n处理中',
+    nonce: '123456789012345678',
+    enforceNonce: true,
+    fetchImpl: async (_url, options) => {
+      requests.push(JSON.parse(options.body));
+      return { ok: true, status: 200, json: async () => ({ id: '888888888888888888' }) };
+    },
+  });
+  assert.deepEqual(requests, [{
+    content: '### 任务进度\n处理中',
+    allowed_mentions: { parse: [] },
+    nonce: '123456789012345678',
+    enforce_nonce: true,
+  }]);
+});
+
 test('queues an active-writer reply with encrypted text and no plaintext at rest', () => {
   const state = createEmptyInboxState();
   const accepted = classifyReply(makeMessage(), config, mapping, state);
@@ -1561,6 +1592,133 @@ test('migrates the reply queue and stores slash continuations without tokens or 
   assert.equal(listContinuations(state).length, 2);
   assert.equal(state.createdTasksByInteraction['create-1'].threadId, 'root-new');
   assert.equal(Object.hasOwn(state, 'pendingReplies'), false);
+});
+
+test('persists bounded Discord turn origins and resolves only an exact trusted binding', async () => {
+  const state = createEmptyInboxState();
+  const snapshots = [];
+  await persistDiscordTurnOrigin({
+    state,
+    persistState: async (snapshot) => { snapshots.push(structuredClone(snapshot)); },
+    origin: {
+      turnId: 'turn-origin-1',
+      threadId: '11111111-1111-4111-8111-111111111111',
+      guildId: '222222222222222222',
+      channelId: '777777777777777777',
+      source: 'slash',
+      createdAt: '2026-09-01T12:00:00.000Z',
+      projectId: 'project-1',
+      projectName: '项目 @everyone **unsafe**',
+    },
+  });
+
+  assert.deepEqual(state.discordTurnOrigins['turn-origin-1'], {
+    threadId: '11111111-1111-4111-8111-111111111111',
+    guildId: '222222222222222222',
+    channelId: '777777777777777777',
+    source: 'slash',
+    createdAt: '2026-09-01T12:00:00.000Z',
+    projectId: 'project-1',
+    projectName: '项目 @everyone **unsafe**',
+    rolloutCursor: 0,
+    deliveredEventIds: [],
+    deliveryState: 'pending',
+  });
+  assert.equal(JSON.stringify(snapshots).includes('interaction-token'), false);
+
+  const exact = {
+    type: 'agent-turn-complete',
+    'turn-id': 'turn-origin-1',
+    'thread-id': '11111111-1111-4111-8111-111111111111',
+    'discord-guild-id': '222222222222222222',
+  };
+  assert.deepEqual(resolveDiscordOrigin(exact, state), state.discordTurnOrigins['turn-origin-1']);
+  const nativeWithoutGuild = { ...exact };
+  delete nativeWithoutGuild['discord-guild-id'];
+  assert.deepEqual(resolveDiscordOrigin(nativeWithoutGuild, state), state.discordTurnOrigins['turn-origin-1']);
+  assert.equal(resolveDiscordOrigin({ ...exact, 'thread-id': 'other-thread' }, state), null);
+  assert.equal(resolveDiscordOrigin({ ...exact, 'discord-guild-id': '999999999999999999' }, state), null);
+  assert.equal(resolveDiscordOrigin({ ...exact, 'discord-guild-id': 'not-a-snowflake' }, state), null);
+  state.discordTurnOrigins['turn-origin-1'].channelId = 'not-a-snowflake';
+  assert.equal(resolveDiscordOrigin(exact, state), null);
+});
+
+test('origin capacity rejects overflow when every retained turn is still pending', async () => {
+  const state = createEmptyInboxState();
+  for (let index = 0; index < 2_000; index += 1) {
+    state.discordTurnOrigins[`turn-live-${index}`] = {
+      threadId: `root-live-${index}`,
+      guildId: '222222222222222222', channelId: '777777777777777777', source: 'slash',
+      createdAt: '2026-09-01T00:00:00.000Z', rolloutCursor: 0, deliveredEventIds: [], deliveryState: 'pending',
+    };
+  }
+  await assert.rejects(() => persistDiscordTurnOrigin({
+    state,
+    persistState: async () => {},
+    origin: {
+      turnId: 'turn-overflow', threadId: 'root-overflow',
+      guildId: '222222222222222222', channelId: '777777777777777777', source: 'slash',
+      createdAt: '2026-09-02T00:00:00.000Z',
+    },
+  }), /persistence failed|capacity/i);
+  assert.equal(Object.hasOwn(state.discordTurnOrigins, 'turn-overflow'), false);
+  assert.equal(Object.keys(state.discordTurnOrigins).length, 2_000);
+});
+
+test('origin migration bounds terminal history and per-turn dedupe without deleting pending turns', () => {
+  const discordTurnOrigins = Object.fromEntries(Array.from({ length: 2_005 }, (_, index) => [
+    `turn-old-${index}`,
+    {
+      threadId: `root-${index}`,
+      guildId: '222222222222222222',
+      channelId: '777777777777777777',
+      source: 'new-task',
+      createdAt: new Date(Date.UTC(2026, 7, 1, 0, 0, index)).toISOString(),
+      rolloutCursor: index,
+      deliveredEventIds: Array.from({ length: 140 }, (__, eventIndex) => `event-${eventIndex}`),
+      deliveryState: 'terminal-delivered',
+      deliveredAt: new Date(Date.UTC(2026, 7, 2, 0, 0, index)).toISOString(),
+    },
+  ]));
+  discordTurnOrigins['turn-live'] = {
+    threadId: 'root-live', guildId: '222222222222222222', channelId: '777777777777777777',
+    source: 'reply', createdAt: '2026-09-01T00:00:00.000Z', rolloutCursor: 0,
+    deliveredEventIds: [], deliveryState: 'pending',
+  };
+
+  const state = migrateInboxState({ discordTurnOrigins });
+  assert.equal(Object.keys(state.discordTurnOrigins).length, 2_000);
+  assert.equal(Object.hasOwn(state.discordTurnOrigins, 'turn-live'), true);
+  assert.equal(Object.hasOwn(state.discordTurnOrigins, 'turn-old-0'), false);
+  assert.equal(state.discordTurnOrigins['turn-old-2004'].deliveredEventIds.length, 128);
+});
+
+test('a successful slash continuation commits its origin before returning started', async () => {
+  const state = createEmptyInboxState();
+  const snapshots = [];
+  const request = createContinuationRequest({
+    source: 'slash', requestId: '1544329941024374935',
+    threadId: '11111111-1111-4111-8111-111111111111', text: '继续处理',
+    guildId: '222222222222222222', channelId: '777777777777777777',
+    projectId: 'project-1', projectName: '项目一',
+    createdAt: '2026-09-01T20:55:55.000Z',
+  });
+
+  const result = await dispatchContinuation(request, {
+    state,
+    now: () => '2026-09-01T20:55:56.000Z',
+    encryptText: async () => 'opaque-ciphertext',
+    persistState: async (snapshot) => { snapshots.push(structuredClone(snapshot)); },
+    resumeCodexThread: async () => ({
+      turnId: 'turn-exact-origin', completion: Promise.resolve({ turn: { status: 'completed' } }),
+    }),
+  });
+
+  assert.equal(result.status, 'started');
+  assert.equal(state.discordTurnOrigins['turn-exact-origin'].channelId, '777777777777777777');
+  assert.equal(state.discordTurnOrigins['turn-exact-origin'].threadId, request.threadId);
+  assert.equal(state.discordTurnOrigins['turn-exact-origin'].projectName, '项目一');
+  assert.equal(snapshots.at(-1).discordTurnOrigins['turn-exact-origin'].deliveryState, 'pending');
 });
 
 test('deduplicates continuation request ids, rejects blank text, and bounds interaction records', () => {
@@ -2312,7 +2470,7 @@ test('bridge retry candidates include queued work and confirmed replies awaiting
   );
 });
 
-test('a confirmed turn stays started when confirmation persistence, acknowledgement, or tracking fails', async () => {
+test('a confirmed external turn reports uncertain when its origin confirmation cannot be persisted', async () => {
   const state = createEmptyInboxState();
   const events = [];
   let persistCount = 0;
@@ -2334,7 +2492,7 @@ test('a confirmed turn stays started when confirmation persistence, acknowledgem
     sendReply: async () => { events.push('ack'); throw new Error('private token'); },
     trackCompletion: () => { events.push('track'); throw new Error('private tracker'); },
   });
-  assert.equal(result.status, 'started');
+  assert.equal(result.status, 'uncertain');
   assert.equal(result.turnId, 'turn-confirmed');
   assert.equal(result.reason, 'state-persist-failed');
   assert.equal(listContinuations(state)[0].status, 'start-uncertain');
@@ -2367,7 +2525,7 @@ test('restart preserves an uncertain external start after confirmation persisten
       return { turnId: 'turn-uncertain', completion: Promise.resolve({ turn: { status: 'completed' } }) };
     },
   });
-  assert.equal(first.status, 'started');
+  assert.equal(first.status, 'uncertain');
   assert.equal(first.reason, 'state-persist-failed');
   assert.equal(listContinuations(persistedState)[0].status, 'start-submitted');
 

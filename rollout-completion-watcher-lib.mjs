@@ -1,7 +1,13 @@
 import { spawn } from 'node:child_process';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+
+import {
+  advanceDiscordTurnOrigin,
+  prepareDiscordOriginTerminalDelivery,
+  resolveDiscordOrigin,
+} from './discord-bridge-lib.mjs';
 
 const stateVersion = 2;
 const maxMessageChars = 50_000;
@@ -9,6 +15,9 @@ const maxInputMessages = 12;
 const metadataReadBytes = 512 * 1024;
 const recentTailBytes = 8 * 1024 * 1024;
 const recentContextWindowMs = 24 * 60 * 60 * 1000;
+const maxProgressLineBytes = 256 * 1024;
+const maxProgressChars = 1_400;
+const originPollQueues = new WeakMap();
 
 export function createEmptyRolloutWatcherState() {
   return { version: stateVersion, initialized: false, files: {}, pending: {} };
@@ -35,7 +44,7 @@ export async function readRolloutWatcherState(statePath, { sessionsRoot } = {}) 
           try { entries = parseLines(Buffer.from(await fs.readFile(rolloutPath, 'utf8'))); } catch { continue; }
           const metadata = entries.find((entry) => entry?.type === 'session_meta');
           const complete = entries.find((entry) => entry?.type === 'event_msg' && entry.payload?.type === 'task_complete' && String(entry.payload?.turn_id ?? '') === String(turnId));
-          if (complete && String(metadata?.payload?.id ?? '') === threadId) {
+          if (complete && rootSessionMeta(metadata, threadId)) {
             matches.push(rolloutPath);
           }
         }
@@ -104,6 +113,252 @@ function parseLines(buffer, { dropFirstPartial = false } = {}) {
   });
 }
 
+function parseLinesWithOffsets(buffer) {
+  const entries = [];
+  let start = 0;
+  for (;;) {
+    const newline = buffer.indexOf(0x0a, start);
+    if (newline < 0) break;
+    const end = newline + 1;
+    const raw = buffer.subarray(start, newline > start && buffer[newline - 1] === 0x0d ? newline - 1 : newline);
+    if (raw.length > 0 && raw.length <= maxProgressLineBytes) {
+      try { entries.push({ entry: JSON.parse(raw.toString('utf8')), start, end }); } catch {}
+    }
+    start = end;
+  }
+  return { entries, completeEnd: start };
+}
+
+function rootSessionMeta(entry, threadId) {
+  if (entry?.type !== 'session_meta' || String(entry.payload?.id ?? '') !== String(threadId)) return false;
+  const payload = entry.payload ?? {};
+  const source = String(payload.thread_source ?? '').trim().toLocaleLowerCase();
+  if (source && source !== 'user') return false;
+  if (String(payload.parent_thread_id ?? '').trim()) return false;
+  const sessionId = String(payload.session_id ?? '').trim();
+  if (sessionId && sessionId !== String(threadId)) return false;
+  return !(payload.source && typeof payload.source === 'object' && Object.entries(payload.source).some(
+    ([key, value]) => key.toLocaleLowerCase() === 'subagent' && value != null,
+  ));
+}
+
+function exactMetadataTurn(payload, turnId) {
+  return String(payload?.internal_chat_message_metadata_passthrough?.turn_id ?? '') === String(turnId);
+}
+
+function outputText(payload) {
+  return (Array.isArray(payload?.content) ? payload.content : [])
+    .filter((item) => item?.type === 'output_text' && typeof item?.text === 'string')
+    .map((item) => item.text)
+    .join('\n');
+}
+
+function sanitizeProgressText(value) {
+  let text = String(value ?? '').replace(/\r\n?/gu, '\n');
+  text = text.replace(/```[\s\S]*?```/gu, '[代码内容已省略]');
+  text = text.replace(/```[\s\S]*$/gu, '[代码内容已省略]');
+  text = text.replace(/https:\/\/discord(?:app)?\.com\/api\/webhooks\/[^\s)]+/giu, '[敏感信息已隐藏]');
+  text = text.replace(/\b(?:sk|sess|token)[-_][A-Za-z0-9_-]{8,}\b/giu, '[敏感信息已隐藏]');
+  text = text.replace(/\b(?:api[_-]?key|access[_-]?token|token|secret|password)\b\s*[:=]\s*(?:"[^"\r\n]*"|'[^'\r\n]*'|`[^`\r\n]*`|[^\s"'`]+)/giu, '[敏感信息已隐藏]');
+  text = text.replace(/\b(?:gh[pousr]_[A-Za-z0-9]{16,}|xox[baprs]-[A-Za-z0-9-]{10,})\b/giu, '[敏感信息已隐藏]');
+  text = text.replace(/\b[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{6}\.[A-Za-z0-9_-]{20,}\b/gu, '[敏感信息已隐藏]');
+  const nextSensitiveValue = '(?:[A-Za-z]:[\\\\/]|\\\\\\\\|/(?!/)|(?:api[_-]?key|access[_-]?token|token|secret|password)\\b\\s*[:=]|\\[代码内容已省略\\]|＠)';
+  text = text.replace(new RegExp(`\\b[A-Za-z]:[\\\\/][^\\r\\n]*?(?=\\s+${nextSensitiveValue}|$)`, 'gimu'), '[本机路径]');
+  text = text.replace(new RegExp(`\\\\\\\\[^\\r\\n]*?(?=\\s+${nextSensitiveValue}|$)`, 'gimu'), '[本机路径]');
+  text = text.replace(new RegExp(`(^|[\\s(])/(?!/)[^\\r\\n]*?(?=\\s+${nextSensitiveValue}|$)`, 'gimu'), '$1[本机路径]');
+  text = text.replace(/@/gu, '＠').replace(/^\s*([#>|])/gmu, '\\$1');
+  text = text.replace(/\n{3,}/gu, '\n\n').trim();
+  if (!text) return '';
+  return text.length <= maxProgressChars ? text : `${text.slice(0, maxProgressChars - 1)}…`;
+}
+
+function eventIdentifier({ fingerprint, turnId, kind, lineStart, lineEnd, semantic = '' }) {
+  return createHash('sha256')
+    .update(`${fingerprint}\0${turnId}\0${kind}\0${lineStart}\0${lineEnd}\0${semantic}`, 'utf8')
+    .digest('hex');
+}
+
+function discordNonce(eventId) {
+  return BigInt(`0x${String(eventId).slice(0, 16)}`).toString(10).slice(0, 25);
+}
+
+function toolKind(payload) {
+  const name = String(payload?.name ?? payload?.namespace ?? '').toLocaleLowerCase();
+  if (name.includes('exec') || name.includes('command')) return '命令';
+  if (name.includes('patch') || name.includes('edit')) return '文件修改';
+  if (name.includes('web') || name.includes('search')) return '检索';
+  if (name.includes('image')) return '图像';
+  return '工具';
+}
+
+function coalesceProgressBursts(events) {
+  const coalesced = [];
+  for (const event of events) {
+    const previous = coalesced.at(-1);
+    if (event.kind !== 'commentary' || previous?.kind !== 'commentary') {
+      coalesced.push({ ...event });
+      continue;
+    }
+    previous.end = event.end;
+    if (previous.semantic === event.semantic) continue;
+    const combined = `${previous.semantic}\n\n${event.semantic}`;
+    if (combined.length <= maxProgressChars) {
+      previous.semantic = combined;
+    } else {
+      const marker = '…较早进度已合并…\n';
+      previous.semantic = `${marker}${event.semantic.slice(-(maxProgressChars - marker.length))}`;
+    }
+    previous.content = `### 任务进度\n${previous.semantic}`;
+  }
+  return coalesced;
+}
+
+function extractOriginProgress(lines, origin, fingerprint) {
+  const events = [];
+  let activeTurnId = '';
+  let terminalSeen = false;
+  for (const item of lines) {
+    const { entry, start, end } = item;
+    if (entry?.type === 'event_msg') {
+      const payload = entry.payload ?? {};
+      if (payload.type === 'task_started') {
+        activeTurnId = String(payload.turn_id ?? '');
+        terminalSeen = false;
+        if (activeTurnId === origin.turnId && end > origin.rolloutCursor) {
+          events.push({ kind: 'started', content: '## 任务已开始\n已开始处理本轮任务。', start, end });
+        }
+        continue;
+      }
+      if (payload.type === 'task_complete' && String(payload.turn_id ?? activeTurnId) === origin.turnId) {
+        terminalSeen = true;
+        activeTurnId = '';
+        continue;
+      }
+      if (terminalSeen || activeTurnId !== origin.turnId || end <= origin.rolloutCursor) continue;
+      if (payload.type === 'agent_message' && payload.phase === 'commentary' && typeof payload.message === 'string') {
+        const text = sanitizeProgressText(payload.message);
+        if (text) events.push({ kind: 'commentary', content: `### 任务进度\n${text}`, start, end, semantic: text });
+      } else if (payload.type === 'patch_apply_end' && String(payload.turn_id ?? '') === origin.turnId && String(payload.call_id ?? '').trim()) {
+        const failed = payload.success === false || String(payload.status ?? '').toLocaleLowerCase() === 'failed';
+        events.push({ kind: failed ? 'tool-failed' : 'tool-complete', content: failed ? '🔧 文件修改失败' : '🔧 文件修改已完成', start, end, semantic: String(payload.call_id) });
+      } else if (payload.type === 'item_completed' && String(payload.turn_id ?? '') === origin.turnId) {
+        const itemType = String(payload.item?.type ?? '');
+        if (['SubAgentActivity', 'CollabAgentToolCall'].includes(itemType)) continue;
+        const status = String(payload.item?.status ?? '').toLocaleLowerCase();
+        const failed = status === 'failed' || (itemType === 'CommandExecution' && Number(payload.item?.exit_code) !== 0);
+        if (failed && ['CommandExecution', 'McpToolCall', 'Extension'].includes(itemType)) {
+          events.push({ kind: 'tool-failed', content: '🔧 工具执行失败', start, end, semantic: String(payload.item?.id ?? itemType) });
+        }
+      }
+      continue;
+    }
+    if (entry?.type !== 'response_item' || terminalSeen || activeTurnId !== origin.turnId || end <= origin.rolloutCursor) continue;
+    const payload = entry.payload ?? {};
+    if (!exactMetadataTurn(payload, origin.turnId)) continue;
+    if (payload.type === 'message' && payload.role === 'assistant' && payload.phase === 'commentary') {
+      const text = sanitizeProgressText(outputText(payload));
+      if (text) events.push({ kind: 'commentary', content: `### 任务进度\n${text}`, start, end, semantic: text });
+      continue;
+    }
+    const callId = String(payload.call_id ?? '').trim();
+    if (!callId) continue;
+    if (['custom_tool_call', 'function_call'].includes(payload.type)) {
+      events.push({ kind: 'tool-start', content: `🔧 ${toolKind(payload)}正在执行`, start, end, semantic: callId });
+    } else if (['custom_tool_call_output', 'function_call_output'].includes(payload.type)) {
+      events.push({ kind: 'tool-complete', content: '🔧 工具已完成', start, end, semantic: callId });
+    }
+  }
+  return coalesceProgressBursts(events).map((event) => {
+    const eventId = eventIdentifier({
+      fingerprint, turnId: origin.turnId, kind: event.kind,
+      lineStart: event.start, lineEnd: event.end, semantic: event.semantic,
+    });
+    return { ...event, eventId, nonce: discordNonce(eventId) };
+  });
+}
+
+async function exactOriginRollout(sessionsRoot, origin) {
+  const candidates = [];
+  for (const filePath of await listRolloutFiles(sessionsRoot)) {
+    let bytes;
+    try { bytes = await fs.readFile(filePath); } catch { continue; }
+    const parsed = parseLinesWithOffsets(bytes);
+    const meta = parsed.entries.find(({ entry }) => entry?.type === 'session_meta')?.entry;
+    if (!rootSessionMeta(meta, origin.threadId)) continue;
+    const hasTurn = parsed.entries.some(({ entry }) => entry?.type === 'event_msg' &&
+      entry.payload?.type === 'task_started' && String(entry.payload?.turn_id ?? '') === origin.turnId);
+    if (!hasTurn) continue;
+    const fingerprint = createHash('sha256')
+      .update(`${path.resolve(filePath).toLocaleLowerCase()}\0${JSON.stringify(meta)}`, 'utf8').digest('hex');
+    candidates.push({ filePath, bytes, parsed, fingerprint });
+  }
+  return candidates.length === 1 ? candidates[0] : null;
+}
+
+async function pollDiscordOriginEventsUnlocked({ sessionsRoot, inboxState, persistInboxState, dispatchMessage }) {
+  if (typeof persistInboxState !== 'function' || typeof dispatchMessage !== 'function') {
+    throw new TypeError('Discord origin progress requires persistence and dispatch adapters');
+  }
+  let firstError = null;
+  for (const [turnId, storedOrigin] of Object.entries(inboxState?.discordTurnOrigins ?? {})) {
+    try {
+      if (storedOrigin?.deliveryState === 'terminal-delivered') continue;
+      const origin = { ...storedOrigin, turnId };
+      const rollout = await exactOriginRollout(sessionsRoot, origin);
+      if (!rollout || (origin.rolloutFingerprint && origin.rolloutFingerprint !== rollout.fingerprint) ||
+          Number(origin.rolloutCursor ?? 0) > rollout.bytes.length) continue;
+      const events = extractOriginProgress(rollout.parsed.entries, origin, rollout.fingerprint);
+      for (const event of events) {
+        const current = inboxState.discordTurnOrigins[turnId];
+        if (current.deliveredEventIds.includes(event.eventId)) continue;
+        const response = await dispatchMessage({
+          channelId: current.channelId,
+          content: event.content,
+          kind: event.kind,
+          nonce: event.nonce,
+          enforceNonce: true,
+        });
+        await advanceDiscordTurnOrigin({
+          state: inboxState,
+          persistState: persistInboxState,
+          turnId,
+          rolloutCursor: event.end,
+          eventId: event.eventId,
+          lastMessageId: response?.id,
+          rolloutFingerprint: rollout.fingerprint,
+        });
+      }
+      const current = inboxState.discordTurnOrigins[turnId];
+      if (rollout.parsed.completeEnd > Number(current.rolloutCursor ?? 0)) {
+        await advanceDiscordTurnOrigin({
+          state: inboxState,
+          persistState: persistInboxState,
+          turnId,
+          rolloutCursor: rollout.parsed.completeEnd,
+          rolloutFingerprint: rollout.fingerprint,
+        });
+      }
+    } catch (error) {
+      firstError ??= error;
+    }
+  }
+  if (firstError) throw firstError;
+  return inboxState;
+}
+
+/** Stream only trusted root progress and serialize concurrent polls per inbox state. */
+export async function pollDiscordOriginEvents(options) {
+  const state = options?.inboxState;
+  if (!state || typeof state !== 'object') throw new TypeError('Discord origin inbox state is required');
+  const previous = originPollQueues.get(state) ?? Promise.resolve();
+  const current = previous.catch(() => {}).then(() => pollDiscordOriginEventsUnlocked(options));
+  const tail = current.then(() => undefined, () => undefined);
+  originPollQueues.set(state, tail);
+  try { return await current; } finally {
+    if (originPollQueues.get(state) === tail) originPollQueues.delete(state);
+  }
+}
+
 async function readRange(filePath, start, end) {
   if (end <= start) return Buffer.alloc(0);
   const handle = await fs.open(filePath, 'r');
@@ -125,6 +380,7 @@ function applyEntry(filePath, fileState, entry, pending, { emitCompletions }) {
   if (entry?.type === 'session_meta') {
     fileState.threadId = String(entry.payload?.id ?? fileState.threadId ?? '');
     fileState.cwd = String(entry.payload?.cwd ?? fileState.cwd ?? '');
+    fileState.rootEligible = rootSessionMeta(entry, fileState.threadId);
     return;
   }
   if (entry?.type !== 'event_msg') return;
@@ -136,7 +392,7 @@ function applyEntry(filePath, fileState, entry, pending, { emitCompletions }) {
   if (payload.type !== 'task_complete') return;
 
   const turnId = String(payload.turn_id ?? fileState.activeTurnId ?? '');
-  if (emitCompletions && turnId && fileState.threadId) {
+  if (emitCompletions && fileState.rootEligible === true && turnId && fileState.threadId) {
     pending[turnId] = {
       completedAtMs: Date.parse(String(entry.timestamp ?? '')) || Date.now(),
       lastAttemptAtMs: 0,
@@ -151,7 +407,7 @@ function applyEntry(filePath, fileState, entry, pending, { emitCompletions }) {
 }
 
 async function hydrateExistingFile(filePath, info, nowMs) {
-  const fileState = { offset: info.size, threadId: '', cwd: '', activeTurnId: '' };
+  const fileState = { offset: info.size, threadId: '', cwd: '', activeTurnId: '', rootEligible: false };
   const metadataBuffer = await readRange(filePath, 0, Math.min(info.size, metadataReadBytes));
   for (const entry of parseLines(metadataBuffer)) applyEntry(filePath, fileState, entry, {}, { emitCompletions: false });
 
@@ -163,6 +419,19 @@ async function hydrateExistingFile(filePath, info, nowMs) {
     }
   }
   return fileState;
+}
+
+async function ensureRootEligibility(filePath, fileState, info) {
+  if (typeof fileState.rootEligible === 'boolean') return;
+  const metadataBuffer = await readRange(filePath, 0, Math.min(info.size, metadataReadBytes));
+  const metadata = parseLines(metadataBuffer).find((entry) => entry?.type === 'session_meta');
+  if (!metadata) {
+    fileState.rootEligible = false;
+    return;
+  }
+  fileState.threadId = String(metadata.payload?.id ?? fileState.threadId ?? '');
+  fileState.cwd = String(metadata.payload?.cwd ?? fileState.cwd ?? '');
+  fileState.rootEligible = rootSessionMeta(metadata, fileState.threadId);
 }
 
 export async function initializeRolloutWatcherState({ sessionsRoot, state, nowMs = Date.now() }) {
@@ -197,13 +466,16 @@ export async function pollRolloutCompletions({
   graceMs = 6_000,
   retryMs = 10_000,
   dispatchNotification,
+  inboxState,
+  persistInboxState,
 }) {
   if (!state.initialized) await initializeRolloutWatcherState({ sessionsRoot, state, nowMs });
   for (const filePath of await listRolloutFiles(sessionsRoot)) {
     const info = await fs.stat(filePath);
     if (!state.files[filePath]) {
-      state.files[filePath] = { offset: 0, threadId: '', cwd: '', activeTurnId: '' };
+      state.files[filePath] = { offset: 0, threadId: '', cwd: '', activeTurnId: '', rootEligible: false };
     }
+    await ensureRootEligibility(filePath, state.files[filePath], info);
     await consumeFile(filePath, state.files[filePath], info, state.pending);
   }
 
@@ -212,7 +484,36 @@ export async function pollRolloutCompletions({
     .sort((left, right) => Number(left[1].completedAtMs) - Number(right[1].completedAtMs));
   for (const [turnId, item] of ready) {
     item.lastAttemptAtMs = nowMs;
-    await dispatchNotification(await reconstructNotification(item, turnId));
+    const notification = await reconstructNotification(item, turnId);
+    const origin = resolveDiscordOrigin(notification, inboxState);
+    if (origin?.deliveryState === 'terminal-delivered') {
+      delete state.pending[turnId];
+      continue;
+    }
+    let terminalEventId = null;
+    if (origin) {
+      if (typeof persistInboxState !== 'function') throw new Error('Discord origin terminal persistence is unavailable');
+      terminalEventId = createHash('sha256')
+        .update(`${turnId}\0${item.threadId}\0terminal`, 'utf8').digest('hex');
+      await prepareDiscordOriginTerminalDelivery({
+        state: inboxState,
+        persistState: persistInboxState,
+        turnId,
+        eventId: terminalEventId,
+      });
+      notification['discord-origin-channel-id'] = origin.channelId;
+      notification['discord-guild-id'] = origin.guildId;
+    }
+    await dispatchNotification(notification);
+    if (origin) {
+      await advanceDiscordTurnOrigin({
+        state: inboxState,
+        persistState: persistInboxState,
+        turnId,
+        rolloutCursor: origin.rolloutCursor,
+        terminalDeliveredAt: new Date(nowMs).toISOString(),
+      });
+    }
     delete state.pending[turnId];
   }
   return state;

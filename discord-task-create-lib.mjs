@@ -3,7 +3,12 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 
-import { AppServerClient, commitInboxState, initializeAppServerClient } from './discord-bridge-lib.mjs';
+import {
+  AppServerClient,
+  commitInboxState,
+  createDiscordTurnOriginRecord,
+  initializeAppServerClient,
+} from './discord-bridge-lib.mjs';
 
 export const NO_PROJECT = '__projectless__';
 
@@ -150,6 +155,9 @@ export function createProjectCatalog({ loader, ttlMs = 60_000, now = Date.now } 
       return snapshotChoices(focused);
     },
     snapshotChoices,
+    snapshot() {
+      return projects.map((item) => structuredClone(item));
+    },
     refresh() {
       return startRefresh();
     },
@@ -598,21 +606,70 @@ function persistenceError() {
   return error;
 }
 
-async function persistInteractionRecord({ state, interactionId, record, persistState }) {
+async function persistInteractionRecord({ state, interactionId, record, persistState, discordTurnOrigin }) {
   try {
+    const origin = discordTurnOrigin ? createDiscordTurnOriginRecord(discordTurnOrigin) : null;
     await commitInboxState({
       state,
       persistState,
-      entries: { createdTasksByInteraction: [interactionId] },
+      entries: {
+        createdTasksByInteraction: [interactionId],
+        discordTurnOrigins: origin ? [origin.turnId] : [],
+      },
       mutate: () => {
         state.createdTasksByInteraction ??= {};
         state.createdTasksByInteraction[interactionId] = record;
+        if (origin) {
+          state.discordTurnOrigins ??= {};
+          const { turnId, ...value } = origin;
+          const existing = state.discordTurnOrigins[turnId];
+          if (existing && (existing.threadId !== value.threadId || existing.guildId !== value.guildId ||
+              existing.channelId !== value.channelId)) {
+            throw new Error('Discord turn origin conflicts with an existing binding');
+          }
+          state.discordTurnOrigins[turnId] ??= value;
+        }
       },
       errorMessage: 'Task creation state persistence failed',
     });
   } catch {
     throw persistenceError();
   }
+}
+
+export async function recordTaskCreationReceiptOutcome({
+  state,
+  interactionId,
+  status,
+  messageId,
+  errorCategory,
+  now = new Date(),
+  persistState,
+} = {}) {
+  if (!state || typeof state !== 'object') throw new TypeError('Task creation state is required');
+  if (!interactionId) throw new Error('Interaction ID is required');
+  if (!['original-edited', 'followup-sent', 'failed'].includes(String(status ?? ''))) {
+    throw new Error('Invalid creation receipt status');
+  }
+  const current = state.createdTasksByInteraction?.[interactionId];
+  if (!current) return false;
+  const observedNow = typeof now === 'function' ? now() : now;
+  const updatedAt = new Date(observedNow instanceof Date ? observedNow.getTime() : Number(observedNow)).toISOString();
+  const record = {
+    ...current,
+    receiptStatus: status,
+    receiptUpdatedAt: updatedAt,
+  };
+  delete record.receiptMessageId;
+  delete record.receiptErrorCategory;
+  if (messageId) record.receiptMessageId = String(messageId).slice(0, 128);
+  if (status === 'failed') {
+    record.receiptErrorCategory = errorCategory === 'creation-receipt-delivery-failed'
+      ? errorCategory
+      : 'creation-receipt-delivery-failed';
+  }
+  await persistInteractionRecord({ state, interactionId, record, persistState });
+  return true;
 }
 
 async function sourceMatchesProof({ proof, gitRunner }) {
@@ -795,6 +852,7 @@ export async function createNewTaskOnce({
   fileSystem = fs,
   persistState,
   now = new Date(),
+  discordOrigin,
 } = {}) {
   if (!state || typeof state !== 'object') throw new TypeError('Task creation state is required');
   if (!interactionId) throw new Error('Interaction ID is required');
@@ -820,11 +878,15 @@ export async function createNewTaskOnce({
   });
   stateFlights.set(interactionId, operation);
   (async () => {
+    const projectIdentity = {
+      projectId: selection?.kind === 'project' ? selection.projectId : null,
+      projectName: selection?.projectName ?? (selection?.kind === 'project' ? selection.projectId : '无项目'),
+    };
     let prepared = null;
     let started = null;
     try {
       await persistInteractionRecord({
-        state, interactionId, record: { status: 'creating' }, persistState,
+        state, interactionId, record: { status: 'creating', ...projectIdentity }, persistState,
       });
       prepared = await prepareTaskWorkspace({
         selection,
@@ -836,7 +898,7 @@ export async function createNewTaskOnce({
         onWorkspacePlanned: async (workspace) => persistInteractionRecord({
           state,
           interactionId,
-          record: { status: 'creating', workspace: persistableWorkspace(workspace) },
+          record: { status: 'creating', ...projectIdentity, workspace: persistableWorkspace(workspace) },
           persistState,
         }),
       });
@@ -844,7 +906,7 @@ export async function createNewTaskOnce({
       await persistInteractionRecord({
         state,
         interactionId,
-        record: { status: 'workspace-ready', workspace: persistentWorkspace },
+        record: { status: 'workspace-ready', ...projectIdentity, workspace: persistentWorkspace },
         persistState,
       });
       started = await startNewCodexTask({
@@ -859,7 +921,7 @@ export async function createNewTaskOnce({
           await persistInteractionRecord({
             state,
             interactionId,
-            record: { status: 'thread-starting', workspace: persistentWorkspace },
+            record: { status: 'thread-starting', ...projectIdentity, workspace: persistentWorkspace },
             persistState,
           });
         },
@@ -869,6 +931,7 @@ export async function createNewTaskOnce({
             interactionId,
             record: {
               status: 'thread-created',
+              ...projectIdentity,
               threadId,
               taskName,
               workspace: persistentWorkspace,
@@ -883,9 +946,21 @@ export async function createNewTaskOnce({
         threadId: started.threadId,
         turnId: started.turnId,
         taskName: started.taskName,
+        ...projectIdentity,
         workspace: persistentWorkspace,
       };
-      await persistInteractionRecord({ state, interactionId, record, persistState });
+      await persistInteractionRecord({
+        state,
+        interactionId,
+        record,
+        persistState,
+        discordTurnOrigin: discordOrigin ? {
+          ...discordOrigin,
+          turnId: started.turnId,
+          threadId: started.threadId,
+          createdAt: now.toISOString(),
+        } : null,
+      });
       return {
         ...record,
         completion: started.completion,
@@ -907,6 +982,7 @@ export async function createNewTaskOnce({
           status: 'first-turn-failed',
           threadId: error?.threadId ?? current.threadId,
           taskName: error?.taskName ?? current.taskName ?? '生成中',
+          ...projectIdentity,
           workspace: persistableWorkspace(error?.workspace ?? prepared ?? current.workspace),
           errorCategory: taskCreationErrorCategory(error),
         };
@@ -926,6 +1002,7 @@ export async function createNewTaskOnce({
         persistState,
         finalRecord: {
           status: 'failed-before-thread',
+          ...projectIdentity,
           workspace,
           errorCategory: taskCreationErrorCategory(error),
         },

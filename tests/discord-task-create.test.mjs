@@ -14,6 +14,7 @@ import {
   createProjectCatalog,
   listCodexProjects,
   prepareTaskWorkspace,
+  recordTaskCreationReceiptOutcome,
   recoverInterruptedTaskCreations,
   resolveProjectSelection,
   startNewCodexTask,
@@ -458,6 +459,7 @@ test('falls back from missing remote HEAD to the current Git HEAD', async () => 
   const prepared = await prepareTaskWorkspace({
     selection: { kind: 'project', projectId: 'p1', projectName: 'POS', roots: ['C:\\repo'] },
     worktreeRoot: 'G:\\codex-worktrees',
+    worktreeRoot: 'G:\\codex-worktrees',
     operationId: 'fallback1',
     now: new Date('2026-09-01T01:02:03Z'),
     fileSystem: fakeFileSystem({ gitRoots: ['C:\\repo'] }),
@@ -851,6 +853,76 @@ test('persists each creation state before the corresponding external mutation an
   assert.equal(gitCalls.length, 2);
   assert.equal(gitCalls.some(({ args }) => args.includes('add')), false);
   await first.completion;
+});
+
+test('successful new task atomically persists its exact Discord origin before returning', async () => {
+  const state = createEmptyInboxState();
+  const snapshots = [];
+  const result = await createNewTaskOnce({
+    state,
+    interactionId: '1544329941024374935',
+    selection: { kind: 'project', projectId: 'p1', projectName: 'POS', roots: ['C:\\repo'] },
+    worktreeRoot: 'G:\\codex-worktrees',
+    text: '从 Discord 创建',
+    fileSystem: fakeFileSystem(),
+    persistState: async (snapshot) => { snapshots.push(structuredClone(snapshot)); },
+    gitRunner: fakeGitRunner([], { isRepo: false }),
+    clientFactory: () => fakeAppServer([], {
+      'thread/start': { thread: { id: '01a05d0a-5a8f-71f2-b5e1-96fe962224b5', name: 'Discord 新任务' } },
+      'turn/start': { turn: { id: 'turn-new-origin' } },
+    }),
+    now: new Date('2026-09-01T20:55:55.000Z'),
+    discordOrigin: {
+      guildId: '222222222222222222', channelId: '777777777777777777', source: 'new-task',
+      projectId: 'p1', projectName: 'POS',
+    },
+  });
+
+  assert.equal(result.status, 'started');
+  assert.deepEqual(state.discordTurnOrigins['turn-new-origin'], {
+    threadId: '01a05d0a-5a8f-71f2-b5e1-96fe962224b5',
+    guildId: '222222222222222222',
+    channelId: '777777777777777777',
+    source: 'new-task',
+    createdAt: '2026-09-01T20:55:55.000Z',
+    projectId: 'p1', projectName: 'POS',
+    rolloutCursor: 0, deliveredEventIds: [], deliveryState: 'pending',
+  });
+  const createdRecord = snapshots.at(-1).createdTasksByInteraction['1544329941024374935'];
+  assert.equal(createdRecord.status, 'started');
+  assert.equal(createdRecord.threadId, '01a05d0a-5a8f-71f2-b5e1-96fe962224b5');
+  assert.equal(createdRecord.turnId, 'turn-new-origin');
+  assert.equal(createdRecord.projectId, 'p1');
+  assert.equal(createdRecord.projectName, 'POS');
+  assert.equal(snapshots.at(-1).discordTurnOrigins['turn-new-origin'].channelId, '777777777777777777');
+  assert.equal(JSON.stringify(snapshots).includes('interaction-token'), false);
+  await result.completion;
+});
+
+test('creation receipt outcome persists only bounded delivery metadata on the existing creation record', async () => {
+  const state = createEmptyInboxState();
+  state.createdTasksByInteraction['interaction-receipt'] = {
+    status: 'started', threadId: 'thread-receipt', turnId: 'turn-receipt', taskName: '收据任务',
+    projectId: 'p1', projectName: 'POS',
+  };
+  const snapshots = [];
+
+  const recorded = await recordTaskCreationReceiptOutcome({
+    state,
+    interactionId: 'interaction-receipt',
+    status: 'followup-sent',
+    messageId: '1544329941024374999',
+    now: new Date('2026-09-01T20:56:10.000Z'),
+    persistState: async (snapshot) => { snapshots.push(structuredClone(snapshot)); },
+  });
+
+  assert.equal(recorded, true);
+  assert.deepEqual(state.createdTasksByInteraction['interaction-receipt'], {
+    status: 'started', threadId: 'thread-receipt', turnId: 'turn-receipt', taskName: '收据任务',
+    projectId: 'p1', projectName: 'POS', receiptStatus: 'followup-sent',
+    receiptMessageId: '1544329941024374999', receiptUpdatedAt: '2026-09-01T20:56:10.000Z',
+  });
+  assert.equal(JSON.stringify(snapshots).includes('interaction-token'), false);
 });
 
 test('concurrent identical task creation installs its in-flight operation before waiting for the inbox lock', async () => {

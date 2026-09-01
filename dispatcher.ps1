@@ -28,6 +28,7 @@ $configPath = Join-Path $toolDir 'config.json'
 $logPath = Join-Path $toolDir 'mobile-notify.log'
 $quotaStatePath = Join-Path $toolDir 'quota-state.json'
 $discordMessageMapPath = Join-Path $toolDir 'discord-message-map.json'
+$discordInboxStatePath = Join-Path $toolDir 'discord-inbox-state.json'
 $taskDeliveryStatePath = Join-Path $toolDir 'task-delivery-state.json'
 $sessionIndexPath = Join-Path $codexRoot 'session_index.jsonl'
 $sessionsPath = Join-Path $codexRoot 'sessions'
@@ -239,7 +240,11 @@ function Get-TaskNotificationEligibility {
 
     $sidebarEntry = Get-SidebarThreadEntry -ThreadId $threadId
     if ($null -eq $sidebarEntry) {
-        return [pscustomobject]@{ Allowed = $false; Reason = 'thread is not present in the sidebar task index' }
+        $discordOrigin = Get-VerifiedDiscordTurnOriginRecord -Notification $Notification
+        if ($null -eq $discordOrigin) {
+            return [pscustomobject]@{ Allowed = $false; Reason = 'thread is not present in the sidebar task index or trusted Discord origin state' }
+        }
+        return Get-ExactDiscordRootTurnEligibility -Notification $Notification
     }
 
     $metadata = Get-SessionMetadataForThread -ThreadId $threadId
@@ -281,6 +286,97 @@ function Get-TaskNotificationEligibility {
     return [pscustomobject]@{ Allowed = $true; Reason = 'user-visible sidebar root task' }
 }
 
+function Get-ExactDiscordRootTurnEligibility {
+    param([object]$Notification)
+
+    $threadId = [string](Get-OptionalValue -Object $Notification -Name 'thread-id' -DefaultValue '')
+    $turnId = [string](Get-OptionalValue -Object $Notification -Name 'turn-id' -DefaultValue '')
+    $uuidPattern = '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+    if ($threadId -notmatch $uuidPattern -or $turnId -notmatch $uuidPattern -or -not (Test-Path -LiteralPath $sessionsPath -PathType Container)) {
+        return [pscustomobject]@{ Allowed = $false; Reason = 'Discord origin does not identify an exact persisted root turn' }
+    }
+
+    try {
+        $escapedThreadId = [regex]::Escape($threadId)
+        $candidates = @(Get-ChildItem -LiteralPath $sessionsPath -Recurse -File -Filter "*$threadId*.jsonl" -ErrorAction Stop |
+            Where-Object { $_.BaseName -match "(?i)(?:^|[-_])$escapedThreadId$" })
+    }
+    catch {
+        return [pscustomobject]@{ Allowed = $false; Reason = 'Discord root rollout lookup failed' }
+    }
+
+    $claimants = @()
+    foreach ($candidate in $candidates) {
+        try {
+            if (($candidate.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or $candidate.Length -le 0) {
+                continue
+            }
+            $matchingMetadata = @()
+            $hasExactTurn = $false
+            foreach ($line in [System.IO.File]::ReadLines($candidate.FullName, [System.Text.Encoding]::UTF8)) {
+                if ([string]::IsNullOrWhiteSpace($line)) {
+                    continue
+                }
+                try {
+                    $entry = $line | ConvertFrom-Json
+                }
+                catch {
+                    continue
+                }
+                $entryType = [string](Get-OptionalValue -Object $entry -Name 'type' -DefaultValue '')
+                $payload = Get-OptionalValue -Object $entry -Name 'payload' -DefaultValue $null
+                if ($null -eq $payload) {
+                    continue
+                }
+                if ($entryType -eq 'session_meta' -and [string](Get-OptionalValue -Object $payload -Name 'id' -DefaultValue '') -ceq $threadId) {
+                    $matchingMetadata += $payload
+                    continue
+                }
+                if ($entryType -eq 'event_msg' -and
+                    [string](Get-OptionalValue -Object $payload -Name 'type' -DefaultValue '') -ceq 'task_started' -and
+                    [string](Get-OptionalValue -Object $payload -Name 'turn_id' -DefaultValue '') -ceq $turnId) {
+                    $hasExactTurn = $true
+                }
+            }
+            if ($matchingMetadata.Count -eq 0) {
+                continue
+            }
+            $claimants += [pscustomobject]@{
+                Metadata = if ($matchingMetadata.Count -eq 1) { $matchingMetadata[0] } else { $null }
+                HasExactTurn = $hasExactTurn
+            }
+        }
+        catch {
+            return [pscustomobject]@{ Allowed = $false; Reason = 'Discord root rollout could not be verified' }
+        }
+    }
+
+    if ($claimants.Count -ne 1 -or $null -eq $claimants[0].Metadata -or -not [bool]$claimants[0].HasExactTurn) {
+        return [pscustomobject]@{ Allowed = $false; Reason = 'Discord origin rollout is missing, ambiguous, or does not contain the exact turn' }
+    }
+
+    $metadata = $claimants[0].Metadata
+    $threadSource = [string](Get-OptionalValue -Object $metadata -Name 'thread_source' -DefaultValue '')
+    $parentThreadId = [string](Get-OptionalValue -Object $metadata -Name 'parent_thread_id' -DefaultValue '')
+    $sessionId = [string](Get-OptionalValue -Object $metadata -Name 'session_id' -DefaultValue '')
+    if ((-not [string]::IsNullOrWhiteSpace($threadSource) -and $threadSource -ine 'user') -or
+        -not [string]::IsNullOrWhiteSpace($parentThreadId) -or
+        (-not [string]::IsNullOrWhiteSpace($sessionId) -and $sessionId -ine $threadId)) {
+        return [pscustomobject]@{ Allowed = $false; Reason = 'Discord origin rollout is not a root user task' }
+    }
+    $source = Get-OptionalValue -Object $metadata -Name 'source' -DefaultValue $null
+    if ($null -ne $source -and $source -isnot [string]) {
+        $subagentProperty = $source.PSObject.Properties |
+            Where-Object { $_.Name -ieq 'subagent' } |
+            Select-Object -First 1
+        if ($null -ne $subagentProperty -and $null -ne $subagentProperty.Value) {
+            return [pscustomobject]@{ Allowed = $false; Reason = 'Discord origin rollout contains subagent metadata' }
+        }
+    }
+
+    return [pscustomobject]@{ Allowed = $true; Reason = 'trusted Discord origin maps to an exact root task turn' }
+}
+
 function Get-TaskName {
     param(
         [object]$Notification,
@@ -305,6 +401,23 @@ function Get-TaskName {
         return $TaskMessage.Substring(0, 30) + '…'
     }
     return $TaskMessage
+}
+
+function Get-NotificationProjectName {
+    param([object]$Notification)
+
+    $origin = Get-VerifiedDiscordTurnOriginRecord -Notification $Notification
+    if ($null -ne $origin) {
+        $persistedName = ConvertTo-CompactText -Value ([string](Get-OptionalValue -Object $origin -Name 'projectName' -DefaultValue ''))
+        if (-not [string]::IsNullOrWhiteSpace($persistedName)) {
+            return $persistedName
+        }
+    }
+    $cwd = [string](Get-OptionalValue -Object $Notification -Name 'cwd' -DefaultValue '')
+    if ([string]::IsNullOrWhiteSpace($cwd)) {
+        return '任务'
+    }
+    return Split-Path -Leaf $cwd.TrimEnd('\', '/')
 }
 
 function Invoke-JsonPost {
@@ -426,6 +539,243 @@ function Get-DiscordBotChannelId {
         return ''
     }
     return [string](Get-OptionalValue -Object $Config -Name $propertyName -DefaultValue '')
+}
+
+function Test-IsJsonObject {
+    param([object]$Value)
+
+    return $null -ne $Value -and $Value -is [pscustomobject]
+}
+
+function Test-IsIntegralJsonNumber {
+    param([object]$Value)
+
+    return $Value -is [byte] -or $Value -is [sbyte] -or
+        $Value -is [int16] -or $Value -is [uint16] -or
+        $Value -is [int32] -or $Value -is [uint32] -or
+        $Value -is [int64] -or $Value -is [uint64]
+}
+
+function Test-JsonObjectProperties {
+    param(
+        [object]$Value,
+        [string[]]$Allowed,
+        [string[]]$Required = @()
+    )
+
+    if (-not (Test-IsJsonObject -Value $Value)) {
+        return $false
+    }
+    $names = @($Value.PSObject.Properties | ForEach-Object { [string]$_.Name })
+    foreach ($name in $names) {
+        if ($name -cnotin $Allowed) {
+            return $false
+        }
+    }
+    foreach ($name in $Required) {
+        if ($name -cnotin $names) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Test-OptionalJsonString {
+    param(
+        [object]$Value,
+        [string]$Name
+    )
+
+    $property = $Value.PSObject.Properties | Where-Object { $_.Name -ceq $Name } | Select-Object -First 1
+    return $null -eq $property -or $property.Value -is [string]
+}
+
+function Test-JsonTimestamp {
+    param([object]$Value)
+
+    if ($Value -isnot [string] -or [string]::IsNullOrWhiteSpace($Value)) {
+        return $false
+    }
+    $parsed = [DateTimeOffset]::MinValue
+    return [DateTimeOffset]::TryParse($Value, [ref]$parsed)
+}
+
+function Test-DiscordTurnOriginRecord {
+    param([object]$Value)
+
+    $allowed = @(
+        'threadId', 'guildId', 'channelId', 'source', 'createdAt', 'projectId', 'projectName',
+        'rolloutCursor', 'deliveredEventIds', 'deliveryState', 'deliveredAt', 'lastMessageId',
+        'rolloutFingerprint', 'terminalEventId'
+    )
+    $required = @(
+        'threadId', 'guildId', 'channelId', 'source', 'createdAt',
+        'rolloutCursor', 'deliveredEventIds', 'deliveryState'
+    )
+    if (-not (Test-JsonObjectProperties -Value $Value -Allowed $allowed -Required $required)) {
+        return $false
+    }
+    if ($Value.threadId -isnot [string] -or [string]::IsNullOrWhiteSpace($Value.threadId) -or
+        $Value.guildId -isnot [string] -or $Value.guildId -notmatch '\A[0-9]{17,20}\z' -or
+        $Value.channelId -isnot [string] -or $Value.channelId -notmatch '\A[0-9]{17,20}\z' -or
+        $Value.source -isnot [string] -or $Value.source -cnotin @('new-task', 'slash', 'reply') -or
+        -not (Test-JsonTimestamp -Value $Value.createdAt) -or
+        -not (Test-IsIntegralJsonNumber -Value $Value.rolloutCursor) -or [int64]$Value.rolloutCursor -lt 0 -or
+        $Value.deliveredEventIds -isnot [System.Array] -or @($Value.deliveredEventIds).Count -gt 128 -or
+        $Value.deliveryState -isnot [string] -or
+        $Value.deliveryState -cnotin @('pending', 'terminal-dispatching', 'terminal-delivered')) {
+        return $false
+    }
+    foreach ($eventId in @($Value.deliveredEventIds)) {
+        if ($eventId -isnot [string] -or [string]::IsNullOrWhiteSpace($eventId)) {
+            return $false
+        }
+    }
+    foreach ($name in @('projectId', 'projectName', 'lastMessageId', 'rolloutFingerprint', 'terminalEventId')) {
+        if (-not (Test-OptionalJsonString -Value $Value -Name $name)) {
+            return $false
+        }
+    }
+    foreach ($name in @('rolloutFingerprint', 'terminalEventId')) {
+        $property = $Value.PSObject.Properties | Where-Object { $_.Name -ceq $name } | Select-Object -First 1
+        if ($null -ne $property -and $property.Value -cnotmatch '\A[a-f0-9]{64}\z') {
+            return $false
+        }
+    }
+    $deliveredAt = $Value.PSObject.Properties | Where-Object { $_.Name -ceq 'deliveredAt' } | Select-Object -First 1
+    if ($null -ne $deliveredAt -and -not (Test-JsonTimestamp -Value $deliveredAt.Value)) {
+        return $false
+    }
+    return $true
+}
+
+function Read-VerifiedDiscordTurnOrigins {
+    if (-not (Test-Path -LiteralPath $discordInboxStatePath -PathType Leaf)) {
+        return $null
+    }
+
+    try {
+        $file = Get-Item -LiteralPath $discordInboxStatePath -ErrorAction Stop
+        if (($file.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0 -or
+            $file.Length -le 0 -or $file.Length -gt 16MB) {
+            return $null
+        }
+        $state = [System.IO.File]::ReadAllText($file.FullName, [System.Text.Encoding]::UTF8) |
+            ConvertFrom-Json -DateKind String
+        $allowed = @(
+            'version', 'initialized', 'cursors', 'processedMessageIds', 'pendingContinuations',
+            'processedInteractions', 'createdTasksByInteraction', 'discordTurnOrigins'
+        )
+        if (-not (Test-JsonObjectProperties -Value $state -Allowed $allowed -Required $allowed) -or
+            -not (Test-IsIntegralJsonNumber -Value $state.version) -or [int64]$state.version -ne 2 -or
+            $state.initialized -isnot [bool] -or
+            -not (Test-IsJsonObject -Value $state.cursors) -or
+            $state.processedMessageIds -isnot [System.Array] -or
+            -not (Test-IsJsonObject -Value $state.pendingContinuations) -or
+            $state.processedInteractions -isnot [System.Array] -or
+            -not (Test-IsJsonObject -Value $state.createdTasksByInteraction) -or
+            -not (Test-IsJsonObject -Value $state.discordTurnOrigins)) {
+            return $null
+        }
+        $originProperties = @($state.discordTurnOrigins.PSObject.Properties)
+        if ($originProperties.Count -gt 2000) {
+            return $null
+        }
+        foreach ($property in $originProperties) {
+            if ([string]::IsNullOrWhiteSpace([string]$property.Name) -or
+                -not (Test-DiscordTurnOriginRecord -Value $property.Value)) {
+                return $null
+            }
+        }
+        return $state.discordTurnOrigins
+    }
+    catch {
+        return $null
+    }
+}
+
+function Get-VerifiedDiscordTurnOriginRecord {
+    param([object]$Notification)
+
+    if ($null -eq $Notification) {
+        return $null
+    }
+    $turnProperty = $Notification.PSObject.Properties | Where-Object { $_.Name -ceq 'turn-id' } | Select-Object -First 1
+    $threadProperty = $Notification.PSObject.Properties | Where-Object { $_.Name -ceq 'thread-id' } | Select-Object -First 1
+    if ($null -eq $turnProperty -or $turnProperty.Value -isnot [string] -or [string]::IsNullOrWhiteSpace($turnProperty.Value) -or
+        $null -eq $threadProperty -or $threadProperty.Value -isnot [string] -or [string]::IsNullOrWhiteSpace($threadProperty.Value)) {
+        return $null
+    }
+
+    $origins = Read-VerifiedDiscordTurnOrigins
+    if ($null -eq $origins) {
+        return $null
+    }
+    $originProperty = $origins.PSObject.Properties |
+        Where-Object { $_.Name -ceq [string]$turnProperty.Value } |
+        Select-Object -First 1
+    if ($null -eq $originProperty -or [string]$originProperty.Value.threadId -cne [string]$threadProperty.Value) {
+        return $null
+    }
+
+    $notificationChannel = $Notification.PSObject.Properties |
+        Where-Object { $_.Name -ceq 'discord-origin-channel-id' } |
+        Select-Object -First 1
+    if ($null -ne $notificationChannel -and
+        ($notificationChannel.Value -isnot [string] -or
+         $notificationChannel.Value -notmatch '\A[0-9]{17,20}\z' -or
+         [string]$notificationChannel.Value -cne [string]$originProperty.Value.channelId)) {
+        return $null
+    }
+    $notificationGuild = $Notification.PSObject.Properties |
+        Where-Object { $_.Name -ceq 'discord-guild-id' } |
+        Select-Object -First 1
+    if ($null -ne $notificationGuild -and
+        ($notificationGuild.Value -isnot [string] -or
+         $notificationGuild.Value -notmatch '\A[0-9]{17,20}\z' -or
+         [string]$notificationGuild.Value -cne [string]$originProperty.Value.guildId)) {
+        return $null
+    }
+    return $originProperty.Value
+}
+
+function Get-DiscordOriginChannelId {
+    param(
+        [object]$Notification,
+        [string]$EventName
+    )
+
+    if ($EventName -notin @('user-task-complete', 'user-task-confirmation-required')) {
+        return ''
+    }
+    $origin = Get-VerifiedDiscordTurnOriginRecord -Notification $Notification
+    if ($null -eq $origin) {
+        return ''
+    }
+    return [string]$origin.channelId
+}
+
+function Get-DiscordTerminalNonce {
+    param([object]$Notification)
+
+    if ($null -eq $Notification) {
+        return ''
+    }
+    $turnId = [string](Get-OptionalValue -Object $Notification -Name 'turn-id' -DefaultValue '')
+    $threadId = [string](Get-OptionalValue -Object $Notification -Name 'thread-id' -DefaultValue '')
+    if ([string]::IsNullOrWhiteSpace($turnId) -or [string]::IsNullOrWhiteSpace($threadId)) {
+        return ''
+    }
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $seed = $turnId + [char]0 + $threadId + [char]0 + 'terminal'
+        $hash = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($seed))
+        $prefix = ([BitConverter]::ToString($hash) -replace '-', '').Substring(0, 16)
+        return [Convert]::ToUInt64($prefix, 16).ToString([System.Globalization.CultureInfo]::InvariantCulture)
+    }
+    finally {
+        $sha.Dispose()
+    }
 }
 
 function Send-DiscordBotMessage {
@@ -587,12 +937,29 @@ function Send-MobileMessage {
     else {
         $null
     }
-    $channelId = if ($provider -eq 'discord-bot') {
+    $fixedChannelId = if ($provider -eq 'discord-bot') {
         Get-DiscordBotChannelId -Config $Config -EventName $EventName
     }
     else {
         ''
     }
+    $originChannelId = if ($provider -eq 'discord-bot') {
+        Get-DiscordOriginChannelId -Notification $Notification -EventName $EventName
+    }
+    else {
+        ''
+    }
+    $channelId = if (-not [string]::IsNullOrWhiteSpace($originChannelId)) { $originChannelId } else { $fixedChannelId }
+    if ($provider -eq 'discord-bot' -and -not [string]::IsNullOrWhiteSpace($originChannelId)) {
+        $terminalNonce = Get-DiscordTerminalNonce -Notification $Notification
+        if (-not [string]::IsNullOrWhiteSpace($terminalNonce)) {
+            $providerPayload['nonce'] = $terminalNonce
+            $providerPayload['enforce_nonce'] = $true
+        }
+    }
+    $usesOriginChannel = $provider -eq 'discord-bot' -and
+        -not [string]::IsNullOrWhiteSpace($originChannelId) -and
+        $originChannelId -ne $fixedChannelId
     $syntheticTest = $false
     if ($null -ne $Notification) {
         $syntheticTest = [bool](Get-OptionalValue -Object $Notification -Name 'synthetic-test' -DefaultValue $false)
@@ -689,7 +1056,24 @@ function Send-MobileMessage {
             Invoke-JsonPost -Uri $endpoint -TimeoutSeconds $timeoutSeconds -Payload $providerPayload
         }
         'discord-bot' {
-            $response = Send-DiscordBotMessage -Config $Config -ChannelId $channelId -Payload $providerPayload -TimeoutSeconds $timeoutSeconds
+            try {
+                $response = Send-DiscordBotMessage -Config $Config -ChannelId $channelId -Payload $providerPayload -TimeoutSeconds $timeoutSeconds
+            }
+            catch {
+                if (-not $usesOriginChannel) {
+                    throw
+                }
+
+                $fallbackPayload = New-DiscordBotPayload -Title $Title -Body $Body -EventName $EventName
+                $fallbackPayload.embeds[0]['description'] = '**路由提示：** 原任务频道发送失败，已转到固定通知频道。'
+                if ($providerPayload.Contains('nonce')) {
+                    $fallbackPayload['nonce'] = $providerPayload['nonce']
+                    $fallbackPayload['enforce_nonce'] = $true
+                }
+                $response = Send-DiscordBotMessage -Config $Config -ChannelId $fixedChannelId -Payload $fallbackPayload -TimeoutSeconds $timeoutSeconds
+                $channelId = $fixedChannelId
+                Write-NotifyLog "Discord origin route failed; notification sent to the fixed $EventName channel"
+            }
             if ($saveTaskMapping) {
                 if (-not (Get-Command -Name Save-DiscordTaskMapping -ErrorAction SilentlyContinue)) {
                     throw 'Discord task mapping module is unavailable'
@@ -864,13 +1248,7 @@ function Invoke-ConfirmationNotifier {
         return
     }
 
-    $cwd = [string](Get-OptionalValue -Object $Notification -Name 'cwd' -DefaultValue '')
-    $project = if ([string]::IsNullOrWhiteSpace($cwd)) {
-        '任务'
-    }
-    else {
-        Split-Path -Leaf $cwd.TrimEnd('\', '/')
-    }
+    $project = Get-NotificationProjectName -Notification $Notification
 
     $taskMessage = Get-LastUserMessage -Notification $Notification
     $taskName = Get-TaskName -Notification $Notification -TaskMessage $taskMessage
@@ -909,13 +1287,7 @@ function Invoke-MobileNotifier {
 
     $includeAssistantMessage = [bool](Get-OptionalValue -Object $Config -Name 'includeAssistantMessage' -DefaultValue $false)
 
-    $cwd = [string](Get-OptionalValue -Object $Notification -Name 'cwd' -DefaultValue '')
-    $project = if ([string]::IsNullOrWhiteSpace($cwd)) {
-        '任务'
-    }
-    else {
-        Split-Path -Leaf $cwd.TrimEnd('\', '/')
-    }
+    $project = Get-NotificationProjectName -Notification $Notification
 
     $taskMessage = Get-LastUserMessage -Notification $Notification
     $taskName = Get-TaskName -Notification $Notification -TaskMessage $taskMessage
@@ -1815,15 +2187,24 @@ try {
         }
         if ($isHeartbeat) {
             Write-NotifyLog 'Heartbeat turn skipped for mobile task notification'
+            if ($FallbackInvocation) {
+                throw 'Watcher task notification was rejected as heartbeat input'
+            }
             return
         }
         if ($isInternal) {
             Write-NotifyLog 'Internal/background turn skipped for mobile task notification'
+            if ($FallbackInvocation) {
+                throw 'Watcher task notification was rejected as internal input'
+            }
             return
         }
         $eligibility = Get-TaskNotificationEligibility -Notification $notification
         if (-not [bool]$eligibility.Allowed) {
             Write-NotifyLog "Non-sidebar/subagent turn skipped for mobile task notification: $($eligibility.Reason)"
+            if ($FallbackInvocation) {
+                throw 'Watcher task notification root eligibility could not be verified'
+            }
             return
         }
         $notificationKind = Get-TaskNotificationKind -Notification $notification
