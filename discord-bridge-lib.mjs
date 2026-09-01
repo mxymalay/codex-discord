@@ -360,6 +360,12 @@ export function decryptPendingReplyText({ toolDir, powershellPath = 'pwsh', ciph
   return transformPendingReplyText({ toolDir, powershellPath, scriptName: 'unprotect-discord-pending-reply.ps1', value: ciphertext });
 }
 
+function boundedPositiveInteger(value, fallback, maximum) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) return fallback;
+  return Math.min(maximum, Math.max(1, Math.floor(numeric)));
+}
+
 export class AppServerClient {
   constructor({
     codexPath,
@@ -377,8 +383,8 @@ export class AppServerClient {
     this.pending = new Map();
     this.completedTurns = new Map();
     this.earlyCompletedTurns = new Map();
-    this.earlyCompletionMax = Math.max(1, Number(earlyCompletionMax) || 1);
-    this.earlyCompletionTtlMs = Math.max(1, Number(earlyCompletionTtlMs) || 1);
+    this.earlyCompletionMax = boundedPositiveInteger(earlyCompletionMax, 100, 1_000);
+    this.earlyCompletionTtlMs = boundedPositiveInteger(earlyCompletionTtlMs, 5 * 60 * 1000, 60 * 60 * 1000);
     this.now = now;
     this.closed = false;
     this.exitError = null;

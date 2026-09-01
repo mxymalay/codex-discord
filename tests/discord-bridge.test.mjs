@@ -264,6 +264,46 @@ test('early completion buffering has bounded size and retention', async () => {
   child.emit('close', 0);
 });
 
+test('early completion configuration is clamped to finite positive integer safety limits', () => {
+  const makeChild = () => {
+    const child = new EventEmitter();
+    child.stdin = new PassThrough();
+    child.stdout = new PassThrough();
+    child.kill = () => {};
+    return child;
+  };
+  const hugeChild = makeChild();
+  const huge = new AppServerClient({
+    codexPath: 'not-used', cwd: 'C:\\workspace', spawnImpl: () => hugeChild,
+    earlyCompletionMax: Number.MAX_SAFE_INTEGER,
+    earlyCompletionTtlMs: Number.MAX_SAFE_INTEGER,
+  });
+  assert.equal(huge.earlyCompletionMax, 1_000);
+  assert.equal(huge.earlyCompletionTtlMs, 60 * 60 * 1000);
+
+  const fractionalChild = makeChild();
+  const fractional = new AppServerClient({
+    codexPath: 'not-used', cwd: 'C:\\workspace', spawnImpl: () => fractionalChild,
+    earlyCompletionMax: 2.9, earlyCompletionTtlMs: 10.9,
+  });
+  assert.equal(fractional.earlyCompletionMax, 2);
+  assert.equal(fractional.earlyCompletionTtlMs, 10);
+  assert.equal(Number.isInteger(fractional.earlyCompletionMax), true);
+  assert.equal(Number.isInteger(fractional.earlyCompletionTtlMs), true);
+
+  const invalidChild = makeChild();
+  const invalid = new AppServerClient({
+    codexPath: 'not-used', cwd: 'C:\\workspace', spawnImpl: () => invalidChild,
+    earlyCompletionMax: Number.NaN, earlyCompletionTtlMs: Number.POSITIVE_INFINITY,
+  });
+  assert.equal(invalid.earlyCompletionMax, 100);
+  assert.equal(invalid.earlyCompletionTtlMs, 5 * 60 * 1000);
+
+  huge.close();
+  fractional.close();
+  invalid.close();
+});
+
 test('orders Discord Snowflakes numerically', () => {
   const values = ['777777777777777801', '777777777777777702', '777777777777777710'];
   assert.deepEqual(values.sort(compareSnowflakes), [

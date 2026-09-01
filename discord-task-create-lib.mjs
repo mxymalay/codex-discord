@@ -184,20 +184,53 @@ export function resolveProjectSelection({ projects, selectionId, projectlessRoot
   };
 }
 
-function runGitWithSpawn({ command = 'git', args }) {
+function controlledGitEnvironment(environment) {
+  const sanitized = { ...environment, LC_ALL: 'C', LANG: 'C', GIT_TERMINAL_PROMPT: '0' };
+  for (const name of [
+    'GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE',
+    'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+    'GIT_CEILING_DIRECTORIES', 'GIT_DISCOVERY_ACROSS_FILESYSTEM',
+  ]) delete sanitized[name];
+  return sanitized;
+}
+
+function isRepositoryProbe(args) {
+  return args.length === 4 && args[0] === '-C' && args[2] === 'rev-parse' && args[3] === '--show-toplevel';
+}
+
+function isExactRefProbe(args) {
+  return args.length === 6 && args[0] === '-C' && args[2] === 'show-ref'
+    && args[3] === '--verify' && args[4] === '--hash' && args[5].startsWith('refs/heads/');
+}
+
+export function runGitWithSpawn({
+  command = 'git', args, spawnImpl = spawn, environment = process.env,
+}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, {
+    const child = spawnImpl(command, args, {
       windowsHide: true,
       shell: false,
-      stdio: ['ignore', 'pipe', 'ignore'],
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: controlledGitEnvironment(environment),
     });
     let stdout = '';
+    let stderr = '';
     child.stdout.setEncoding('utf8');
     child.stdout.on('data', (chunk) => { stdout += chunk; });
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', (chunk) => {
+      if (stderr.length < 8192) stderr += chunk.slice(0, 8192 - stderr.length);
+    });
     child.on('error', () => reject(Object.assign(new Error('Unable to start Git'), { code: 'GIT_START_FAILED' })));
     child.on('close', (code) => {
       if (code === 0) resolve({ stdout });
-      else reject(Object.assign(new Error('Git operation failed'), { code: 'GIT_FAILED' }));
+      else if (code === 128 && isRepositoryProbe(args) && /^fatal: not a git repository\b/i.test(stderr.trim())) {
+        reject(Object.assign(new Error('Git root is not a repository'), { code: 'GIT_NOT_REPOSITORY' }));
+      } else if (code === 1 && isExactRefProbe(args)) {
+        reject(Object.assign(new Error('Git branch reference was not found'), { code: 'GIT_REF_NOT_FOUND' }));
+      } else {
+        reject(Object.assign(new Error('Git operation failed'), { code: 'GIT_FAILED' }));
+      }
     });
   });
 }
@@ -208,10 +241,18 @@ function formatBranchTimestamp(value) {
   return date.toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15);
 }
 
+function windowsPathKey(value) {
+  return path.win32.resolve(String(value ?? '')).toLocaleLowerCase('en-US');
+}
+
+function windowsPathEqual(left, right) {
+  return windowsPathKey(left) === windowsPathKey(right);
+}
+
 function resolvedDescendant(root, candidate) {
-  const resolvedRoot = path.resolve(root);
-  const resolvedCandidate = path.resolve(candidate);
-  const relative = path.relative(resolvedRoot, resolvedCandidate);
+  const resolvedRoot = windowsPathKey(root);
+  const resolvedCandidate = windowsPathKey(candidate);
+  const relative = path.win32.relative(resolvedRoot, resolvedCandidate);
   return relative !== '' && !relative.startsWith('..') && !path.isAbsolute(relative);
 }
 
@@ -230,6 +271,11 @@ function expandWorktreeRoot(worktreeRoot) {
 }
 
 async function validateSavedProjectRoots(roots, fileSystem) {
+  if (roots.some((root) => !path.win32.isAbsolute(root))) {
+    const error = new Error('Saved project root is unavailable');
+    error.code = 'PROJECT_ROOT_UNAVAILABLE';
+    throw error;
+  }
   for (const root of roots) {
     try {
       const info = await fileSystem.stat(root);
@@ -282,8 +328,8 @@ async function inspectSavedProjectGit({ sourceRoot, gitRunner, fileSystem }) {
     const repositoryRoot = String(result?.stdout ?? '').trim();
     if (!repositoryRoot || !path.win32.isAbsolute(repositoryRoot)) throw new Error('invalid repository root');
     return { isRepo: true, repositoryRoot: path.win32.normalize(repositoryRoot) };
-  } catch {
-    if (!markerPresent) return { isRepo: false, repositoryRoot: null };
+  } catch (error) {
+    if (error?.code === 'GIT_NOT_REPOSITORY' && !markerPresent) return { isRepo: false, repositoryRoot: null };
     throw sanitizedGitInspectionError();
   }
 }
@@ -295,7 +341,9 @@ function parseWorktreePorcelain(output) {
     if (!field) continue;
     if (field.startsWith('worktree ')) {
       if (current) records.push(current);
-      current = { path: field.slice('worktree '.length), branch: null };
+      current = { path: field.slice('worktree '.length), branch: null, head: null };
+    } else if (current && field.startsWith('HEAD ')) {
+      current.head = field.slice('HEAD '.length);
     } else if (current && field.startsWith('branch ')) {
       current.branch = field.slice('branch '.length);
     }
@@ -304,7 +352,7 @@ function parseWorktreePorcelain(output) {
   return records;
 }
 
-async function proveOwnedWorkspace({ workspace, worktreeRoot, operationId, gitRunner }) {
+function structurallyOwnedWorkspace({ workspace, worktreeRoot, operationId }) {
   if (!workspace || workspace.mode !== 'worktree') return false;
   let configuredRoot;
   try {
@@ -312,48 +360,106 @@ async function proveOwnedWorkspace({ workspace, worktreeRoot, operationId, gitRu
   } catch {
     return false;
   }
-  const expectedPath = path.resolve(configuredRoot, operationId);
-  const actualPath = path.resolve(String(workspace.worktreePath ?? ''));
+  const expectedPath = path.win32.resolve(configuredRoot, operationId);
+  const actualPath = String(workspace.worktreePath ?? '');
   const repositoryRoot = String(workspace.repositoryRoot ?? '').trim();
   const sourceRoot = String(workspace.sourceRoot ?? '').trim();
   const branchName = String(workspace.branchName ?? '');
   const structurallyOwned = workspace.operationId === operationId
-    && actualPath === expectedPath
+    && windowsPathEqual(actualPath, expectedPath)
     && resolvedDescendant(configuredRoot, actualPath)
     && path.win32.isAbsolute(repositoryRoot)
     && path.win32.isAbsolute(sourceRoot)
     && branchName.startsWith('codex/discord-');
-  if (!structurallyOwned) return false;
+  return structurallyOwned;
+}
 
+function validObjectId(value) {
+  return /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/i.test(String(value ?? ''));
+}
+
+async function exactBranchOid({ repositoryRoot, branchRef, gitRunner }) {
   try {
-    const sourceProbe = await gitRunner({
-      command: 'git', args: ['-C', sourceRoot, 'rev-parse', '--show-toplevel'],
+    const result = await gitRunner({
+      command: 'git', args: ['-C', repositoryRoot, 'show-ref', '--verify', '--hash', branchRef],
     });
-    if (path.resolve(String(sourceProbe?.stdout ?? '').trim()) !== path.resolve(repositoryRoot)) return false;
-    const metadata = await gitRunner({
-      command: 'git', args: ['-C', repositoryRoot, 'worktree', 'list', '--porcelain', '-z'],
-    });
-    return parseWorktreePorcelain(metadata?.stdout).some((item) => (
-      path.resolve(item.path) === actualPath
-      && item.branch === `refs/heads/${branchName}`
-    ));
-  } catch {
-    return false;
+    const oid = String(result?.stdout ?? '').trim();
+    return validObjectId(oid) ? { state: 'present', oid } : { state: 'invalid' };
+  } catch (error) {
+    if (error?.code === 'GIT_REF_NOT_FOUND') return { state: 'missing' };
+    return { state: 'unknown' };
   }
 }
 
-async function cleanupOwnedWorkspace({ workspace, worktreeRoot, operationId, gitRunner }) {
-  if (!await proveOwnedWorkspace({ workspace, worktreeRoot, operationId, gitRunner })) return false;
-  const actualPath = path.resolve(workspace.worktreePath);
-  await gitRunner({
-    command: 'git',
-    args: ['-C', workspace.repositoryRoot, 'worktree', 'remove', '--force', actualPath],
-  });
-  await gitRunner({
-    command: 'git',
-    args: ['-C', workspace.repositoryRoot, 'branch', '-D', workspace.branchName],
-  });
-  return true;
+async function proveOwnedWorkspace({ workspace, worktreeRoot, operationId, gitRunner }) {
+  if (!structurallyOwnedWorkspace({ workspace, worktreeRoot, operationId })) return null;
+  const branchRef = `refs/heads/${workspace.branchName}`;
+
+  try {
+    const sourceProbe = await gitRunner({
+      command: 'git', args: ['-C', workspace.sourceRoot, 'rev-parse', '--show-toplevel'],
+    });
+    if (!windowsPathEqual(String(sourceProbe?.stdout ?? '').trim(), workspace.repositoryRoot)) return null;
+    const metadata = await gitRunner({
+      command: 'git', args: ['-C', workspace.repositoryRoot, 'worktree', 'list', '--porcelain', '-z'],
+    });
+    const matches = parseWorktreePorcelain(metadata?.stdout).filter((item) => (
+      windowsPathEqual(item.path, workspace.worktreePath) && item.branch === branchRef && validObjectId(item.head)
+    ));
+    if (matches.length !== 1) return null;
+    const branch = await exactBranchOid({
+      repositoryRoot: workspace.repositoryRoot, branchRef, gitRunner,
+    });
+    if (branch.state !== 'present' || branch.oid.toLocaleLowerCase('en-US') !== matches[0].head.toLocaleLowerCase('en-US')) {
+      return null;
+    }
+    return {
+      repositoryRoot: workspace.repositoryRoot,
+      sourceRoot: workspace.sourceRoot,
+      worktreePath: workspace.worktreePath,
+      branchName: workspace.branchName,
+      branchRef,
+      branchOid: branch.oid,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function validCleanupProof({ proof, workspace, worktreeRoot, operationId }) {
+  return structurallyOwnedWorkspace({ workspace, worktreeRoot, operationId })
+    && proof && typeof proof === 'object'
+    && windowsPathEqual(proof.repositoryRoot, workspace.repositoryRoot)
+    && windowsPathEqual(proof.sourceRoot, workspace.sourceRoot)
+    && windowsPathEqual(proof.worktreePath, workspace.worktreePath)
+    && proof.branchName === workspace.branchName
+    && proof.branchRef === `refs/heads/${workspace.branchName}`
+    && validObjectId(proof.branchOid);
+}
+
+async function inspectProvenWorktree({ proof, gitRunner }) {
+  try {
+    const sourceProbe = await gitRunner({
+      command: 'git', args: ['-C', proof.sourceRoot, 'rev-parse', '--show-toplevel'],
+    });
+    if (!windowsPathEqual(String(sourceProbe?.stdout ?? '').trim(), proof.repositoryRoot)) return 'crossed';
+    const metadata = await gitRunner({
+      command: 'git', args: ['-C', proof.repositoryRoot, 'worktree', 'list', '--porcelain', '-z'],
+    });
+    const records = parseWorktreePorcelain(metadata?.stdout);
+    const exact = records.filter((item) => (
+      windowsPathEqual(item.path, proof.worktreePath)
+      && item.branch === proof.branchRef
+      && String(item.head).toLocaleLowerCase('en-US') === proof.branchOid.toLocaleLowerCase('en-US')
+    ));
+    if (exact.length === 1) return 'present';
+    const crossed = records.some((item) => (
+      windowsPathEqual(item.path, proof.worktreePath) || item.branch === proof.branchRef
+    ));
+    return crossed ? 'crossed' : 'removed';
+  } catch {
+    return 'unknown';
+  }
 }
 
 function noOpCleanup() {
@@ -426,7 +532,7 @@ export async function prepareTaskWorkspace({
   }
 
   const branchName = `codex/discord-${formatBranchTimestamp(now)}-${randomBytes(3).toString('hex')}`;
-  const worktreePath = path.resolve(configuredWorktreeRoot, operationId);
+  const worktreePath = path.win32.resolve(configuredWorktreeRoot, operationId);
   if (!resolvedDescendant(configuredWorktreeRoot, worktreePath)) throw new Error('Unsafe worktree path');
   const workspace = {
     mode: 'worktree',
@@ -445,22 +551,12 @@ export async function prepareTaskWorkspace({
       args: ['-C', sourceRoot, 'worktree', 'add', '-b', branchName, worktreePath, baseRef],
     });
   } catch {
-    await cleanupOwnedWorkspace({
-      workspace,
-      worktreeRoot: configuredWorktreeRoot,
-      operationId,
-      gitRunner,
-    }).catch(() => false);
     const error = new Error('Git workspace preparation failed');
     error.code = 'GIT_WORKSPACE_PREP_FAILED';
+    error.workspace = workspace;
     throw error;
   }
-  workspace.cleanupBeforeThreadStart = () => cleanupOwnedWorkspace({
-    workspace,
-    worktreeRoot: configuredWorktreeRoot,
-    operationId,
-    gitRunner,
-  });
+  workspace.cleanupBeforeThreadStart = noOpCleanup;
   return workspace;
 }
 
@@ -486,6 +582,103 @@ async function persistInteractionRecord({ state, interactionId, record, persistS
   }
 }
 
+async function sourceMatchesProof({ proof, gitRunner }) {
+  try {
+    const sourceProbe = await gitRunner({
+      command: 'git', args: ['-C', proof.sourceRoot, 'rev-parse', '--show-toplevel'],
+    });
+    return windowsPathEqual(String(sourceProbe?.stdout ?? '').trim(), proof.repositoryRoot);
+  } catch {
+    return false;
+  }
+}
+
+async function cleanupWithJournal({
+  state,
+  interactionId,
+  workspace,
+  worktreeRoot,
+  gitRunner,
+  persistState,
+  finalRecord,
+}) {
+  if (!workspace || workspace.mode !== 'worktree') {
+    await persistInteractionRecord({ state, interactionId, record: finalRecord, persistState });
+    return { completed: true, cleaned: false, retryable: false };
+  }
+
+  let current = state.createdTasksByInteraction[interactionId];
+  let proof = current?.cleanupProof;
+  if (!['cleanup-proven', 'worktree-removed'].includes(current?.status)) {
+    proof = await proveOwnedWorkspace({ workspace, worktreeRoot, operationId: interactionId, gitRunner });
+    if (!proof) return { completed: false, cleaned: false, retryable: true };
+    await persistInteractionRecord({
+      state,
+      interactionId,
+      record: { ...current, status: 'cleanup-proven', workspace, cleanupProof: proof },
+      persistState,
+    });
+    current = state.createdTasksByInteraction[interactionId];
+  }
+
+  if (!validCleanupProof({ proof, workspace, worktreeRoot, operationId: interactionId })) {
+    return { completed: false, cleaned: false, retryable: true };
+  }
+
+  if (current.status === 'cleanup-proven') {
+    const association = await inspectProvenWorktree({ proof, gitRunner });
+    if (!['present', 'removed'].includes(association)) {
+      return { completed: false, cleaned: false, retryable: true };
+    }
+    if (association === 'present') {
+      try {
+        await gitRunner({
+          command: 'git',
+          args: ['-C', proof.repositoryRoot, 'worktree', 'remove', '--force', proof.worktreePath],
+        });
+      } catch {
+        return { completed: false, cleaned: false, retryable: true };
+      }
+    }
+    await persistInteractionRecord({
+      state,
+      interactionId,
+      record: { ...current, status: 'worktree-removed', workspace, cleanupProof: proof },
+      persistState,
+    });
+    current = state.createdTasksByInteraction[interactionId];
+  }
+
+  if (!await sourceMatchesProof({ proof, gitRunner })) {
+    return { completed: false, cleaned: false, retryable: true };
+  }
+  const branch = await exactBranchOid({
+    repositoryRoot: proof.repositoryRoot, branchRef: proof.branchRef, gitRunner,
+  });
+  if (branch.state === 'present') {
+    if (branch.oid.toLocaleLowerCase('en-US') !== proof.branchOid.toLocaleLowerCase('en-US')) {
+      return { completed: false, cleaned: false, retryable: true };
+    }
+    try {
+      await gitRunner({
+        command: 'git', args: ['-C', proof.repositoryRoot, 'branch', '-D', proof.branchName],
+      });
+    } catch {
+      return { completed: false, cleaned: false, retryable: true };
+    }
+  } else if (branch.state !== 'missing') {
+    return { completed: false, cleaned: false, retryable: true };
+  }
+
+  await persistInteractionRecord({
+    state,
+    interactionId,
+    record: { ...finalRecord, workspace, cleanupProof: proof },
+    persistState,
+  });
+  return { completed: true, cleaned: true, retryable: false };
+}
+
 export async function startNewCodexTask({
   selection,
   workspace,
@@ -494,6 +687,7 @@ export async function startNewCodexTask({
   codexPath,
   processCwd,
   clientFactory,
+  onThreadStarting,
   onThreadCreated,
 } = {}) {
   const client = createClient({ clientFactory, codexPath, processCwd });
@@ -501,6 +695,7 @@ export async function startNewCodexTask({
   let taskName = '生成中';
   try {
     await initializeAppServerClient(client);
+    await onThreadStarting?.({ workspace });
     const threadResult = await client.request({
       method: 'thread/start',
       id: 2,
@@ -619,6 +814,14 @@ export async function createNewTaskOnce({
         codexPath,
         processCwd,
         clientFactory,
+        onThreadStarting: async () => {
+          await persistInteractionRecord({
+            state,
+            interactionId,
+            record: { status: 'thread-starting', workspace: persistentWorkspace },
+            persistState,
+          });
+        },
         onThreadCreated: async ({ threadId, taskName }) => {
           await persistInteractionRecord({
             state,
@@ -646,9 +849,6 @@ export async function createNewTaskOnce({
     } catch (error) {
       const current = state.createdTasksByInteraction[interactionId];
       if (error?.persistenceFailure) {
-        if (!current?.threadId && prepared?.cleanupBeforeThreadStart) {
-          await prepared.cleanupBeforeThreadStart().catch(() => false);
-        }
         throw error;
       }
       if (error?.threadId || current?.threadId) {
@@ -662,23 +862,22 @@ export async function createNewTaskOnce({
         await persistInteractionRecord({ state, interactionId, record, persistState });
         return record;
       }
-      let cleanupCategory = null;
-      if (prepared?.cleanupBeforeThreadStart) {
-        try {
-          await prepared.cleanupBeforeThreadStart();
-        } catch {
-          cleanupCategory = 'git-cleanup-failed';
-        }
+      if (current?.status === 'thread-starting') {
+        throw error;
       }
-      await persistInteractionRecord({
+      const workspace = persistableWorkspace(error?.workspace ?? prepared ?? current?.workspace);
+      await cleanupWithJournal({
         state,
         interactionId,
-        record: {
-          status: 'failed-before-thread',
-          workspace: persistableWorkspace(prepared ?? current?.workspace),
-          errorCategory: cleanupCategory ?? taskCreationErrorCategory(error),
-        },
+        workspace,
+        worktreeRoot,
+        gitRunner,
         persistState,
+        finalRecord: {
+          status: 'failed-before-thread',
+          workspace,
+          errorCategory: taskCreationErrorCategory(error),
+        },
       });
       throw error;
     }
@@ -704,39 +903,36 @@ export async function recoverInterruptedTaskCreations({
   state.createdTasksByInteraction ??= {};
   const results = [];
   for (const [interactionId, record] of Object.entries(state.createdTasksByInteraction)) {
-    if (!['creating', 'workspace-ready', 'recovering'].includes(record?.status) || record?.threadId) continue;
-    await persistInteractionRecord({
-      state,
-      interactionId,
-      record: { ...record, status: 'recovering', recoveryStartedAt: new Date(nowMs).toISOString() },
-      persistState,
-    });
-    let cleaned = false;
-    let errorCategory = null;
-    if (record.workspace) {
-      try {
-        cleaned = await cleanupOwnedWorkspace({
-          workspace: record.workspace,
-          worktreeRoot,
-          operationId: interactionId,
-          gitRunner,
-        });
-      } catch {
-        errorCategory = 'git-cleanup-failed';
-      }
+    if (!['creating', 'workspace-ready', 'recovering', 'cleanup-proven', 'worktree-removed'].includes(record?.status)
+      || record?.threadId) continue;
+    if (!['cleanup-proven', 'worktree-removed'].includes(record.status)) {
+      await persistInteractionRecord({
+        state,
+        interactionId,
+        record: { ...record, status: 'recovering', recoveryStartedAt: new Date(nowMs).toISOString() },
+        persistState,
+      });
     }
-    await persistInteractionRecord({
+    const workspace = state.createdTasksByInteraction[interactionId].workspace;
+    const outcome = await cleanupWithJournal({
       state,
       interactionId,
-      record: {
+      workspace,
+      worktreeRoot,
+      gitRunner,
+      persistState,
+      finalRecord: {
         ...record,
         status: 'recovered-failed',
         recoveredAt: new Date(nowMs).toISOString(),
-        ...(errorCategory ? { errorCategory } : {}),
       },
-      persistState,
     });
-    results.push({ interactionId, cleaned, status: 'recovered-failed', ...(errorCategory ? { errorCategory } : {}) });
+    results.push({
+      interactionId,
+      cleaned: outcome.cleaned,
+      status: state.createdTasksByInteraction[interactionId].status,
+      ...(outcome.retryable ? { retryable: true } : {}),
+    });
   }
   return results;
 }

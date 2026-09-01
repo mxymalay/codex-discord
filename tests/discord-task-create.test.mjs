@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { PassThrough } from 'node:stream';
 import test from 'node:test';
 
 import {
@@ -41,14 +43,20 @@ function fakeAppServer(methods, responses, messages = []) {
 function fakeGitRunner(calls, {
   isRepo = true,
   defaultRef = 'origin/main',
-  head = '0123456789abcdef',
+  head = '0123456789abcdef0123456789abcdef01234567',
   headError = null,
   repositoryRoot = 'C:\\repo',
   probeError = null,
   versionError = null,
   partialAddError = null,
+  removeError = null,
+  branchDeleteFailure = null,
+  branchHeads = new Map(),
   worktrees = [],
 } = {}) {
+  for (const item of worktrees) {
+    branchHeads.set(item.branch, item.head ?? head);
+  }
   return async ({ command, args }) => {
     calls.push({ command, args: [...args] });
     assert.equal(command, 'git');
@@ -71,13 +79,30 @@ function fakeGitRunner(calls, {
       const branch = args[args.indexOf('-b') + 1];
       const worktreePath = args.at(-2);
       worktrees.push({ path: worktreePath, branch, head });
+      branchHeads.set(branch, head);
       if (partialAddError) throw partialAddError;
       return { stdout: '' };
     }
     if (args.includes('worktree') && args.includes('remove')) {
+      if (removeError) throw removeError;
       const target = path.resolve(args.at(-1));
       const index = worktrees.findIndex((item) => path.resolve(item.path) === target);
       if (index >= 0) worktrees.splice(index, 1);
+      return { stdout: '' };
+    }
+    if (args.includes('show-ref') && args.includes('--verify')) {
+      const branch = String(args.at(-1)).replace(/^refs\/heads\//, '');
+      if (!branchHeads.has(branch)) {
+        throw Object.assign(new Error('missing ref'), { code: 'GIT_REF_NOT_FOUND' });
+      }
+      return { stdout: `${branchHeads.get(branch)}\n` };
+    }
+    if (args.includes('branch') && args.includes('-D')) {
+      if (branchDeleteFailure?.remaining > 0) {
+        branchDeleteFailure.remaining -= 1;
+        throw Object.assign(new Error('branch delete failed'), { code: 'GIT_FAILED' });
+      }
+      branchHeads.delete(args.at(-1));
       return { stdout: '' };
     }
     if (args.at(-1) === '--show-toplevel') {
@@ -142,6 +167,21 @@ function project(overrides = {}) {
     id: 'project-1',
     name: 'POS',
     roots: [{ path: 'C:\\repo' }, { path: 'C:\\shared' }],
+    ...overrides,
+  };
+}
+
+function generatedWorkspace(operationId, overrides = {}) {
+  const worktreePath = `G:\\codex-worktrees\\${operationId}`;
+  return {
+    mode: 'worktree',
+    cwd: worktreePath,
+    runtimeWorkspaceRoots: [worktreePath],
+    worktreePath,
+    branchName: 'codex/discord-20260901-010203-abcdef',
+    sourceRoot: 'C:\\repo',
+    repositoryRoot: 'C:\\repo',
+    operationId,
     ...overrides,
   };
 }
@@ -485,6 +525,22 @@ test('rejects missing and non-directory saved roots before probing Git', async (
   }
 });
 
+test('requires every saved project root to be absolute before filesystem or Git access', async () => {
+  const calls = [];
+  let statCalls = 0;
+  await assert.rejects(() => prepareTaskWorkspace({
+    selection: { kind: 'project', projectId: 'p1', projectName: 'POS', roots: ['C:\\repo', 'relative\\shared'] },
+    worktreeRoot: 'G:\\codex-worktrees', operationId: 'absoluteroot1',
+    fileSystem: {
+      ...fakeFileSystem(),
+      async stat() { statCalls += 1; return { isDirectory: () => true }; },
+    },
+    gitRunner: fakeGitRunner(calls),
+  }), /saved project root is unavailable/i);
+  assert.equal(statCalls, 0);
+  assert.deepEqual(calls, []);
+});
+
 test('does not bypass Git isolation when executable, ownership, or repository probes fail', async (t) => {
   const cases = [
     ['missing executable', {
@@ -515,6 +571,66 @@ test('does not bypass Git isolation when executable, ownership, or repository pr
       });
       assert.equal(calls.some(({ args }) => args.includes('add')), false);
     });
+  }
+});
+
+test('missing Git markers plus a generic repository probe failure remains fatal', async () => {
+  const calls = [];
+  await assert.rejects(() => prepareTaskWorkspace({
+    selection: { kind: 'project', projectId: 'p1', projectName: 'Files', roots: ['C:\\files'] },
+    worktreeRoot: 'G:\\codex-worktrees', operationId: 'genericprobe1',
+    fileSystem: fakeFileSystem(),
+    gitRunner: fakeGitRunner(calls, {
+      probeError: Object.assign(new Error('fatal from localized Git C:\\private'), { code: 'GIT_FAILED' }),
+    }),
+  }), (error) => {
+    assert.equal(error.message, 'Git workspace inspection failed');
+    assert.equal(error.message.includes('private'), false);
+    return true;
+  });
+  assert.equal(calls.some(({ args }) => args.includes('add')), false);
+});
+
+test('the default Git runner sanitizes probe environment and classifies only the controlled not-repository result', async () => {
+  const taskCreate = await import('../discord-task-create-lib.mjs');
+  assert.equal(typeof taskCreate.runGitWithSpawn, 'function');
+  const invocations = [];
+  const spawnImpl = (_command, _args, options) => {
+    invocations.push(options);
+    const child = new EventEmitter();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    setImmediate(() => {
+      child.stderr.write('fatal: not a git repository (or any of the parent directories): .git\n');
+      child.stderr.end();
+      child.emit('close', 128);
+    });
+    return child;
+  };
+  const environment = {
+    PATH: 'C:\\Git\\cmd',
+    GIT_DIR: 'C:\\attacker',
+    GIT_WORK_TREE: 'C:\\attacker-tree',
+    GIT_CEILING_DIRECTORIES: 'C:\\plain',
+    GIT_DISCOVERY_ACROSS_FILESYSTEM: 'false',
+    LC_ALL: 'zh_CN.UTF-8',
+  };
+
+  await assert.rejects(() => taskCreate.runGitWithSpawn({
+    args: ['-C', 'C:\\plain', 'rev-parse', '--show-toplevel'], spawnImpl, environment,
+  }), (error) => error.code === 'GIT_NOT_REPOSITORY' && !error.message.includes('plain'));
+  await assert.rejects(() => taskCreate.runGitWithSpawn({
+    args: ['-C', 'C:\\plain', 'symbolic-ref', 'HEAD'], spawnImpl, environment,
+  }), (error) => error.code === 'GIT_FAILED' && !error.message.includes('plain'));
+
+  for (const options of invocations) {
+    assert.equal(options.shell, false);
+    assert.equal(options.env.GIT_DIR, undefined);
+    assert.equal(options.env.GIT_WORK_TREE, undefined);
+    assert.equal(options.env.GIT_CEILING_DIRECTORIES, undefined);
+    assert.equal(options.env.GIT_DISCOVERY_ACROSS_FILESYSTEM, undefined);
+    assert.equal(options.env.LC_ALL, 'C');
+    assert.equal(options.env.LANG, 'C');
   }
 });
 
@@ -652,7 +768,7 @@ test('persists each creation state before the corresponding external mutation an
       clients += 1;
       return fakeAppServer(methods, {
         'thread/start': () => {
-          assert.equal(state.createdTasksByInteraction['interaction-once'].status, 'workspace-ready');
+          assert.equal(state.createdTasksByInteraction['interaction-once'].status, 'thread-starting');
           return { thread: { id: 'thread-once', name: null } };
         },
         'turn/start': () => {
@@ -724,12 +840,13 @@ test('awaits durable creation transitions before each following Git or App Serve
   before('persist:creating', 'fs:stat');
   before('persist:creating-planned', 'git:add');
   before('persist:workspace-ready', 'app:initialize');
+  before('persist:thread-starting', 'app:thread/start');
   before('persist:thread-created', 'app:turn/start');
   before('app:turn/start', 'persist:started');
   assert.deepEqual(snapshots.map((snapshot) => {
     const record = snapshot.createdTasksByInteraction.durable1;
     return `${record.status}${record.status === 'creating' && record.workspace ? '-planned' : ''}`;
-  }), ['creating', 'creating-planned', 'workspace-ready', 'thread-created', 'started']);
+  }), ['creating', 'creating-planned', 'workspace-ready', 'thread-starting', 'thread-created', 'started']);
 
   for (const snapshot of snapshots) {
     let externalCalls = 0;
@@ -745,6 +862,64 @@ test('awaits durable creation transitions before each following Git or App Serve
     assert.equal(duplicate.duplicate, true);
     assert.equal(externalCalls, 0);
   }
+});
+
+test('a failed thread-created persistence reloads the non-cleanable thread-starting boundary', async () => {
+  const state = {};
+  const durableSnapshots = [];
+  const gitCalls = [];
+  let statusAtThreadStart = null;
+  await assert.rejects(() => createNewTaskOnce({
+    state, interactionId: 'threadboundary1',
+    selection: { kind: 'project', projectId: 'p1', projectName: 'POS', roots: ['C:\\repo'] },
+    worktreeRoot: 'G:\\codex-worktrees', text: 'durable thread boundary',
+    codexPath: 'codex', processCwd: 'C:\\repo',
+    fileSystem: fakeFileSystem({ gitRoots: ['C:\\repo'] }),
+    gitRunner: fakeGitRunner(gitCalls),
+    persistState: async (current) => {
+      const snapshot = structuredClone(current);
+      const status = snapshot.createdTasksByInteraction.threadboundary1.status;
+      if (status === 'thread-created') throw new Error('disk unavailable C:\\private');
+      durableSnapshots.push(snapshot);
+    },
+    clientFactory: () => fakeAppServer([], {
+      'thread/start': () => {
+        statusAtThreadStart = state.createdTasksByInteraction.threadboundary1.status;
+        return { thread: { id: 'thread-ambiguous', name: null } };
+      },
+      'turn/start': { turn: { id: 'must-not-start' } },
+    }),
+  }), (error) => {
+    assert.equal(error.message, 'Task creation state persistence failed');
+    assert.equal(error.message.includes('private'), false);
+    return true;
+  });
+
+  assert.equal(statusAtThreadStart, 'thread-starting');
+  const reloaded = structuredClone(durableSnapshots.at(-1));
+  assert.equal(reloaded.createdTasksByInteraction.threadboundary1.status, 'thread-starting');
+  assert.equal(gitCalls.some(({ args }) => args.includes('remove') || args.includes('-D')), false);
+
+  let duplicateCalls = 0;
+  const duplicate = await createNewTaskOnce({
+    state: structuredClone(reloaded), interactionId: 'threadboundary1',
+    persistState: async () => { duplicateCalls += 1; },
+    gitRunner: async () => { duplicateCalls += 1; },
+    clientFactory: () => { duplicateCalls += 1; },
+  });
+  assert.equal(duplicate.duplicate, true);
+  assert.equal(duplicate.status, 'thread-starting');
+  assert.equal(duplicateCalls, 0);
+
+  const recoveryCalls = [];
+  const recoveryState = structuredClone(reloaded);
+  assert.deepEqual(await recoverInterruptedTaskCreations({
+    state: recoveryState, worktreeRoot: 'G:\\codex-worktrees',
+    persistState: async () => { throw new Error('thread-starting must not be rewritten'); },
+    gitRunner: fakeGitRunner(recoveryCalls),
+  }), []);
+  assert.equal(recoveryState.createdTasksByInteraction.threadboundary1.status, 'thread-starting');
+  assert.deepEqual(recoveryCalls, []);
 });
 
 test('creation and recovery require an injected persistence boundary before external mutation', async (t) => {
@@ -809,6 +984,9 @@ test('persists an operation plan before worktree add and safely cleans an immedi
   const plannedIndex = persistence.snapshots.findIndex((snapshot) => snapshot.createdTasksByInteraction.partial1.workspace?.mode === 'worktree');
   assert.notEqual(plannedIndex, -1);
   assert.ok(events.indexOf('persist:creating-planned') < events.indexOf('git:add'));
+  assert.deepEqual(persistence.snapshots.slice(-3).map((snapshot) => snapshot.createdTasksByInteraction.partial1.status), [
+    'cleanup-proven', 'worktree-removed', 'failed-before-thread',
+  ]);
   assert.equal(persistence.snapshots.at(-1).createdTasksByInteraction.partial1.status, 'failed-before-thread');
   assert.equal(calls.filter(({ args }) => args.includes('remove') || args.includes('-D')).length, 2);
   assert.deepEqual(worktrees, []);
@@ -865,7 +1043,7 @@ test('a restart during worktree add reloads the durable plan, prevents duplicati
   });
   assert.equal(recovered[0].cleaned, true);
   assert.deepEqual(recoveryPersistence.snapshots.map((snapshot) => snapshot.createdTasksByInteraction.crashadd1.status), [
-    'recovering', 'recovered-failed',
+    'recovering', 'cleanup-proven', 'worktree-removed', 'recovered-failed',
   ]);
   assert.equal(recoveryCalls.filter(({ args }) => args.includes('remove') || args.includes('-D')).length, 2);
 
@@ -873,7 +1051,7 @@ test('a restart during worktree add reloads the durable plan, prevents duplicati
   await assert.rejects(() => creation, /Git workspace preparation failed/);
 });
 
-test('cleans only its generated worktree and branch when thread creation fails', async () => {
+test('journals cleanup of only its generated worktree and branch before thread-starting', async () => {
   const state = {};
   const gitCalls = [];
   const persistence = capturingPersistence();
@@ -887,8 +1065,8 @@ test('cleans only its generated worktree and branch when thread creation fails',
     fileSystem: fakeFileSystem({ gitRoots: ['C:\\repo'] }),
     persistState: persistence.persistState,
     gitRunner: fakeGitRunner(gitCalls),
-    clientFactory: () => fakeAppServer([], { 'thread/start': new Error('thread failed') }),
-  }), /thread failed/);
+    clientFactory: () => fakeAppServer([], { initialize: new Error('App Server initialization failed') }),
+  }), /App Server initialization failed/);
 
   const record = state.createdTasksByInteraction.cleanup1;
   assert.equal(record.status, 'failed-before-thread');
@@ -898,7 +1076,33 @@ test('cleans only its generated worktree and branch when thread creation fails',
   assert.deepEqual(destructive[0].args.slice(2), ['worktree', 'remove', '--force', 'G:\\codex-worktrees\\cleanup1']);
   assert.equal(destructive[1].args.at(-2), '-D');
   assert.match(destructive[1].args.at(-1), /^codex\/discord-/);
+  assert.deepEqual(persistence.snapshots.slice(-3).map((snapshot) => snapshot.createdTasksByInteraction.cleanup1.status), [
+    'cleanup-proven', 'worktree-removed', 'failed-before-thread',
+  ]);
+  const proof = persistence.snapshots.at(-3).createdTasksByInteraction.cleanup1.cleanupProof;
+  assert.equal(proof.branchRef, `refs/heads/${record.workspace.branchName}`);
+  assert.match(proof.branchOid, /^[0-9a-f]{40,64}$/i);
   assert.equal(persistence.snapshots.at(-1).createdTasksByInteraction.cleanup1.status, 'failed-before-thread');
+});
+
+test('an ambiguous thread-start request failure retains the non-cleanable workspace', async () => {
+  const state = {};
+  const calls = [];
+  const persistence = capturingPersistence();
+  await assert.rejects(() => createNewTaskOnce({
+    state, interactionId: 'ambiguousstart1',
+    selection: { kind: 'project', projectId: 'p1', projectName: 'POS', roots: ['C:\\repo'] },
+    worktreeRoot: 'G:\\codex-worktrees', text: 'ambiguous', codexPath: 'codex', processCwd: 'C:\\repo',
+    fileSystem: fakeFileSystem({ gitRoots: ['C:\\repo'] }), gitRunner: fakeGitRunner(calls),
+    persistState: persistence.persistState,
+    clientFactory: () => fakeAppServer([], { 'thread/start': new Error('connection closed') }),
+  }), /connection closed/);
+  assert.equal(state.createdTasksByInteraction.ambiguousstart1.status, 'thread-starting');
+  assert.equal(calls.some(({ args }) => args.includes('remove') || args.includes('-D')), false);
+  assert.deepEqual(await recoverInterruptedTaskCreations({
+    state: structuredClone(state), worktreeRoot: 'G:\\codex-worktrees',
+    gitRunner: async () => { throw new Error('must not inspect'); }, persistState: async () => {},
+  }), []);
 });
 
 test('preserves the durable thread and worktree when the first turn fails', async () => {
@@ -985,7 +1189,10 @@ test('startup recovery cleans only descendant, prefixed, operation-owned records
   assert.equal(recovered.find(({ interactionId }) => interactionId === 'valid1').cleaned, true);
   assert.equal(gitCalls.filter(({ args }) => args.includes('remove') || args.includes('-D')).length, 2);
   assert.equal(state.createdTasksByInteraction.valid1.status, 'recovered-failed');
-  assert.equal(state.createdTasksByInteraction.outside1.status, 'recovered-failed');
+  assert.equal(state.createdTasksByInteraction.outside1.status, 'recovering');
+  assert.equal(state.createdTasksByInteraction.prefix1.status, 'recovering');
+  assert.equal(state.createdTasksByInteraction.mismatch1.status, 'recovering');
+  assert.equal(recovered.find(({ interactionId }) => interactionId === 'outside1').retryable, true);
   assert.equal(state.createdTasksByInteraction.durable1.status, 'workspace-ready');
   assert.equal(recovered.some(({ interactionId }) => interactionId === 'durable1'), false);
   assert.equal(persistence.snapshots.at(-1).createdTasksByInteraction.valid1.status, 'recovered-failed');
@@ -1070,6 +1277,172 @@ test('recovery persistence is awaited before any destructive inspection or mutat
   assert.deepEqual(calls, []);
   releasePersist();
   await recovery;
-  assert.equal(persistenceCalls, 2);
+  assert.equal(persistenceCalls, 4);
+  assert.equal(calls.filter(({ args }) => args.includes('remove') || args.includes('-D')).length, 2);
+});
+
+test('cleanup persists exact immutable proof before removal and worktree-removed before branch deletion', async () => {
+  const operationId = 'journalorder1';
+  const workspace = generatedWorkspace(operationId);
+  const events = [];
+  const snapshots = [];
+  const baseGit = fakeGitRunner([], { worktrees: [{
+    path: workspace.worktreePath, branch: workspace.branchName,
+  }] });
+  const gitRunner = async (request) => {
+    if (request.args.includes('remove')) events.push('git:remove');
+    if (request.args.includes('-D')) events.push('git:branch-delete');
+    return baseGit(request);
+  };
+  const state = { createdTasksByInteraction: { [operationId]: { status: 'workspace-ready', workspace } } };
+  const result = await recoverInterruptedTaskCreations({
+    state, worktreeRoot: 'G:\\codex-worktrees', gitRunner,
+    persistState: async (current) => {
+      const snapshot = structuredClone(current);
+      snapshots.push(snapshot);
+      events.push(`persist:${snapshot.createdTasksByInteraction[operationId].status}`);
+    },
+  });
+
+  const statuses = snapshots.map((snapshot) => snapshot.createdTasksByInteraction[operationId].status);
+  assert.deepEqual(statuses, ['recovering', 'cleanup-proven', 'worktree-removed', 'recovered-failed']);
+  assert.ok(events.indexOf('persist:cleanup-proven') < events.indexOf('git:remove'));
+  assert.ok(events.indexOf('persist:worktree-removed') < events.indexOf('git:branch-delete'));
+  const proof = snapshots.find((snapshot) => (
+    snapshot.createdTasksByInteraction[operationId].status === 'cleanup-proven'
+  )).createdTasksByInteraction[operationId].cleanupProof;
+  assert.deepEqual({
+    repositoryRoot: proof.repositoryRoot,
+    sourceRoot: proof.sourceRoot,
+    worktreePath: proof.worktreePath,
+    branchName: proof.branchName,
+    branchRef: proof.branchRef,
+  }, {
+    repositoryRoot: workspace.repositoryRoot,
+    sourceRoot: workspace.sourceRoot,
+    worktreePath: workspace.worktreePath,
+    branchName: workspace.branchName,
+    branchRef: `refs/heads/${workspace.branchName}`,
+  });
+  assert.match(proof.branchOid, /^[0-9a-f]{40,64}$/i);
+  assert.equal(result[0].cleaned, true);
+});
+
+test('cleanup resumes from durable proof after removal succeeds but worktree-removed persistence crashes', async () => {
+  const operationId = 'removecrash1';
+  const workspace = generatedWorkspace(operationId);
+  const worktrees = [{ path: workspace.worktreePath, branch: workspace.branchName }];
+  const branchHeads = new Map();
+  const calls = [];
+  const gitRunner = fakeGitRunner(calls, { worktrees, branchHeads });
+  const durableSnapshots = [];
+  const state = { createdTasksByInteraction: { [operationId]: { status: 'workspace-ready', workspace } } };
+
+  await assert.rejects(() => recoverInterruptedTaskCreations({
+    state, worktreeRoot: 'G:\\codex-worktrees', gitRunner,
+    persistState: async (current) => {
+      const snapshot = structuredClone(current);
+      if (snapshot.createdTasksByInteraction[operationId].status === 'worktree-removed') {
+        throw new Error('disk unavailable');
+      }
+      durableSnapshots.push(snapshot);
+    },
+  }), /state persistence failed/);
+  const reloaded = structuredClone(durableSnapshots.at(-1));
+  assert.equal(reloaded.createdTasksByInteraction[operationId].status, 'cleanup-proven');
+  assert.equal(worktrees.length, 0);
+  assert.equal(calls.filter(({ args }) => args.includes('remove')).length, 1);
+  assert.equal(calls.filter(({ args }) => args.includes('-D')).length, 0);
+
+  const recoveryPersistence = capturingPersistence();
+  const result = await recoverInterruptedTaskCreations({
+    state: reloaded, worktreeRoot: 'G:\\codex-worktrees', gitRunner,
+    persistState: recoveryPersistence.persistState,
+  });
+  assert.equal(result[0].cleaned, true);
+  assert.equal(calls.filter(({ args }) => args.includes('remove')).length, 1);
+  assert.equal(calls.filter(({ args }) => args.includes('-D')).length, 1);
+  assert.deepEqual(recoveryPersistence.snapshots.map((snapshot) => snapshot.createdTasksByInteraction[operationId].status), [
+    'worktree-removed', 'recovered-failed',
+  ]);
+});
+
+test('branch-delete failure leaves a retryable worktree-removed journal and reentry does not remove twice', async () => {
+  const operationId = 'branchretry1';
+  const workspace = generatedWorkspace(operationId);
+  const worktrees = [{ path: workspace.worktreePath, branch: workspace.branchName }];
+  const branchHeads = new Map();
+  const branchDeleteFailure = { remaining: 1 };
+  const calls = [];
+  const gitRunner = fakeGitRunner(calls, { worktrees, branchHeads, branchDeleteFailure });
+  const state = { createdTasksByInteraction: { [operationId]: { status: 'workspace-ready', workspace } } };
+
+  const first = await recoverInterruptedTaskCreations({
+    state, worktreeRoot: 'G:\\codex-worktrees', gitRunner, persistState: async () => {},
+  });
+  assert.equal(first[0].cleaned, false);
+  assert.equal(first[0].retryable, true);
+  assert.equal(state.createdTasksByInteraction[operationId].status, 'worktree-removed');
+  assert.equal(calls.filter(({ args }) => args.includes('remove')).length, 1);
+  assert.equal(calls.filter(({ args }) => args.includes('-D')).length, 1);
+
+  const second = await recoverInterruptedTaskCreations({
+    state, worktreeRoot: 'G:\\codex-worktrees', gitRunner, persistState: async () => {},
+  });
+  assert.equal(second[0].cleaned, true);
+  assert.equal(state.createdTasksByInteraction[operationId].status, 'recovered-failed');
+  assert.equal(calls.filter(({ args }) => args.includes('remove')).length, 1);
+  assert.equal(calls.filter(({ args }) => args.includes('-D')).length, 2);
+});
+
+test('corrupt cleanup proofs remain retryable and make zero destructive calls', async (t) => {
+  const operationId = 'corruptproof1';
+  const workspace = generatedWorkspace(operationId);
+  const validProof = {
+    repositoryRoot: workspace.repositoryRoot,
+    sourceRoot: workspace.sourceRoot,
+    worktreePath: workspace.worktreePath,
+    branchName: workspace.branchName,
+    branchRef: `refs/heads/${workspace.branchName}`,
+    branchOid: '0123456789abcdef0123456789abcdef01234567',
+  };
+  const cases = [
+    ['cleanup-proven', { ...validProof, worktreePath: 'G:\\codex-worktrees\\someone-else' }],
+    ['worktree-removed', { ...validProof, branchRef: 'refs/heads/codex/discord-crossed' }],
+  ];
+  for (const [status, cleanupProof] of cases) {
+    await t.test(status, async () => {
+      const calls = [];
+      const state = { createdTasksByInteraction: { [operationId]: { status, workspace, cleanupProof } } };
+      const result = await recoverInterruptedTaskCreations({
+        state, worktreeRoot: 'G:\\codex-worktrees',
+        gitRunner: fakeGitRunner(calls, { worktrees: [{ path: workspace.worktreePath, branch: workspace.branchName }] }),
+        persistState: async () => {},
+      });
+      assert.equal(result[0].cleaned, false);
+      assert.equal(result[0].retryable, true);
+      assert.equal(state.createdTasksByInteraction[operationId].status, status);
+      assert.equal(calls.some(({ args }) => args.includes('remove') || args.includes('-D')), false);
+    });
+  }
+});
+
+test('Windows repository and worktree identities compare case-insensitively during cleanup', async () => {
+  const operationId = 'pathcase1';
+  const workspace = generatedWorkspace(operationId, {
+    sourceRoot: 'C:\\REPO', repositoryRoot: 'C:\\REPO',
+    worktreePath: 'G:\\CODEX-WORKTREES\\pathcase1', cwd: 'G:\\CODEX-WORKTREES\\pathcase1',
+    runtimeWorkspaceRoots: ['G:\\CODEX-WORKTREES\\pathcase1'],
+  });
+  const calls = [];
+  const state = { createdTasksByInteraction: { [operationId]: { status: 'workspace-ready', workspace } } };
+  const result = await recoverInterruptedTaskCreations({
+    state, worktreeRoot: 'g:\\codex-worktrees', persistState: async () => {},
+    gitRunner: fakeGitRunner(calls, {
+      repositoryRoot: 'c:\\repo',
+      worktrees: [{ path: 'g:\\codex-worktrees\\PATHCASE1', branch: workspace.branchName }],
+    }),
+  });
+  assert.equal(result[0].cleaned, true);
   assert.equal(calls.filter(({ args }) => args.includes('remove') || args.includes('-D')).length, 2);
 });
