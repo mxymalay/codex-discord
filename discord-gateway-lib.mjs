@@ -65,6 +65,9 @@ export function createGatewayClient({
   let heartbeatOutstanding = false;
   let stopped = false;
   let started = false;
+  let lifecycleGeneration = 0;
+  let nextConnectionGeneration = 0;
+  let activeConnectionGeneration = 0;
 
   function snapshot() {
     return { ...status };
@@ -91,28 +94,45 @@ export function createGatewayClient({
     }
   }
 
-  function send(socket, payload) {
-    if (socket === currentSocket && !stopped) socket.send(JSON.stringify(payload));
+  function isLifecycleActive(lifecycle) {
+    return !stopped && lifecycle === lifecycleGeneration;
   }
 
-  function sendHeartbeat(socket) {
-    send(socket, { op: OP.HEARTBEAT, d: sequence });
+  function isConnectionActive(socket, lifecycle, connection) {
+    return isLifecycleActive(lifecycle)
+      && socket === currentSocket
+      && connection === activeConnectionGeneration;
+  }
+
+  function retireCurrentSocket() {
+    const socket = currentSocket;
+    currentSocket = null;
+    activeConnectionGeneration = 0;
+    if (socket) socket.close();
+  }
+
+  function send(socket, lifecycle, connection, payload) {
+    if (isConnectionActive(socket, lifecycle, connection)) socket.send(JSON.stringify(payload));
+  }
+
+  function sendHeartbeat(socket, lifecycle, connection) {
+    send(socket, lifecycle, connection, { op: OP.HEARTBEAT, d: sequence });
     heartbeatOutstanding = true;
     status.lastHeartbeatAt = clock.now();
     publish();
   }
 
-  function scheduleHeartbeat(socket, delay) {
+  function scheduleHeartbeat(socket, lifecycle, connection, delay) {
     clearTimer('heartbeat');
     heartbeatTimer = clock.setTimeout(() => {
       heartbeatTimer = null;
-      if (stopped || socket !== currentSocket) return;
+      if (!isConnectionActive(socket, lifecycle, connection)) return;
       if (heartbeatOutstanding) {
         scheduleReconnect('heartbeat-timeout');
         return;
       }
-      sendHeartbeat(socket);
-      scheduleHeartbeat(socket, heartbeatInterval);
+      sendHeartbeat(socket, lifecycle, connection);
+      scheduleHeartbeat(socket, lifecycle, connection, heartbeatInterval);
     }, delay);
   }
 
@@ -125,7 +145,7 @@ export function createGatewayClient({
     return true;
   }
 
-  function handleDispatch(frame) {
+  function handleDispatch(frame, lifecycle, connection) {
     if (frame.s !== null && frame.s !== undefined) sequence = frame.s;
     status.lastEventAt = clock.now();
     if (frame.t === 'READY' && typeof frame.d?.session_id === 'string') {
@@ -136,15 +156,19 @@ export function createGatewayClient({
     }
     publish();
     if (frame.t === 'INTERACTION_CREATE' && typeof frame.d?.id === 'string' && rememberInteraction(frame.d.id)) {
-      Promise.resolve(onInteraction(frame.d)).catch(() => {
-        status.lastError = 'interaction-handler-failed';
-        publish();
-      });
+      Promise.resolve()
+        .then(() => onInteraction(frame.d))
+        .catch(() => {
+          if (isLifecycleActive(lifecycle) && connection === activeConnectionGeneration) {
+            status.lastError = 'interaction-handler-failed';
+            publish();
+          }
+        });
     }
   }
 
-  function handleFrame(socket, event) {
-    if (stopped || socket !== currentSocket) return;
+  function handleFrame(socket, lifecycle, connection, event) {
+    if (!isConnectionActive(socket, lifecycle, connection)) return;
     let frame;
     try {
       frame = JSON.parse(event.data);
@@ -154,7 +178,7 @@ export function createGatewayClient({
       return;
     }
     if (frame.op === OP.DISPATCH) {
-      handleDispatch(frame);
+      handleDispatch(frame, lifecycle, connection);
       return;
     }
     if (frame.op === OP.HELLO) {
@@ -164,13 +188,14 @@ export function createGatewayClient({
         scheduleReconnect('gateway-hello-invalid');
         return;
       }
-      if (status.sessionId !== null && sequence !== null) send(socket, resumePayload(token, status.sessionId, sequence));
-      else send(socket, identifyPayload(token));
-      scheduleHeartbeat(socket, Math.floor(clock.random() * heartbeatInterval));
+      if (status.sessionId !== null && sequence !== null) send(socket, lifecycle, connection, resumePayload(token, status.sessionId, sequence));
+      else send(socket, lifecycle, connection, identifyPayload(token));
+      scheduleHeartbeat(socket, lifecycle, connection, Math.floor(clock.random() * heartbeatInterval));
       return;
     }
     if (frame.op === OP.HEARTBEAT) {
-      sendHeartbeat(socket);
+      sendHeartbeat(socket, lifecycle, connection);
+      scheduleHeartbeat(socket, lifecycle, connection, heartbeatInterval);
       return;
     }
     if (frame.op === OP.HEARTBEAT_ACK) {
@@ -191,8 +216,8 @@ export function createGatewayClient({
     }
   }
 
-  function connect() {
-    if (stopped) return false;
+  function connect(lifecycle) {
+    if (!isLifecycleActive(lifecycle)) return false;
     const url = resumeGatewayUrl ?? gatewayUrl;
     if (!url) {
       status.lastError = 'gateway-url-unavailable';
@@ -209,34 +234,44 @@ export function createGatewayClient({
       setState('disconnected');
       return false;
     }
+    if (!isLifecycleActive(lifecycle)) {
+      socket.close();
+      return false;
+    }
+    const connection = ++nextConnectionGeneration;
     currentSocket = socket;
-    socket.addEventListener('message', (event) => handleFrame(socket, event));
+    activeConnectionGeneration = connection;
+    socket.addEventListener('message', (event) => handleFrame(socket, lifecycle, connection, event));
     socket.addEventListener('close', () => {
-      if (!stopped && socket === currentSocket) scheduleReconnect('gateway-closed');
+      if (isConnectionActive(socket, lifecycle, connection)) scheduleReconnect('gateway-closed');
     });
     socket.addEventListener('error', () => {
-      if (!stopped && socket === currentSocket) scheduleReconnect('gateway-error');
+      if (isConnectionActive(socket, lifecycle, connection)) scheduleReconnect('gateway-error');
     });
     return true;
   }
 
   function scheduleReconnect(reason) {
     if (stopped || reconnectTimer !== null) return;
+    const lifecycle = lifecycleGeneration;
     clearTimer('heartbeat');
     heartbeatOutstanding = false;
+    retireCurrentSocket();
     status.reconnectCount += 1;
     status.lastError = reason;
     setState('reconnecting');
     const delay = RECONNECT_DELAYS[Math.min(status.reconnectCount - 1, RECONNECT_DELAYS.length - 1)];
     reconnectTimer = clock.setTimeout(() => {
       reconnectTimer = null;
-      if (!connect()) scheduleReconnect('gateway-connect-failed');
+      if (!isLifecycleActive(lifecycle)) return;
+      if (!connect(lifecycle)) scheduleReconnect('gateway-connect-failed');
     }, delay);
   }
 
   return {
     async start() {
       if (started) return;
+      const lifecycle = ++lifecycleGeneration;
       started = true;
       stopped = false;
       setState('connecting', null);
@@ -248,26 +283,29 @@ export function createGatewayClient({
         if (!response?.ok) throw gatewayError();
         const body = await response.json();
         if (typeof body?.url !== 'string') throw gatewayError();
+        if (!isLifecycleActive(lifecycle)) return;
         gatewayUrl = body.url;
       } catch {
+        if (!isLifecycleActive(lifecycle)) return;
         started = false;
         status.lastError = 'gateway-connect-failed';
         setState('disconnected');
         throw gatewayError();
       }
-      if (!connect()) {
+      if (!connect(lifecycle)) {
+        if (!isLifecycleActive(lifecycle)) return;
         started = false;
         throw gatewayError();
       }
     },
 
     async stop() {
+      lifecycleGeneration += 1;
       stopped = true;
       started = false;
       clearTimer('heartbeat');
       clearTimer('reconnect');
-      if (currentSocket) currentSocket.close();
-      currentSocket = null;
+      retireCurrentSocket();
       setState('stopped', null);
     },
 

@@ -21,6 +21,7 @@ class FakeWebSocket {
   }
 
   close() {
+    this.closed = true;
     this.emit('close', { code: 1000 });
   }
 
@@ -161,6 +162,94 @@ test('reconnects when a heartbeat is not acknowledged before the next interval',
   await timers.advance(1_000);
   assert.equal(sockets.length, 2);
   assert.equal(client.getStatus().state, 'connecting');
+});
+
+test('gives a server-requested heartbeat a fresh ACK deadline', async () => {
+  const { client, sockets, timers } = createHarness();
+  await client.start();
+  const socket = sockets[0];
+  socket.receive({ op: 10, d: { heartbeat_interval: 10 } });
+  socket.receive({ op: 1, d: null });
+  assert.deepEqual(socket.sent[1], { op: 1, d: null });
+
+  await timers.advance(0);
+  assert.equal(client.getStatus().state, 'connecting');
+  socket.receive({ op: 11, d: null });
+  await timers.advance(9);
+  assert.equal(socket.sent.length, 2);
+  await timers.advance(1);
+  assert.deepEqual(socket.sent[2], { op: 1, d: null });
+});
+
+test('retires a reconnecting socket and ignores its stale events', async () => {
+  const { client, interactions, sockets, timers } = createHarness();
+  await client.start();
+  const oldSocket = sockets[0];
+  oldSocket.receive({ op: 10, d: { heartbeat_interval: 45_000 } });
+  oldSocket.receive({ op: 7, d: null });
+
+  assert.equal(oldSocket.closed, true);
+  oldSocket.receive({ op: 0, t: 'INTERACTION_CREATE', s: 2, d: { id: 'stale-interaction' } });
+  await Promise.resolve();
+  assert.deepEqual(interactions, []);
+  await timers.advance(1_000);
+  assert.equal(sockets.length, 2);
+  assert.equal(client.getStatus().state, 'connecting');
+});
+
+test('ignores a stopped start request when its gateway fetch resolves late', async () => {
+  const sockets = [];
+  let resolveFirstFetch;
+  let fetchCalls = 0;
+  const client = createGatewayClient({
+    token: 'test-token',
+    fetchImpl: async () => {
+      fetchCalls += 1;
+      if (fetchCalls === 1) {
+        return new Promise((resolve) => { resolveFirstFetch = resolve; });
+      }
+      return new Response(JSON.stringify({ url: 'wss://fresh.gateway.test' }));
+    },
+    WebSocketImpl: class extends FakeWebSocket {
+      constructor(url) {
+        super(url);
+        sockets.push(this);
+      }
+    },
+    onInteraction: async () => {},
+    onStatus: () => {},
+    timers: createFakeTimers(),
+  });
+
+  const staleStart = client.start();
+  await client.stop();
+  await client.start();
+  resolveFirstFetch(new Response(JSON.stringify({ url: 'wss://stale.gateway.test' })));
+  await staleStart;
+
+  assert.deepEqual(sockets.map((socket) => socket.url), ['wss://fresh.gateway.test?v=10&encoding=json']);
+  assert.equal(client.getStatus().state, 'connecting');
+});
+
+test('contains a synchronous interaction handler exception as sanitized status', async () => {
+  const statuses = [];
+  const socket = new FakeWebSocket('wss://gateway.discord.test');
+  const client = createGatewayClient({
+    token: 'test-token',
+    fetchImpl: async () => new Response(JSON.stringify({ url: 'wss://gateway.discord.test' })),
+    WebSocketImpl: class { constructor() { return socket; } },
+    onInteraction: () => { throw new Error('handler input leaked'); },
+    onStatus: (status) => statuses.push(status),
+    timers: createFakeTimers(),
+  });
+  await client.start();
+  socket.receive({ op: 10, d: { heartbeat_interval: 45_000 } });
+
+  assert.doesNotThrow(() => socket.receive({ op: 0, t: 'INTERACTION_CREATE', s: 1, d: { id: 'interaction-1' } }));
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(client.getStatus().lastError, 'interaction-handler-failed');
+  assert.equal(JSON.stringify(statuses).includes('handler input leaked'), false);
 });
 
 test('reports only sanitized status data when the gateway request fails', async () => {
