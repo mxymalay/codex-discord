@@ -8,6 +8,7 @@ import { PassThrough } from 'node:stream';
 import test from 'node:test';
 
 import * as bridgeModule from '../discord-bridge.mjs';
+import * as bridgeLib from '../discord-bridge-lib.mjs';
 import { startNewCodexTask } from '../discord-task-create-lib.mjs';
 import { createBridgeApplication, finalizeContinuationOutcome, getDiscordBotMember, pollChannel } from '../discord-bridge.mjs';
 import { createInteractionRouter } from '../discord-interactions.mjs';
@@ -141,6 +142,7 @@ test('production takeover retry reloads only the exact queued record through tra
   const replies = [];
   const trackedResources = [];
   let trackedRestCalls = 0;
+  const persistedSnapshots = [];
   const production = bridgeModule.createProductionBridgeDependencies({
     runOnce: true,
     startContinuationImpl: async (options) => {
@@ -150,6 +152,7 @@ test('production takeover retry reloads only the exact queued record through tra
       return { status: 'started', queueId: options.request.queueId, turnId: 'turn-exact' };
     },
     sendDiscordReplyImpl: async (payload) => { replies.push(payload); },
+    persistInboxStateImpl: async (snapshot) => { persistedSnapshots.push(structuredClone(snapshot)); },
     createInteractionRestClientImpl: () => ({ callback: async () => {}, editOriginal: async () => ({ id: 'message-1' }) }),
     createInteractionRouterImpl: (dependencies) => {
       interactionDependencies = dependencies;
@@ -165,6 +168,7 @@ test('production takeover retry reloads only the exact queued record through tra
     ...createContinuationRequest({ source: 'slash', requestId: 'retry-exact', threadId: 'root-exact', text: 'exact' }),
     encryptedText: 'cipher-exact',
   });
+  exact.blockedReason = 'active-writer';
   const terminal = enqueueContinuation(inboxState, {
     ...createContinuationRequest({ source: 'slash', requestId: 'retry-terminal', threadId: 'root-terminal', text: 'done' }),
     encryptedText: 'cipher-terminal', status: 'failed',
@@ -190,24 +194,36 @@ test('production takeover retry reloads only the exact queued record through tra
   };
   await production.createInteractionHandler(context);
 
-  const result = await interactionDependencies.retryContinuation(exact.queueId);
+  const claim = await interactionDependencies.claimContinuationTakeover({
+    queueId: exact.queueId,
+    targetThreadId: exact.threadId,
+  });
+  assert.equal(claim.status, 'claimed');
+  assert.equal(inboxState.pendingContinuations[exact.queueId].status, 'takeover-claimed');
+  const result = await interactionDependencies.retryContinuation(claim);
 
   assert.equal(result.status, 'started');
   assert.equal(starts.length, 1);
   assert.strictEqual(starts[0].state, inboxState);
   assert.strictEqual(starts[0].request, inboxState.pendingContinuations[exact.queueId]);
+  assert.equal(starts[0].takeoverClaimId, claim.claimId);
   assert.notStrictEqual(starts[0].request, first);
   assert.deepEqual(trackedResources, [{ kind: 'continuation', turnId: 'turn-exact' }]);
   assert.equal(trackedRestCalls, 1);
   assert.deepEqual(replies, [{ token: 'test-token', channelId: 'channel-1', content: 'tracked reply' }]);
 
-  assert.deepEqual(await interactionDependencies.retryContinuation('missing-queue'), {
+  assert.deepEqual(await interactionDependencies.retryContinuation({
+    queueId: 'missing-queue', targetThreadId: 'root-exact', claimId: claim.claimId,
+  }), {
     status: 'failed', reason: 'not-found',
   });
-  assert.deepEqual(await interactionDependencies.retryContinuation(terminal.queueId), {
+  assert.deepEqual(await interactionDependencies.retryContinuation({
+    queueId: terminal.queueId, targetThreadId: terminal.threadId, claimId: claim.claimId,
+  }), {
     status: 'failed', reason: 'not-found',
   });
   assert.equal(starts.length, 1);
+  assert.equal(persistedSnapshots.length >= 1, true);
 });
 
 test('production index refreshes serialize an older scan before a fresh takeover snapshot without stopping on a new task', async () => {
@@ -1699,6 +1715,332 @@ test('state migration removes active-writer reasons from non-queued continuation
   migrateInboxState(state);
 
   assert.equal(Object.hasOwn(state.pendingContinuations[failed.queueId], 'blockedReason'), false);
+});
+
+test('continuation schema accepts active-writer only on queued records', () => {
+  const state = createEmptyInboxState();
+  const queued = enqueueContinuation(state, {
+    ...createContinuationRequest({ source: 'slash', requestId: 'schema-blocked', threadId: 'root-1', text: 'continue' }),
+    encryptedText: 'opaque-ciphertext',
+  });
+  queued.blockedReason = 'active-writer';
+  assert.doesNotThrow(() => bridgeLib.assertValidInboxStateV2(structuredClone(state)));
+
+  const invalidStatus = structuredClone(state);
+  invalidStatus.pendingContinuations[queued.queueId].status = 'failed';
+  assert.throws(() => bridgeLib.assertValidInboxStateV2(invalidStatus), /corrupt/iu);
+
+  const invalidReason = structuredClone(state);
+  invalidReason.pendingContinuations[queued.queueId].blockedReason = 'raw-error-detail';
+  assert.throws(() => bridgeLib.assertValidInboxStateV2(invalidReason), /corrupt/iu);
+
+  const invalidTerminalClaim = structuredClone(state);
+  const terminal = invalidTerminalClaim.pendingContinuations[queued.queueId];
+  terminal.status = 'failed';
+  delete terminal.blockedReason;
+  terminal.takeoverClaimId = 'claim-1234567890';
+  terminal.takeoverClaimedAt = '2026-09-01T01:00:00.000Z';
+  assert.throws(() => bridgeLib.assertValidInboxStateV2(invalidTerminalClaim), /corrupt/iu);
+
+  const incompleteClaim = structuredClone(state);
+  const claimed = incompleteClaim.pendingContinuations[queued.queueId];
+  claimed.status = 'takeover-claimed';
+  delete claimed.blockedReason;
+  assert.throws(() => bridgeLib.assertValidInboxStateV2(incompleteClaim), /corrupt/iu);
+});
+
+test('persisted cancellation removes the active-writer marker from every snapshot', async () => {
+  const state = createEmptyInboxState();
+  const queued = enqueueContinuation(state, {
+    ...createContinuationRequest({ source: 'slash', requestId: 'cancel-blocked', threadId: 'root-1', text: 'continue' }),
+    encryptedText: 'opaque-ciphertext',
+  });
+  queued.blockedReason = 'active-writer';
+  const snapshots = [];
+
+  const result = await cancelContinuationPersisted({
+    state,
+    queueId: queued.queueId,
+    persistState: async (snapshot) => { snapshots.push(structuredClone(snapshot)); },
+  });
+
+  assert.equal(result.status, 'cancelled');
+  assert.equal(Object.hasOwn(state.pendingContinuations[queued.queueId], 'blockedReason'), false);
+  assert.equal(Object.hasOwn(snapshots[0].pendingContinuations[queued.queueId], 'blockedReason'), false);
+});
+
+test('takeover claim durably binds one queued active-writer item to its exact thread', async () => {
+  assert.equal(typeof bridgeLib.claimContinuationTakeover, 'function');
+  const state = createEmptyInboxState();
+  const queued = enqueueContinuation(state, {
+    ...createContinuationRequest({ source: 'slash', requestId: 'claim-exact', threadId: 'root-exact', text: 'continue' }),
+    encryptedText: 'opaque-ciphertext',
+  });
+  queued.blockedReason = 'active-writer';
+  const snapshots = [];
+
+  const result = await bridgeLib.claimContinuationTakeover({
+    state,
+    queueId: queued.queueId,
+    targetThreadId: 'root-exact',
+    now: '2026-09-01T01:00:00.000Z',
+    randomBytes: () => Buffer.alloc(12, 7),
+    persistState: async (snapshot) => { snapshots.push(structuredClone(snapshot)); },
+  });
+
+  assert.equal(result.status, 'claimed');
+  assert.equal(result.queueId, queued.queueId);
+  assert.equal(result.targetThreadId, 'root-exact');
+  assert.match(result.claimId, /^[A-Za-z0-9_-]{16}$/u);
+  const claimed = state.pendingContinuations[queued.queueId];
+  assert.equal(claimed.status, 'takeover-claimed');
+  assert.equal(claimed.takeoverClaimId, result.claimId);
+  assert.equal(claimed.takeoverClaimedAt, '2026-09-01T01:00:00.000Z');
+  assert.equal(Object.hasOwn(claimed, 'blockedReason'), false);
+  assert.deepEqual(snapshots.at(-1).pendingContinuations[queued.queueId], claimed);
+  assert.doesNotThrow(() => bridgeLib.assertValidInboxStateV2(structuredClone(state)));
+});
+
+test('takeover claim fails closed for cancelled, already claimed, and mismatched targets', async () => {
+  assert.equal(typeof bridgeLib.claimContinuationTakeover, 'function');
+  const makeBlocked = (requestId, threadId = 'root-1') => {
+    const state = createEmptyInboxState();
+    const item = enqueueContinuation(state, {
+      ...createContinuationRequest({ source: 'slash', requestId, threadId, text: 'continue' }),
+      encryptedText: 'opaque-ciphertext',
+    });
+    item.blockedReason = 'active-writer';
+    return { state, item };
+  };
+  const cancelled = makeBlocked('claim-cancelled');
+  cancelContinuation(cancelled.state, cancelled.item.queueId);
+  const mismatch = makeBlocked('claim-mismatch', 'root-other');
+  const already = makeBlocked('claim-already');
+  already.item.status = 'resuming';
+  delete already.item.blockedReason;
+
+  for (const [fixture, targetThreadId] of [
+    [cancelled, 'root-1'], [mismatch, 'root-1'], [already, 'root-1'],
+  ]) {
+    const result = await bridgeLib.claimContinuationTakeover({
+      state: fixture.state,
+      queueId: fixture.item.queueId,
+      targetThreadId,
+      persistState: async () => {},
+    });
+    assert.equal(result.status, 'unavailable');
+    assert.equal(fixture.state.pendingContinuations[fixture.item.queueId].status, fixture.item.status);
+  }
+});
+
+test('failed takeover claim persistence leaves the exact request queued and never claimed', async () => {
+  assert.equal(typeof bridgeLib.claimContinuationTakeover, 'function');
+  const state = createEmptyInboxState();
+  const queued = enqueueContinuation(state, {
+    ...createContinuationRequest({ source: 'slash', requestId: 'claim-persist-failed', threadId: 'root-1', text: 'continue' }),
+    encryptedText: 'opaque-ciphertext',
+  });
+  queued.blockedReason = 'active-writer';
+
+  const result = await bridgeLib.claimContinuationTakeover({
+    state,
+    queueId: queued.queueId,
+    targetThreadId: 'root-1',
+    persistState: async () => { throw new Error('private path'); },
+  });
+
+  assert.deepEqual(result, { status: 'failed', reason: 'state-persist-failed' });
+  assert.equal(state.pendingContinuations[queued.queueId].status, 'queued');
+  assert.equal(state.pendingContinuations[queued.queueId].blockedReason, 'active-writer');
+  assert.equal(Object.hasOwn(state.pendingContinuations[queued.queueId], 'takeoverClaimId'), false);
+});
+
+test('releasing the exact takeover claim durably restores its active-writer queue marker', async () => {
+  assert.equal(typeof bridgeLib.releaseContinuationTakeoverClaim, 'function');
+  const state = createEmptyInboxState();
+  const queued = enqueueContinuation(state, {
+    ...createContinuationRequest({ source: 'slash', requestId: 'claim-release', threadId: 'root-1', text: 'continue' }),
+    encryptedText: 'opaque-ciphertext',
+  });
+  queued.blockedReason = 'active-writer';
+  const claim = await bridgeLib.claimContinuationTakeover({
+    state, queueId: queued.queueId, targetThreadId: 'root-1',
+    randomBytes: () => Buffer.alloc(12, 8), persistState: async () => {},
+  });
+  const snapshots = [];
+
+  const wrong = await bridgeLib.releaseContinuationTakeoverClaim({
+    state, claim: { ...claim, claimId: 'wrong-claim-id' }, persistState: async () => {},
+  });
+  assert.equal(wrong.status, 'unavailable');
+  assert.equal(state.pendingContinuations[queued.queueId].status, 'takeover-claimed');
+
+  const released = await bridgeLib.releaseContinuationTakeoverClaim({
+    state, claim, persistState: async (snapshot) => { snapshots.push(structuredClone(snapshot)); },
+  });
+  assert.deepEqual(released, { status: 'queued', queueId: queued.queueId, reason: 'active-writer' });
+  const restored = state.pendingContinuations[queued.queueId];
+  assert.equal(restored.status, 'queued');
+  assert.equal(restored.blockedReason, 'active-writer');
+  assert.equal(Object.hasOwn(restored, 'takeoverClaimId'), false);
+  assert.equal(Object.hasOwn(restored, 'takeoverClaimedAt'), false);
+  assert.deepEqual(snapshots.at(-1).pendingContinuations[queued.queueId], restored);
+});
+
+test('startup recovery returns a durable takeover claim to the active-writer queue', async () => {
+  assert.equal(typeof bridgeLib.claimContinuationTakeover, 'function');
+  const state = createEmptyInboxState();
+  const queued = enqueueContinuation(state, {
+    ...createContinuationRequest({ source: 'slash', requestId: 'claim-recovery', threadId: 'root-1', text: 'continue' }),
+    encryptedText: 'opaque-ciphertext',
+  });
+  queued.blockedReason = 'active-writer';
+  await bridgeLib.claimContinuationTakeover({
+    state, queueId: queued.queueId, targetThreadId: 'root-1',
+    randomBytes: () => Buffer.alloc(12, 9), persistState: async () => {},
+  });
+
+  recoverContinuationAttempts(state, '2026-09-01T01:05:00.000Z');
+
+  const recovered = state.pendingContinuations[queued.queueId];
+  assert.equal(recovered.status, 'queued');
+  assert.equal(recovered.blockedReason, 'active-writer');
+  assert.equal(Object.hasOwn(recovered, 'takeoverClaimId'), false);
+  assert.equal(Object.hasOwn(recovered, 'takeoverClaimedAt'), false);
+  assert.equal(listRetryableContinuations(state).some((item) => item.queueId === queued.queueId), true);
+});
+
+test('only the exact persisted takeover claim can consume and start its continuation once', async () => {
+  assert.equal(typeof bridgeLib.claimContinuationTakeover, 'function');
+  const state = createEmptyInboxState();
+  const queued = enqueueContinuation(state, {
+    ...createContinuationRequest({ source: 'slash', requestId: 'claim-consume', threadId: 'root-1', text: 'continue' }),
+    encryptedText: 'opaque-ciphertext',
+  });
+  queued.blockedReason = 'active-writer';
+  const claim = await bridgeLib.claimContinuationTakeover({
+    state, queueId: queued.queueId, targetThreadId: 'root-1',
+    randomBytes: () => Buffer.alloc(12, 10), persistState: async () => {},
+  });
+  let starts = 0;
+  const dependencies = {
+    state,
+    takeoverClaimId: 'wrong-claim-id',
+    decryptText: async () => 'continue',
+    persistState: async () => {},
+    resumeCodexThread: async () => { starts += 1; return { turnId: 'turn-claim' }; },
+  };
+
+  const wrong = await dispatchContinuation(state.pendingContinuations[queued.queueId], dependencies);
+  assert.equal(wrong.status, 'failed');
+  assert.equal(starts, 0);
+  assert.equal(state.pendingContinuations[queued.queueId].status, 'takeover-claimed');
+
+  dependencies.takeoverClaimId = claim.claimId;
+  const started = await dispatchContinuation(state.pendingContinuations[queued.queueId], dependencies);
+  assert.equal(started.status, 'started');
+  assert.equal(starts, 1);
+  assert.equal(state.pendingContinuations[queued.queueId].status, 'delivered');
+  assert.equal(Object.hasOwn(state.pendingContinuations[queued.queueId], 'takeoverClaimId'), false);
+
+  const repeated = await dispatchContinuation(state.pendingContinuations[queued.queueId], dependencies);
+  assert.equal(repeated.status, 'started');
+  assert.equal(starts, 1);
+});
+
+test('a durable takeover claim wins atomically over cancellation and background retry', async () => {
+  const state = createEmptyInboxState();
+  const queued = enqueueContinuation(state, {
+    ...createContinuationRequest({ source: 'slash', requestId: 'claim-race', threadId: 'root-1', text: 'continue' }),
+    encryptedText: 'opaque-ciphertext',
+  });
+  queued.blockedReason = 'active-writer';
+  const claimPersisting = deferred();
+  const allowClaimPersist = deferred();
+  let persists = 0;
+  const persistState = async () => {
+    persists += 1;
+    if (persists === 1) {
+      claimPersisting.resolve();
+      await allowClaimPersist.promise;
+    }
+  };
+
+  const claimPromise = bridgeLib.claimContinuationTakeover({
+    state, queueId: queued.queueId, targetThreadId: 'root-1',
+    randomBytes: () => Buffer.alloc(12, 11), persistState,
+  });
+  await claimPersisting.promise;
+  const cancelPromise = cancelContinuationPersisted({
+    state, queueId: queued.queueId, persistState,
+  });
+  let backgroundStarts = 0;
+  const backgroundPromise = dispatchContinuation(state.pendingContinuations[queued.queueId], {
+    state,
+    decryptText: async () => 'continue',
+    persistState,
+    resumeCodexThread: async () => { backgroundStarts += 1; return { turnId: 'unexpected' }; },
+  });
+  allowClaimPersist.resolve();
+
+  const [claim, cancelled, background] = await Promise.all([claimPromise, cancelPromise, backgroundPromise]);
+
+  assert.equal(claim.status, 'claimed');
+  assert.equal(cancelled.status, 'already-started');
+  assert.equal(background.status, 'failed');
+  assert.equal(backgroundStarts, 0);
+  assert.equal(state.pendingContinuations[queued.queueId].status, 'takeover-claimed');
+  assert.equal(state.pendingContinuations[queued.queueId].takeoverClaimId, claim.claimId);
+});
+
+test('takeover retry persistence failure preserves its claim and post-submit ambiguity stays one-shot', async () => {
+  const state = createEmptyInboxState();
+  const queued = enqueueContinuation(state, {
+    ...createContinuationRequest({ source: 'slash', requestId: 'takeover-uncertain', threadId: 'root-1', text: 'continue' }),
+    encryptedText: 'opaque-ciphertext',
+  });
+  queued.blockedReason = 'active-writer';
+  const claim = await bridgeLib.claimContinuationTakeover({
+    state, queueId: queued.queueId, targetThreadId: 'root-1',
+    randomBytes: () => Buffer.alloc(12, 12), persistState: async () => {},
+  });
+  let externalStarts = 0;
+
+  const failedPersist = await dispatchContinuation(state.pendingContinuations[queued.queueId], {
+    state,
+    takeoverClaimId: claim.claimId,
+    decryptText: async () => 'continue',
+    persistState: async (snapshot) => {
+      if (snapshot.pendingContinuations[queued.queueId].status === 'resuming') throw new Error('private path');
+    },
+    resumeCodexThread: async () => { externalStarts += 1; return { turnId: 'unexpected' }; },
+  });
+  assert.equal(failedPersist.reason, 'state-persist-failed');
+  assert.equal(externalStarts, 0);
+  assert.equal(state.pendingContinuations[queued.queueId].status, 'takeover-claimed');
+  assert.equal(state.pendingContinuations[queued.queueId].takeoverClaimId, claim.claimId);
+
+  const dependencies = {
+    state,
+    takeoverClaimId: claim.claimId,
+    decryptText: async () => 'continue',
+    persistState: async () => {},
+    resumeCodexThread: async ({ onStartSubmitted }) => {
+      externalStarts += 1;
+      await onStartSubmitted();
+      const error = new Error('transport closed');
+      error.submissionStage = 'post-submit';
+      throw error;
+    },
+  };
+  const uncertain = await dispatchContinuation(state.pendingContinuations[queued.queueId], dependencies);
+  const repeated = await dispatchContinuation(state.pendingContinuations[queued.queueId], dependencies);
+
+  assert.equal(uncertain.status, 'uncertain');
+  assert.equal(repeated.status, 'uncertain');
+  assert.equal(externalStarts, 1);
+  assert.equal(state.pendingContinuations[queued.queueId].status, 'start-uncertain');
+  assert.equal(Object.hasOwn(state.pendingContinuations[queued.queueId], 'takeoverClaimId'), false);
 });
 
 test('a failed retry cannot retain a stale active-writer reason', async () => {

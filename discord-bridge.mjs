@@ -6,6 +6,7 @@ import {
   assertValidInboxStateV2,
   assertValidLegacyInboxState,
   cancelContinuationPersisted,
+  claimContinuationTakeover,
   classifyReply,
   commitInboxState,
   createContinuationRequest,
@@ -25,6 +26,7 @@ import {
   readJsonFile,
   recordInboxMessage,
   recoverContinuationAttempts,
+  releaseContinuationTakeoverClaim,
   resolveCodexExecutable,
   resolvePowerShellExecutable,
   sendDiscordReply,
@@ -763,7 +765,16 @@ export async function finalizeContinuationOutcome({
   return { ...result, durable, stopChannelScan: !durable };
 }
 
-async function startContinuation({ token, config, state, request, trackActiveResource, sendReply = (payload) => sendDiscordReply({ token, ...payload }) }) {
+async function startContinuation({
+  token,
+  config,
+  state,
+  request,
+  trackActiveResource,
+  takeoverClaimId,
+  persistState = saveState,
+  sendReply = (payload) => sendDiscordReply({ token, ...payload }),
+}) {
   const mappedCwd = await existingDirectory(String(request.cwd ?? ''));
   const input = { ...request, cwd: mappedCwd ?? undefined };
   const result = await dispatchContinuation(input, {
@@ -772,7 +783,8 @@ async function startContinuation({ token, config, state, request, trackActiveRes
     processCwd: mappedCwd ?? toolDir,
     encryptText: (text) => encryptPendingReplyText({ toolDir, powershellPath: config.discordPowerShellPath, text }),
     decryptText: (encryptedText) => decryptPendingReplyText({ toolDir, powershellPath: config.discordPowerShellPath, ciphertext: encryptedText }),
-    persistState: saveState,
+    persistState,
+    takeoverClaimId,
     sendReply,
     trackCompletion: (started, normalized) => trackContinuationCompletion(
       started, normalized, token, trackActiveResource, sendReply,
@@ -882,6 +894,7 @@ export function createProductionBridgeDependencies({
   createInteractionRouterImpl = createInteractionRouter,
   startContinuationImpl = startContinuation,
   sendDiscordReplyImpl = sendDiscordReply,
+  persistInboxStateImpl = saveState,
 } = {}) {
   let taskIndexCommitTail = Promise.resolve();
   const enqueueTaskIndexOperation = (operation) => {
@@ -959,7 +972,7 @@ export function createProductionBridgeDependencies({
           powershellPath: context.executables.powershellPath,
           text,
         }),
-        persistState: saveState,
+        persistState: persistInboxStateImpl,
       });
       context.inboxReadOnly = loaded.readOnly;
       if (loaded.errorCategory) context.setLatestErrorCategory(loaded.errorCategory);
@@ -970,7 +983,7 @@ export function createProductionBridgeDependencies({
       await recoverInterruptedTaskCreations({
         state: context.inboxState,
         worktreeRoot: context.config.discordWorktreeRoot,
-        persistState: saveState,
+        persistState: persistInboxStateImpl,
       });
     },
     async warmProjectCatalog(context) {
@@ -991,11 +1004,13 @@ export function createProductionBridgeDependencies({
         token: context.token,
         ...payload,
       }));
-      const continuePersistedRequest = (request) => startContinuationImpl({
+      const continuePersistedRequest = (request, { takeoverClaimId } = {}) => startContinuationImpl({
         token: context.token,
         config: context.config,
         state: context.inboxState,
         request,
+        takeoverClaimId,
+        persistState: persistInboxStateImpl,
         trackActiveResource: context.trackActiveResource,
         sendReply: trackedReply,
       });
@@ -1023,8 +1038,8 @@ export function createProductionBridgeDependencies({
         worktreeRoot: context.config.discordWorktreeRoot,
         creationState: context.inboxState,
         continuationState: context.inboxState,
-        persistCreationState: context.inboxReadOnly ? undefined : saveState,
-        persistContinuationState: context.inboxReadOnly ? undefined : saveState,
+        persistCreationState: context.inboxReadOnly ? undefined : persistInboxStateImpl,
+        persistContinuationState: context.inboxReadOnly ? undefined : persistInboxStateImpl,
         mutationDisabledCategory: context.inboxReadOnly ? 'continuation-state-corrupt' : null,
         codexPath: context.executables.codexPath,
         processCwd: toolDir,
@@ -1062,12 +1077,38 @@ export function createProductionBridgeDependencies({
             context.publishHealth?.();
           }
         },
-        retryContinuation: async (queueId) => {
+        claimContinuationTakeover: async ({ queueId, targetThreadId }) => {
+          try {
+            return await claimContinuationTakeover({
+              state: context.inboxState,
+              queueId,
+              targetThreadId,
+              persistState: persistInboxStateImpl,
+            });
+          } finally {
+            context.publishHealth?.();
+          }
+        },
+        releaseContinuationTakeoverClaim: async (claim) => {
+          try {
+            return await releaseContinuationTakeoverClaim({
+              state: context.inboxState,
+              claim,
+              persistState: persistInboxStateImpl,
+            });
+          } finally {
+            context.publishHealth?.();
+          }
+        },
+        retryContinuation: async (claim) => {
           const item = listContinuations(context.inboxState).find((entry) =>
-            entry.queueId === String(queueId) && entry.status === 'queued');
+            entry.queueId === String(claim?.queueId ?? '') &&
+            entry.threadId === String(claim?.targetThreadId ?? '') &&
+            entry.status === 'takeover-claimed' &&
+            entry.takeoverClaimId === String(claim?.claimId ?? ''));
           if (!item) return { status: 'failed', reason: 'not-found' };
           try {
-            return await continuePersistedRequest(item);
+            return await continuePersistedRequest(item, { takeoverClaimId: claim.claimId });
           } finally {
             context.publishHealth?.();
           }
@@ -1078,7 +1119,7 @@ export function createProductionBridgeDependencies({
               state: context.inboxState,
               queueId,
               now,
-              persistState: saveState,
+              persistState: persistInboxStateImpl,
             });
           } finally {
             context.publishHealth?.();
@@ -1115,7 +1156,7 @@ export function createProductionBridgeDependencies({
           channelIds,
           getLatest: (channelId) => context.trackDiscordRest(() => getLatestDiscordMessageId({ token, channelId })),
         });
-        await commitInboxState({ state, persistState: saveState });
+        await commitInboxState({ state, persistState: persistInboxStateImpl });
       }
       await initializeRolloutWatcherState({ sessionsRoot, state: rolloutState });
       await writeRolloutWatcherState(rolloutWatcherStatePath, rolloutState);
@@ -1221,7 +1262,7 @@ export function createProductionBridgeDependencies({
       };
     },
     persistTaskIndex: persistCurrentTaskIndex,
-    persistInboxState: (context) => context.inboxReadOnly ? undefined : saveState(context.inboxState),
+    persistInboxState: (context) => context.inboxReadOnly ? undefined : persistInboxStateImpl(context.inboxState),
     persistRolloutState: (context) => writeRolloutWatcherState(rolloutWatcherStatePath, context.rolloutState),
     publishHealth: async (context, { signal, shouldCommit, forceFinal } = {}) => {
       const status = context.getSystemStatus();

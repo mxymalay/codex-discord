@@ -425,6 +425,7 @@ export function renderTaskList(tasks, { status = '全部' } = {}) {
 function continuationStatusLabel(status) {
   return ({
     queued: '等待发送',
+    'takeover-claimed': '接管处理中',
     resuming: '正在连接',
     submitting: '正在提交启动请求',
     attempting: '正在尝试',
@@ -452,7 +453,7 @@ function continuationQueueView(items, taskIndex = null) {
   const values = Array.isArray(items) ? items : [];
   if (!values.length) return { description: '## 继续队列\n当前没有继续请求。', displayed: [] };
   const tasks = Array.isArray(taskIndex?.tasks) ? taskIndex.tasks : [];
-  const priorityStatuses = ['start-uncertain', 'start-submitted', 'submitting', 'attempting', 'resuming', 'acknowledging', 'confirmed-start', 'queued'];
+  const priorityStatuses = ['start-uncertain', 'start-submitted', 'submitting', 'attempting', 'takeover-claimed', 'resuming', 'acknowledging', 'confirmed-start', 'queued'];
   const priorityStatusSet = new Set(priorityStatuses);
   const ordered = [
     ...priorityStatuses.flatMap((status) => values.filter((item) => item?.status === status)),
@@ -1253,6 +1254,21 @@ async function confirmContinuationTakeover(dependencies, routerState, interactio
         newTasksDetected: true,
       });
     }
+    let claim;
+    try {
+      claim = await dependencies.claimContinuationTakeover({
+        queueId: state.queueId,
+        targetThreadId: state.targetThreadId,
+      });
+    } catch {
+      claim = { status: 'failed', reason: 'state-persist-failed' };
+    }
+    if (claim?.status !== 'claimed') {
+      const content = claim?.status === 'unavailable'
+        ? '队列状态已变化，目标请求可能已经取消或由其他处理器接管；未退出 Codex，也未重复执行。'
+        : '无法安全锁定目标队列；未退出 Codex，目标请求将保持排队。';
+      return editOriginal(dependencies, interaction, { content, components: [] });
+    }
     if (status.desktop.running) {
       let stopResult;
       try {
@@ -1261,15 +1277,24 @@ async function confirmContinuationTakeover(dependencies, routerState, interactio
         stopResult = null;
       }
       if (!stopResult?.ok) {
+        let release;
+        try {
+          release = await dependencies.releaseContinuationTakeoverClaim(claim);
+        } catch {
+          release = { status: 'failed' };
+        }
+        const content = release?.status === 'queued'
+          ? '退出 Codex 失败；未确认桌面端已停止，目标任务已恢复为保持排队。'
+          : '退出 Codex 失败；未确认桌面端已停止，接管状态将在服务恢复时安全回到继续队列。';
         return editOriginal(dependencies, interaction, {
-          content: '退出 Codex 失败；未确认桌面端已停止，目标任务将保持排队。',
+          content,
           components: [],
         });
       }
     }
     let result;
     try {
-      result = await dependencies.retryContinuation(state.queueId);
+      result = await dependencies.retryContinuation(claim);
     } catch {
       result = { status: 'failed' };
     }

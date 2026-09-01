@@ -25,7 +25,7 @@ export function createEmptyInboxState() {
 const MAX_PROCESSED_INTERACTIONS = 2_000;
 const MAX_CREATED_TASK_RECORDS = 2_000;
 const MAX_TERMINAL_CONTINUATIONS = 200;
-const CONTINUATION_STATUSES = new Set(['queued', 'resuming', 'submitting', 'attempting', 'start-submitted', 'start-uncertain', 'confirmed-start', 'acknowledging', 'delivered', 'cancelled', 'failed']);
+const CONTINUATION_STATUSES = new Set(['queued', 'takeover-claimed', 'resuming', 'submitting', 'attempting', 'start-submitted', 'start-uncertain', 'confirmed-start', 'acknowledging', 'delivered', 'cancelled', 'failed']);
 const TERMINAL_CONTINUATION_STATUSES = new Set(['delivered', 'cancelled', 'failed']);
 const TERMINAL_CREATION_STATUSES = new Set(['started', 'first-turn-failed', 'failed-before-thread', 'recovered-failed']);
 const inboxStateCommitQueues = new WeakMap();
@@ -72,13 +72,14 @@ function validContinuationEntry(key, value, { allowLegacyPlaintext = false } = {
     'channelId', 'replyToMessageId', 'referencedMessageId', 'mapping', 'createdAt',
     'queuedAt', 'lastAttemptAt', 'attempts', 'status', 'submittingAt', 'submittedAt',
     'uncertainAt', 'confirmedAt', 'ackClaimedAt', 'deliveredAt', 'cancelledAt',
-    'failedAt', 'failureReason', 'blockedReason', 'turnId',
+    'failedAt', 'failureReason', 'blockedReason', 'turnId', 'takeoverClaimId',
+    'takeoverClaimedAt',
   ]);
   if (allowLegacyPlaintext) allowed.add('text');
   const timestamps = [
     value.createdAt, value.queuedAt, value.lastAttemptAt, value.submittingAt,
     value.submittedAt, value.uncertainAt, value.confirmedAt, value.ackClaimedAt,
-    value.deliveredAt, value.cancelledAt, value.failedAt,
+    value.deliveredAt, value.cancelledAt, value.failedAt, value.takeoverClaimedAt,
   ];
   return hasOnlyKeys(value, allowed) && value.queueId === key &&
     ['reply', 'slash'].includes(value.source) && isNonEmptyString(value.requestId) &&
@@ -88,7 +89,11 @@ function validContinuationEntry(key, value, { allowLegacyPlaintext = false } = {
     timestamps.slice(2).every(isOptionalTimestamp) &&
     ['cwd', 'encryptedText', 'summary', 'channelId', 'replyToMessageId',
       'referencedMessageId', 'failureReason', 'turnId'].every((field) => isOptionalString(value[field])) &&
-    (value.blockedReason === undefined || value.blockedReason === 'active-writer') &&
+    (value.blockedReason === undefined ||
+      (value.status === 'queued' && value.blockedReason === 'active-writer')) &&
+    (value.status === 'takeover-claimed'
+      ? isNonEmptyString(value.takeoverClaimId) && Number.isFinite(Date.parse(value.takeoverClaimedAt))
+      : value.takeoverClaimId === undefined && value.takeoverClaimedAt === undefined) &&
     (!allowLegacyPlaintext || isOptionalString(value.text)) && validMapping(value.mapping);
 }
 
@@ -401,6 +406,10 @@ export function migrateInboxState(candidate) {
     : {};
   for (const pending of Object.values(state.pendingContinuations)) {
     if (pending?.status !== 'queued') delete pending.blockedReason;
+    if (pending?.status !== 'takeover-claimed') {
+      delete pending.takeoverClaimId;
+      delete pending.takeoverClaimedAt;
+    }
   }
   state.processedInteractions = Array.isArray(state.processedInteractions)
     ? state.processedInteractions.slice(-MAX_PROCESSED_INTERACTIONS)
@@ -493,6 +502,7 @@ export function cancelContinuation(state, queueId, now = new Date().toISOString(
   if (item.status === 'cancelled') return { status: 'already-cancelled', queueId: item.queueId };
   if (item.status !== 'queued') return { status: 'already-started', queueId: item.queueId };
   item.status = 'cancelled';
+  delete item.blockedReason;
   item.cancelledAt = String(now);
   if (item.source === 'slash') recordProcessedInteraction(state, item.requestId, { status: 'failed', queueId: item.queueId, reason: 'cancelled' }, now);
   const result = { status: 'cancelled', queueId: item.queueId };
@@ -504,10 +514,104 @@ export async function cancelContinuationPersisted({ state, queueId, now = new Da
   return persistMutation(state, persistState, () => cancelContinuation(state, queueId, now), [String(queueId)]);
 }
 
+function takeoverClaimMatches(item, claim) {
+  return item?.status === 'takeover-claimed' &&
+    String(item?.queueId ?? '') === String(claim?.queueId ?? '') &&
+    String(item?.threadId ?? '') === String(claim?.targetThreadId ?? '') &&
+    String(item?.takeoverClaimId ?? '') === String(claim?.claimId ?? '') &&
+    String(claim?.claimId ?? '').length > 0;
+}
+
+export async function claimContinuationTakeover({
+  state,
+  queueId,
+  targetThreadId,
+  now = new Date().toISOString(),
+  persistState,
+  randomBytes: randomBytesImpl = randomBytes,
+}) {
+  const normalizedQueueId = String(queueId ?? '');
+  const normalizedThreadId = String(targetThreadId ?? '');
+  try {
+    const claimId = randomBytesImpl(12).toString('base64url');
+    return await commitInboxState({
+      state,
+      persistState,
+      entries: { pendingContinuations: [normalizedQueueId] },
+      mutate: () => {
+        const item = state?.pendingContinuations?.[normalizedQueueId];
+        if (!item || item.status !== 'queued' || item.blockedReason !== 'active-writer' ||
+            item.threadId !== normalizedThreadId) {
+          return { status: 'unavailable', reason: 'queue-state-changed' };
+        }
+        item.status = 'takeover-claimed';
+        item.takeoverClaimId = claimId;
+        item.takeoverClaimedAt = String(now);
+        delete item.blockedReason;
+        return {
+          status: 'claimed',
+          queueId: normalizedQueueId,
+          targetThreadId: normalizedThreadId,
+          claimId,
+        };
+      },
+      errorMessage: 'Continuation takeover claim persistence failed',
+    });
+  } catch {
+    return { status: 'failed', reason: 'state-persist-failed' };
+  }
+}
+
+export async function releaseContinuationTakeoverClaim({
+  state,
+  claim,
+  now = new Date().toISOString(),
+  persistState,
+}) {
+  const queueId = String(claim?.queueId ?? '');
+  try {
+    return await commitInboxState({
+      state,
+      persistState,
+      fields: ['processedInteractions'],
+      entries: { pendingContinuations: [queueId] },
+      mutate: () => {
+        const item = state?.pendingContinuations?.[queueId];
+        if (!takeoverClaimMatches(item, claim)) {
+          return { status: 'unavailable', reason: 'queue-state-changed' };
+        }
+        item.status = 'queued';
+        item.blockedReason = 'active-writer';
+        delete item.takeoverClaimId;
+        delete item.takeoverClaimedAt;
+        if (item.source === 'slash') {
+          recordProcessedInteraction(state, item.requestId, {
+            status: 'queued', queueId: item.queueId, reason: 'active-writer',
+          }, now);
+        }
+        return { status: 'queued', queueId: item.queueId, reason: 'active-writer' };
+      },
+      errorMessage: 'Continuation takeover release persistence failed',
+    });
+  } catch {
+    return { status: 'failed', reason: 'state-persist-failed' };
+  }
+}
+
 export function recoverContinuationAttempts(state, now = new Date().toISOString()) {
   migrateInboxState(state);
   for (const item of Object.values(state.pendingContinuations)) {
-    if (item?.status === 'resuming') {
+    if (item?.status === 'takeover-claimed') {
+      item.status = 'queued';
+      item.blockedReason = 'active-writer';
+      delete item.takeoverClaimId;
+      delete item.takeoverClaimedAt;
+      if (item.source === 'slash') {
+        recordProcessedInteraction(state, item.requestId, {
+          status: 'queued', queueId: item.queueId, reason: 'active-writer',
+        }, now);
+      }
+    } else if (item?.status === 'resuming') {
       item.status = 'queued';
       item.failureReason = undefined;
       delete item.blockedReason;
@@ -540,6 +644,8 @@ export function markContinuationDelivered(state, queueId, now = new Date().toISO
   item.status = 'delivered';
   item.deliveredAt = String(now);
   delete item.blockedReason;
+  delete item.takeoverClaimId;
+  delete item.takeoverClaimedAt;
   pruneContinuationHistory(state);
   return item;
 }
@@ -672,6 +778,11 @@ export async function dispatchContinuation(request, dependencies = {}) {
   let existing = listContinuations(state).find((item) => item.source === source && item.requestId === requestId);
   const wasQueuedRequest = Boolean(existing);
   const isQueuedRetry = Boolean(request?.queueId && existing?.queueId === String(request.queueId));
+  const takeoverClaimId = String(dependencies.takeoverClaimId ?? '');
+  const isClaimedRetry = Boolean(isQueuedRetry && takeoverClaimId &&
+    existing?.status === 'takeover-claimed' &&
+    existing?.takeoverClaimId === takeoverClaimId &&
+    existing?.threadId === String(request?.threadId ?? ''));
   if (existing?.status === 'start-uncertain') {
     return { status: 'uncertain', queueId: existing.queueId, reason: 'start-outcome-uncertain' };
   }
@@ -698,7 +809,7 @@ export async function dispatchContinuation(request, dependencies = {}) {
       };
     }
   }
-  if (existing && existing.status !== 'queued') {
+  if (existing && existing.status !== 'queued' && !isClaimedRetry) {
     return {
       status: ['confirmed-start', 'delivered'].includes(existing.status) ? 'started' : 'failed',
       queueId: existing.queueId,
@@ -773,12 +884,20 @@ export async function dispatchContinuation(request, dependencies = {}) {
       entries: { pendingContinuations: [existing.queueId] },
       mutate: () => {
         const current = state.pendingContinuations[existing.queueId];
-        if (!current || current.status !== 'queued') {
+        const canClaimQueued = current?.status === 'queued';
+        const canConsumeTakeover = isClaimedRetry && takeoverClaimMatches(current, {
+          queueId: existing.queueId,
+          targetThreadId: request?.threadId,
+          claimId: takeoverClaimId,
+        });
+        if (!canClaimQueued && !canConsumeTakeover) {
           claimObservation = current ? structuredClone(current) : null;
           return;
         }
         current.status = 'resuming';
         delete current.blockedReason;
+        delete current.takeoverClaimId;
+        delete current.takeoverClaimedAt;
         current.lastAttemptAt = now;
         current.attempts = Number(current.attempts ?? 0) + 1;
         if (source === 'slash') recordProcessedInteraction(state, requestId, { status: 'resuming', queueId: current.queueId }, now);

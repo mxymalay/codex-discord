@@ -167,6 +167,15 @@ function makeDependencies(overrides = {}) {
     getCodexControlStatus: overrides.getCodexControlStatus ?? (async () => ({ ok: true, desktop: { running: false } })),
     stopCodexDesktop: overrides.stopCodexDesktop ?? (async () => ({ ok: true, alreadyStopped: false, stoppedProcessCount: 1 })),
     dispatchContinuation: overrides.dispatchContinuation ?? (async () => ({ status: 'started', turnId: 'turn-continued' })),
+    claimContinuationTakeover: overrides.claimContinuationTakeover ?? (async ({ queueId, targetThreadId }) => ({
+      status: 'claimed', queueId, targetThreadId, claimId: 'claim-1234567890',
+    })),
+    releaseContinuationTakeoverClaim: overrides.releaseContinuationTakeoverClaim ?? (async (claim) => ({
+      status: 'queued', queueId: claim.queueId, reason: 'active-writer',
+    })),
+    retryContinuation: overrides.retryContinuation ?? (async (claim) => ({
+      status: 'started', queueId: claim.queueId, turnId: 'turn-continued',
+    })),
     cancelContinuation: overrides.cancelContinuation ?? (() => ({ status: 'cancelled' })),
     persistContinuationState: overrides.persistContinuationState ?? (async () => {}),
     respond: overrides.respond ?? (async (body) => { responses.push(body); }),
@@ -956,16 +965,21 @@ test('keep queued consumes only its exact takeover state through a deferred comp
 test('confirmed takeover is tenant and message bound, stops once, and retries only its queue id once', async () => {
   const uiState = new Map();
   const stopped = [];
-  const retriedQueueIds = [];
+  const claims = [];
+  const retriedClaims = [];
   const currentIndex = { tasks: [task(1, { status: 'running' })] };
   const { dependencies, responses, edits } = makeDependencies({
     uiState,
     refreshTaskIndex: async () => currentIndex,
     getCodexControlStatus: async () => ({ ok: true, desktop: { running: true } }),
     stopCodexDesktop: async () => { stopped.push('stop'); return { ok: true, stoppedProcessCount: 1 }; },
-    retryContinuation: async (queueId) => {
-      retriedQueueIds.push(queueId);
-      return { status: 'started', queueId, turnId: 'turn-private-12345678' };
+    claimContinuationTakeover: async (target) => {
+      claims.push(target);
+      return { status: 'claimed', ...target, claimId: 'claim-exact-once' };
+    },
+    retryContinuation: async (claim) => {
+      retriedClaims.push(claim);
+      return { status: 'started', queueId: claim.queueId, turnId: 'turn-private-12345678' };
     },
     dispatchContinuation: async () => ({ status: 'queued', reason: 'active-writer', queueId: 'queue-exact' }),
   });
@@ -976,7 +990,8 @@ test('confirmed takeover is tenant and message bound, stops once, and retries on
   await router.handle(componentInteraction(continueId, { userId: '444' }));
   await router.handle(componentInteraction(continueId, { messageId: 'wrong-message' }));
   assert.deepEqual(stopped, []);
-  assert.deepEqual(retriedQueueIds, []);
+  assert.deepEqual(claims, []);
+  assert.deepEqual(retriedClaims, []);
   assert.equal([...uiState.values()].some((state) => state.kind === 'takeover-continue'), true);
 
   await Promise.all([
@@ -985,7 +1000,11 @@ test('confirmed takeover is tenant and message bound, stops once, and retries on
   ]);
 
   assert.deepEqual(stopped, ['stop']);
-  assert.deepEqual(retriedQueueIds, ['queue-exact']);
+  assert.deepEqual(claims, [{ queueId: 'queue-exact', targetThreadId: 'root-1' }]);
+  assert.equal(retriedClaims.length, 1);
+  assert.equal(retriedClaims[0].queueId, 'queue-exact');
+  assert.equal(retriedClaims[0].targetThreadId, 'root-1');
+  assert.equal(retriedClaims[0].claimId, 'claim-exact-once');
   assert.equal(responses.some((body) => body.type === 6), true);
   assert.match(edits.at(-1).content, /已开始继续执行/);
   assert.match(edits.at(-1).content, /…12345678/);
@@ -1002,9 +1021,9 @@ test('a desktop that exits after preview is idempotent success and still retries
     refreshTaskIndex: async () => currentIndex,
     getCodexControlStatus: async () => ({ ok: true, desktop: { running: desktopRunning } }),
     stopCodexDesktop: async () => { stopCalls += 1; return { ok: true }; },
-    retryContinuation: async (queueId) => {
-      retriedQueueIds.push(queueId);
-      return { status: 'started', queueId, turnId: 'turn-after-exit' };
+    retryContinuation: async (claim) => {
+      retriedQueueIds.push(claim.queueId);
+      return { status: 'started', queueId: claim.queueId, turnId: 'turn-after-exit' };
     },
     dispatchContinuation: async () => ({ status: 'queued', reason: 'active-writer', queueId: 'queue-after-exit' }),
   });
@@ -1018,6 +1037,68 @@ test('a desktop that exits after preview is idempotent success and still retries
   assert.equal(stopCalls, 0);
   assert.deepEqual(retriedQueueIds, ['queue-after-exit']);
   assert.match(edits.at(-1).content, /已开始继续执行/);
+});
+
+test('a cancelled queue item or background claim after preview fails closed before desktop stop', async (t) => {
+  for (const status of ['cancelled', 'resuming']) {
+    await t.test(status, async () => {
+      let queueStatus = 'queued';
+      let stopCalls = 0;
+      let retryCalls = 0;
+      const { dependencies, responses, edits } = makeDependencies({
+        refreshTaskIndex: async () => ({ tasks: [task(1, { status: 'running' })] }),
+        getCodexControlStatus: async () => ({ ok: true, desktop: { running: true } }),
+        dispatchContinuation: async () => ({ status: 'queued', reason: 'active-writer', queueId: `queue-${status}` }),
+        claimContinuationTakeover: async () => queueStatus === 'queued'
+          ? { status: 'claimed', queueId: `queue-${status}`, targetThreadId: 'root-1', claimId: 'claim-race-safe' }
+          : { status: 'unavailable', reason: 'queue-state-changed' },
+        stopCodexDesktop: async () => { stopCalls += 1; return { ok: true }; },
+        retryContinuation: async () => { retryCalls += 1; return { status: 'started' }; },
+      });
+      const router = createInteractionRouter(dependencies);
+      await submitContinuationModal(router, responses, { interactionId: `queue-race-${status}` });
+      const continueId = edits[0].components[0].components[0].custom_id;
+      queueStatus = status;
+
+      await router.handle(componentInteraction(continueId, { id: `queue-race-confirm-${status}` }));
+
+      assert.equal(stopCalls, 0);
+      assert.equal(retryCalls, 0);
+      assert.match(edits.at(-1).content, /队列状态已变化|保持排队/);
+    });
+  }
+});
+
+test('takeover claim thread mismatch or persistence failure never stops desktop', async (t) => {
+  for (const entry of [
+    { name: 'thread mismatch', result: { status: 'unavailable', reason: 'queue-state-changed' } },
+    { name: 'persist failed', result: { status: 'failed', reason: 'state-persist-failed' } },
+  ]) {
+    await t.test(entry.name, async () => {
+      let stopCalls = 0;
+      let retryCalls = 0;
+      const { dependencies, responses, edits } = makeDependencies({
+        refreshTaskIndex: async () => ({ tasks: [task(1, { status: 'running' })] }),
+        getCodexControlStatus: async () => ({ ok: true, desktop: { running: true } }),
+        dispatchContinuation: async () => ({ status: 'queued', reason: 'active-writer', queueId: 'queue-exact' }),
+        claimContinuationTakeover: async ({ queueId, targetThreadId }) => {
+          assert.equal(queueId, 'queue-exact');
+          assert.equal(targetThreadId, 'root-1');
+          return entry.result;
+        },
+        stopCodexDesktop: async () => { stopCalls += 1; return { ok: true }; },
+        retryContinuation: async () => { retryCalls += 1; return { status: 'started' }; },
+      });
+      const router = createInteractionRouter(dependencies);
+      await submitContinuationModal(router, responses, { interactionId: `claim-${entry.name}` });
+
+      await router.handle(componentInteraction(edits[0].components[0].components[0].custom_id));
+
+      assert.equal(stopCalls, 0);
+      assert.equal(retryCalls, 0);
+      assert.match(edits.at(-1).content, /未退出 Codex|保持排队/);
+    });
+  }
 });
 
 test('a failed takeover component defer consumes that state and releases the shared exit lock', async () => {
@@ -1102,6 +1183,34 @@ test('takeover does not stop or retry when fresh safety inspection or desktop ex
       assert.equal(JSON.stringify(edits.at(-1)).includes('private'), false);
     });
   }
+});
+
+test('a failed desktop stop releases the exact durable claim back to active-writer queue', async () => {
+  const released = [];
+  let retryCalls = 0;
+  const claim = {
+    status: 'claimed', queueId: 'queue-stop-failed', targetThreadId: 'root-1', claimId: 'claim-stop-fail',
+  };
+  const { dependencies, responses, edits } = makeDependencies({
+    refreshTaskIndex: async () => ({ tasks: [task(1, { status: 'running' })] }),
+    getCodexControlStatus: async () => ({ ok: true, desktop: { running: true } }),
+    dispatchContinuation: async () => ({ status: 'queued', reason: 'active-writer', queueId: claim.queueId }),
+    claimContinuationTakeover: async () => claim,
+    stopCodexDesktop: async () => ({ ok: false }),
+    releaseContinuationTakeoverClaim: async (received) => {
+      released.push(received);
+      return { status: 'queued', queueId: received.queueId, reason: 'active-writer' };
+    },
+    retryContinuation: async () => { retryCalls += 1; return { status: 'started' }; },
+  });
+  const router = createInteractionRouter(dependencies);
+  await submitContinuationModal(router, responses, { interactionId: 'stop-release' });
+
+  await router.handle(componentInteraction(edits[0].components[0].components[0].custom_id));
+
+  assert.deepEqual(released, [claim]);
+  assert.equal(retryCalls, 0);
+  assert.match(edits.at(-1).content, /恢复为保持排队/);
 });
 
 test('a new active task blocks takeover and republishes a fresh exact-queue preview', async () => {
