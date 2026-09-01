@@ -75,15 +75,29 @@ export function buildGuildCommandDefinitions() {
   ];
 }
 
+function normalizeDiscordId(value) {
+  if (typeof value !== 'string' && typeof value !== 'number' && typeof value !== 'bigint') return '';
+  const id = String(value);
+  if (id.length === 0 || id.trim() !== id || !/^\d+$/.test(id)) return '';
+  return id;
+}
+
 /**
  * Check both tenancy boundaries before handling any interaction.
  */
 export function authorizeInteraction(interaction, config) {
-  if (String(interaction?.guild_id ?? '') !== String(config?.discordGuildId ?? '')) {
+  const configuredGuildId = normalizeDiscordId(config?.discordGuildId);
+  const configuredUserId = normalizeDiscordId(config?.discordAllowedUserId);
+  const interactionGuildId = normalizeDiscordId(interaction?.guild_id);
+  const interactionUserId = normalizeDiscordId(interaction?.member?.user?.id ?? interaction?.user?.id);
+
+  if (!configuredGuildId || !configuredUserId || !interactionGuildId || !interactionUserId) {
+    return { allowed: false, reason: 'invalid-identity' };
+  }
+  if (interactionGuildId !== configuredGuildId) {
     return { allowed: false, reason: 'wrong-guild' };
   }
-  const userId = String(interaction?.member?.user?.id ?? interaction?.user?.id ?? '');
-  if (userId !== String(config?.discordAllowedUserId ?? '')) {
+  if (interactionUserId !== configuredUserId) {
     return { allowed: false, reason: 'wrong-user' };
   }
   return { allowed: true, reason: 'authorized' };

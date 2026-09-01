@@ -134,6 +134,26 @@ test('requires both the configured guild and configured user', () => {
   });
 });
 
+test('fails closed when configuration or interaction identifiers are missing or malformed', () => {
+  const validInteraction = { guild_id: '222', member: { user: { id: '333' } } };
+  const validConfig = { discordGuildId: '222', discordAllowedUserId: '333' };
+  const cases = [
+    [{}, {}],
+    [{}, undefined],
+    [{ guild_id: '222', member: { user: { id: '333' } } }, {}],
+    [{ member: { user: { id: '333' } } }, validConfig],
+    [{ guild_id: '222', member: { user: {} } }, validConfig],
+    [validInteraction, { discordGuildId: '', discordAllowedUserId: '333' }],
+    [validInteraction, { discordGuildId: '222', discordAllowedUserId: '' }],
+    [validInteraction, { discordGuildId: ' ', discordAllowedUserId: '333' }],
+    [validInteraction, { discordGuildId: '222', discordAllowedUserId: {} }],
+  ];
+
+  for (const [interaction, config] of cases) {
+    assert.equal(authorizeInteraction(interaction, config).allowed, false);
+  }
+});
+
 test('supports direct user interactions and private mention-safe responses', async () => {
   const config = { discordGuildId: '222', discordAllowedUserId: '333' };
   assert.equal(authorizeInteraction({ guild_id: '222', user: { id: '333' } }, config).allowed, true);
