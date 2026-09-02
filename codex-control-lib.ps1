@@ -281,6 +281,39 @@ function Get-CodexDesktopProcessPlan {
     }
 }
 
+function Test-CodexDiscordBridgeTaskDefinitionCurrent {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][object]$Task,
+        [Parameter(Mandatory)][string]$ToolDir,
+        [Parameter(Mandatory)][string]$PowerShellPath
+    )
+
+    try {
+        if ($null -eq $Task.PSObject.Properties['Actions']) { return $false }
+        $actions = @($Task.Actions)
+        if ($actions.Count -ne 1 -or $null -eq $actions[0]) { return $false }
+        $action = $actions[0]
+        foreach ($propertyName in @('Execute', 'Arguments', 'WorkingDirectory')) {
+            if ($null -eq $action.PSObject.Properties[$propertyName] -or [string]::IsNullOrWhiteSpace([string]$action.$propertyName)) {
+                return $false
+            }
+        }
+
+        $expected = Get-DiscordBridgeTaskDefinition -ToolDir $ToolDir -PowerShellPath $PowerShellPath
+        $actualExecute = [System.IO.Path]::GetFullPath([string]$action.Execute)
+        $actualWorkingDirectory = [System.IO.Path]::GetFullPath([string]$action.WorkingDirectory)
+        return (
+            [string]::Equals($actualExecute, $expected.Execute, [System.StringComparison]::OrdinalIgnoreCase) -and
+            [string]::Equals([string]$action.Arguments, $expected.Arguments, [System.StringComparison]::Ordinal) -and
+            [string]::Equals($actualWorkingDirectory, $expected.WorkingDirectory, [System.StringComparison]::OrdinalIgnoreCase)
+        )
+    }
+    catch {
+        return $false
+    }
+}
+
 function New-CodexControlOperations {
     [CmdletBinding()]
     param()
@@ -326,12 +359,18 @@ function New-CodexControlOperations {
         }
         GetTask = {
             $task = Get-ScheduledTask -TaskName 'Codex Discord Bridge' -ErrorAction SilentlyContinue
-            if ($null -eq $task) { return [pscustomobject]@{ installed=$false; enabled=$false; running=$false } }
+            if ($null -eq $task) { return [pscustomobject]@{ installed=$false; enabled=$false; running=$false; definitionCurrent=$false } }
             $enabled = -not ([string]$task.State).Equals('Disabled', [System.StringComparison]::OrdinalIgnoreCase)
             if ($null -ne $task.Settings -and $null -ne $task.Settings.PSObject.Properties['Enabled']) {
                 $enabled = [bool]$task.Settings.Enabled
             }
-            return [pscustomobject]@{ installed=$true; enabled=$enabled; running=($task.State -eq 'Running') }
+            $definitionCurrent = $false
+            try {
+                $powerShellPath = (Get-Command pwsh.exe -ErrorAction Stop).Source
+                $definitionCurrent = Test-CodexDiscordBridgeTaskDefinitionCurrent -Task $task -ToolDir $PSScriptRoot -PowerShellPath $powerShellPath
+            }
+            catch {}
+            return [pscustomobject]@{ installed=$true; enabled=$enabled; running=($task.State -eq 'Running'); definitionCurrent=$definitionCurrent }
         }
         InstallTask = {
             $installScript = Join-Path $PSScriptRoot 'install-discord-bridge-task.ps1'
@@ -740,7 +779,16 @@ function Get-CodexBridgeServiceStatus {
     try {
         $task = & $Operations.GetTask
         if ($null -eq $task) {
-            $task = [pscustomobject]@{ installed=$false; enabled=$false; running=$false }
+            $task = [pscustomobject]@{ installed=$false; enabled=$false; running=$false; definitionCurrent=$false }
+        }
+        $taskDefinitionCurrent = if (-not [bool]$task.installed) {
+            $false
+        }
+        elseif ($null -eq $task.PSObject.Properties['definitionCurrent']) {
+            $true
+        }
+        else {
+            [bool]$task.definitionCurrent
         }
         $runtime = $null
         if ($Operations.ContainsKey('GetRuntime') -and $Operations.GetRuntime -is [scriptblock]) { $runtime = & $Operations.GetRuntime }
@@ -758,6 +806,7 @@ function Get-CodexBridgeServiceStatus {
         return [pscustomobject][ordered]@{
             ok = $true
             taskInstalled = [bool]$task.installed
+            taskDefinitionCurrent = $taskDefinitionCurrent
             autoStartEnabled = [bool]$task.enabled
             taskRunning = [bool]$task.running
             running = ($null -ne $runtime)
@@ -782,7 +831,7 @@ function Invoke-CodexBridgeServiceAction {
     $requiredByAction = @{
         'start-temporary' = @('GetTask', 'StartTask', 'StartDetached')
         'stop-temporary' = @('GetTask', 'StopTask')
-        'enable-long-term' = @('GetTask', 'InstallTask', 'EnableTask', 'StartTask')
+        'enable-long-term' = @('GetTask', 'InstallTask', 'EnableTask', 'StartTask', 'StopTask')
         'disable-long-term' = @('GetTask', 'DisableTask', 'StopTask')
     }
     foreach ($operationName in $requiredByAction[$Action]) {
@@ -815,7 +864,24 @@ function Invoke-CodexBridgeServiceAction {
                 elseif ($status.taskRunning) { & $Operations.StopTask }
             }
             'enable-long-term' {
-                if (-not $status.taskInstalled) { & $Operations.InstallTask }
+                $taskDefinitionNeedsUpgrade = $status.taskInstalled -and -not $status.taskDefinitionCurrent
+                if ($taskDefinitionNeedsUpgrade -and $status.runtime -and $status.runtime.mode -eq 'scheduled') {
+                    if (Test-CodexBridgeJobOperations $Operations) {
+                        $stopped = Stop-CodexBridgeRuntime -Runtime $status.runtime -Operations $Operations -ToolDir $ToolDir -BeforeTerminate { & $Operations.StopTask } -TimeoutMilliseconds ($PollAttempts * [Math]::Max(1,$PollMilliseconds))
+                        if (-not $stopped.ok) { return New-ServiceActionFailure $stopped.errorCategory }
+                    }
+                    else {
+                        & $Operations.StopTask
+                    }
+                }
+                elseif ($taskDefinitionNeedsUpgrade -and $status.taskRunning) {
+                    & $Operations.StopTask
+                }
+                if (-not $status.taskInstalled -or $taskDefinitionNeedsUpgrade) {
+                    & $Operations.InstallTask
+                    $status = Get-CodexBridgeServiceStatus -Operations $Operations -ToolDir $ToolDir
+                    if (-not $status.ok) { return New-ServiceActionFailure 'service-status-failed' }
+                }
                 if (-not $status.autoStartEnabled) { & $Operations.EnableTask }
                 if ($null -ne $status.runtime -and $status.runtime.mode -eq 'temporary') {
                     if (Test-CodexBridgeJobOperations $Operations) { $stopped = Stop-CodexBridgeRuntime -Runtime $status.runtime -Operations $Operations -ToolDir $ToolDir -TimeoutMilliseconds ($PollAttempts * [Math]::Max(1,$PollMilliseconds)); if (-not $stopped.ok) { return New-ServiceActionFailure $stopped.errorCategory } }
@@ -839,7 +905,7 @@ function Invoke-CodexBridgeServiceAction {
             $complete = $finalStatus.ok -and $(switch ($Action) {
                 'start-temporary' { $finalStatus.running -and $finalStatus.autoStartEnabled -eq $status.autoStartEnabled }
                 'stop-temporary' { -not $finalStatus.running -and -not $finalStatus.taskRunning -and $finalStatus.autoStartEnabled -eq $status.autoStartEnabled }
-                'enable-long-term' { $finalStatus.autoStartEnabled -and $finalStatus.running -and $finalStatus.runtime.mode -eq 'scheduled' }
+                'enable-long-term' { $finalStatus.taskDefinitionCurrent -and $finalStatus.autoStartEnabled -and $finalStatus.running -and $finalStatus.runtime.mode -eq 'scheduled' }
                 'disable-long-term' { -not $finalStatus.autoStartEnabled -and -not $finalStatus.running -and -not $finalStatus.taskRunning }
             })
             if ($complete) { return [pscustomobject][ordered]@{ ok=$true; action=$Action; service=$finalStatus } }

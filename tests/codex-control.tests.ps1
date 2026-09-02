@@ -325,6 +325,20 @@ finally {
     Remove-Item Function:Export-ScheduledTask -Force
 }
 if ($disabledBridgeTask.enabled -or $disabledGuardTask.enabled) { throw 'production task status did not recognize the ScheduledTask Disabled state' }
+if ($disabledBridgeTask.definitionCurrent) { throw 'production task status accepted a stale visible bridge action as current' }
+
+$definitionPowerShellPath = (Microsoft.PowerShell.Core\Get-Command pwsh.exe -ErrorAction Stop).Source
+$currentBridgeDefinition = Get-DiscordBridgeTaskDefinition -ToolDir $sourceRoot -PowerShellPath $definitionPowerShellPath
+$currentBridgeTask = [pscustomobject]@{
+    Actions = @([pscustomobject]@{
+        Execute = $currentBridgeDefinition.Execute
+        Arguments = $currentBridgeDefinition.Arguments
+        WorkingDirectory = $currentBridgeDefinition.WorkingDirectory
+    })
+}
+if (-not (Test-CodexDiscordBridgeTaskDefinitionCurrent -Task $currentBridgeTask -ToolDir $sourceRoot -PowerShellPath $definitionPowerShellPath)) {
+    throw 'production task definition validator rejected the current hidden bridge action'
+}
 
 $guardState = @{ exists=$true; enabled=$true; running=$true; actions=0 }
 $trustedGuardAction = [pscustomobject]@{
@@ -502,16 +516,42 @@ try {
         throw 'a delayed temporary runtime publication was not observed by the bounded status poll'
     }
 
-    $idempotentState = @{ installed=$true; enabled=$true; running=$true; enables=0; starts=0 }
+    $idempotentState = @{ installed=$true; enabled=$true; running=$true; definitionCurrent=$true; installs=0; enables=0; starts=0 }
     $idempotentOps = @{
-        GetTask = { [pscustomobject]@{ installed=$idempotentState.installed; enabled=$idempotentState.enabled; running=$idempotentState.running } }
+        GetTask = { [pscustomobject]@{ installed=$idempotentState.installed; enabled=$idempotentState.enabled; running=$idempotentState.running; definitionCurrent=$idempotentState.definitionCurrent } }
         GetRuntime = { [pscustomobject]@{ processId=704; creationTimeUtc='2026-09-01T13:00:00.0000000Z'; mode='scheduled' } }
         EnableTask = { $idempotentState.enables++ }; StartTask = { $idempotentState.starts++ }
-        InstallTask = {}; DisableTask = {}; StopTask = {}; StopRuntime = {}; StartDetached = {}; Sleep = { param($milliseconds) }
+        InstallTask = { $idempotentState.installs++ }; DisableTask = {}; StopTask = {}; StopRuntime = {}; StartDetached = {}; Sleep = { param($milliseconds) }
     }
     $idempotentEnable = Invoke-CodexBridgeServiceAction -Action 'enable-long-term' -ToolDir $reviewRuntimeRoot -Operations $idempotentOps -PollAttempts 1 -PollMilliseconds 0
-    if (-not $idempotentEnable.ok -or $idempotentState.enables -ne 0 -or $idempotentState.starts -ne 0) {
+    if (-not $idempotentEnable.ok -or $idempotentState.installs -ne 0 -or $idempotentState.enables -ne 0 -or $idempotentState.starts -ne 0) {
         throw 'repeating long-term enable was not idempotent for an already scheduled runtime'
+    }
+
+    $staleDefinitionState = @{ installed=$true; enabled=$true; running=$true; definitionCurrent=$false; processId=709; installs=0; stops=0; starts=0 }
+    $staleDefinitionOps = @{
+        GetTask = { [pscustomobject]@{ installed=$staleDefinitionState.installed; enabled=$staleDefinitionState.enabled; running=$staleDefinitionState.running; definitionCurrent=$staleDefinitionState.definitionCurrent } }
+        GetRuntime = { if ($staleDefinitionState.running) { [pscustomobject]@{ processId=$staleDefinitionState.processId; creationTimeUtc='2026-09-01T13:00:00.0000000Z'; mode='scheduled' } } }
+        InstallTask = { $staleDefinitionState.installs++; $staleDefinitionState.definitionCurrent=$true; $staleDefinitionState.running=$true; $staleDefinitionState.processId=711 }
+        StartTask = { $staleDefinitionState.starts++; $staleDefinitionState.running=$true; $staleDefinitionState.processId=711 }
+        StopTask = { $staleDefinitionState.stops++; $staleDefinitionState.running=$false }
+        EnableTask = {}; DisableTask = {}; StopRuntime = {}; StartDetached = {}; Sleep = { param($milliseconds) }
+    }
+    $staleDefinitionEnable = Invoke-CodexBridgeServiceAction -Action 'enable-long-term' -ToolDir $reviewRuntimeRoot -Operations $staleDefinitionOps -PollAttempts 1 -PollMilliseconds 0
+    if (-not $staleDefinitionEnable.ok -or $staleDefinitionState.stops -ne 1 -or $staleDefinitionState.installs -ne 1 -or $staleDefinitionEnable.service.runtime.processId -ne 711 -or -not $staleDefinitionEnable.service.taskDefinitionCurrent) {
+        throw 'long-term enable did not upgrade an installed task with a stale visible launch definition'
+    }
+
+    $failedUpgradeState = @{ installs=0 }
+    $failedUpgradeOps = @{
+        GetTask = { [pscustomobject]@{ installed=$true; enabled=$true; running=$true; definitionCurrent=$false } }
+        GetRuntime = { [pscustomobject]@{ processId=710; creationTimeUtc='2026-09-01T13:00:00.0000000Z'; mode='scheduled' } }
+        InstallTask = { $failedUpgradeState.installs++ }
+        StartTask = {}; EnableTask = {}; DisableTask = {}; StopTask = {}; StopRuntime = {}; StartDetached = {}; Sleep = { param($milliseconds) }
+    }
+    $failedUpgradeEnable = Invoke-CodexBridgeServiceAction -Action 'enable-long-term' -ToolDir $reviewRuntimeRoot -Operations $failedUpgradeOps -PollAttempts 1 -PollMilliseconds 0
+    if ($failedUpgradeEnable.ok -or $failedUpgradeEnable.errorCategory -ne 'service-action-incomplete' -or $failedUpgradeState.installs -ne 1) {
+        throw 'long-term enable reported success after the stale task definition failed to update'
     }
 
     $childEvents = [System.Collections.Generic.List[string]]::new()
