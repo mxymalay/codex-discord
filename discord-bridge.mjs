@@ -20,6 +20,7 @@ import {
   listRetryableContinuations,
   getLatestDiscordMessageId,
   initializeInboxCursors,
+  interruptCodexThread,
   listContinuations,
   loadDiscordToken,
   migrateLegacyPendingReplies,
@@ -31,6 +32,7 @@ import {
   resolveCodexExecutable,
   resolvePowerShellExecutable,
   sendDiscordReply,
+  steerCodexThread,
   writeJsonAtomic,
 } from './discord-bridge-lib.mjs';
 import { COMMAND_NAMES, registerGuildCommands } from './discord-commands-lib.mjs';
@@ -38,6 +40,8 @@ import { createGatewayClient } from './discord-gateway-lib.mjs';
 import {
   createInteractionRestClient,
   createInteractionRouter,
+  inspectQueuedTakeover,
+  publishContinuationTakeoverMessage,
 } from './discord-interactions.mjs';
 import {
   buildTaskIndex,
@@ -144,6 +148,7 @@ export function createBridgeApplication(dependencies = {}) {
     inboxReadOnly: false,
     projectCatalog: null,
     interactionHandler: null,
+    uiState: new Map(),
     gateway: null,
     legacyPollers: null,
     gatewayStatus: { state: 'idle' },
@@ -679,6 +684,7 @@ async function saveState(state) {
 }
 
 function trackContinuationCompletion(started, request, token, trackActiveResource, sendReply = (payload) => sendDiscordReply({ token, ...payload })) {
+  if (!started?.completion || typeof started.completion.then !== 'function') return;
   const tracked = started.completion
       .then(async (params) => {
         const status = String(params?.turn?.status ?? 'unknown');
@@ -781,6 +787,7 @@ async function startContinuation({
   takeoverClaimId,
   persistState = saveState,
   sendReply = (payload) => sendDiscordReply({ token, ...payload }),
+  onActiveWriterQueued,
 }) {
   const mappedCwd = await existingDirectory(String(request.cwd ?? ''));
   const input = { ...request, cwd: mappedCwd ?? undefined };
@@ -793,11 +800,15 @@ async function startContinuation({
     persistState,
     takeoverClaimId,
     sendReply,
+    steerCodexThread,
     trackCompletion: (started, normalized) => trackContinuationCompletion(
       started, normalized, token, trackActiveResource, sendReply,
     ),
   });
   const outcome = await finalizeContinuationOutcome({ result, state, request, token, sendReply });
+  if (request.source === 'reply' && outcome.status === 'queued' && outcome.reason === 'active-writer') {
+    await onActiveWriterQueued?.({ request: input, result: outcome }).catch(() => {});
+  }
   const category = ({
     started: 'continuation-started',
     queued: 'continuation-queued',
@@ -1024,6 +1035,7 @@ export function createProductionBridgeDependencies({
       return catalog;
     },
     async createInteractionHandler(context) {
+      context.uiState ??= new Map();
       const rest = createInteractionRestClientImpl({ applicationId: context.config.discordApplicationId });
       const readQuota = () => readJsonFile(quotaStatePath, { observedAt: null, limits: [] });
       const api = (route) => context.trackDiscordRest(() => discordRequest({ token: context.token, route }));
@@ -1068,6 +1080,7 @@ export function createProductionBridgeDependencies({
         persistCreationState: context.inboxReadOnly ? undefined : persistInboxStateImpl,
         persistContinuationState: context.inboxReadOnly ? undefined : persistInboxStateImpl,
         mutationDisabledCategory: context.inboxReadOnly ? 'continuation-state-corrupt' : null,
+        uiState: context.uiState,
         codexPath: context.executables.codexPath,
         processCwd: toolDir,
         createNewTaskOnce: async (options) => {
@@ -1106,6 +1119,7 @@ export function createProductionBridgeDependencies({
           powershellPath: context.executables.powershellPath,
           controlPath,
         }),
+        interruptTask: ({ threadId }) => interruptCodexThread({ threadId }),
         dispatchContinuation: async (request) => {
           try {
             return await continuePersistedRequest(request);
@@ -1180,6 +1194,7 @@ export function createProductionBridgeDependencies({
       return gateway;
     },
     async startLegacyPollers(context) {
+      context.uiState ??= new Map();
       const config = context.config;
       const token = context.token;
       const state = context.inboxState;
@@ -1291,6 +1306,36 @@ export function createProductionBridgeDependencies({
                         ...payload,
                         trackActiveResource: context.trackActiveResource,
                         sendReply: trackedReply,
+                        onActiveWriterQueued: async ({ request, result }) => {
+                          const inspection = await inspectQueuedTakeover({
+                            refreshTaskIndex: () => refreshTaskIndex(context),
+                            getCodexControlStatus: () => runCodexControlActionImpl({
+                              action: 'status',
+                              powershellPath: context.executables.powershellPath,
+                              controlPath,
+                            }),
+                          }, request.threadId);
+                          if (!inspection.available) {
+                            await trackedReply({
+                              channelId: request.channelId,
+                              replyToMessageId: request.replyToMessageId,
+                              ...inspection.payload,
+                            });
+                            return;
+                          }
+                          await publishContinuationTakeoverMessage({
+                            uiState: context.uiState,
+                            sendMessage: trackedReply,
+                          }, {
+                            queueId: result.queueId,
+                            targetThreadId: request.threadId,
+                            snapshot: inspection.snapshot,
+                            userId: context.config.discordAllowedUserId,
+                            guildId: context.config.discordGuildId,
+                            channelId: request.channelId,
+                            replyToMessageId: request.replyToMessageId,
+                          });
+                        },
                       });
                     } finally {
                       context.publishHealth?.();

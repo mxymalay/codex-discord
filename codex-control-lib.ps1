@@ -285,8 +285,7 @@ function Test-CodexDiscordBridgeTaskDefinitionCurrent {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][object]$Task,
-        [Parameter(Mandatory)][string]$ToolDir,
-        [Parameter(Mandatory)][string]$PowerShellPath
+        [Parameter(Mandatory)][string]$ToolDir
     )
 
     try {
@@ -300,7 +299,7 @@ function Test-CodexDiscordBridgeTaskDefinitionCurrent {
             }
         }
 
-        $expected = Get-DiscordBridgeTaskDefinition -ToolDir $ToolDir -PowerShellPath $PowerShellPath
+        $expected = Get-DiscordBridgeTaskDefinition -ToolDir $ToolDir
         $actualExecute = [System.IO.Path]::GetFullPath([string]$action.Execute)
         $actualWorkingDirectory = [System.IO.Path]::GetFullPath([string]$action.WorkingDirectory)
         return (
@@ -366,8 +365,7 @@ function New-CodexControlOperations {
             }
             $definitionCurrent = $false
             try {
-                $powerShellPath = (Get-Command pwsh.exe -ErrorAction Stop).Source
-                $definitionCurrent = Test-CodexDiscordBridgeTaskDefinitionCurrent -Task $task -ToolDir $PSScriptRoot -PowerShellPath $powerShellPath
+                $definitionCurrent = Test-CodexDiscordBridgeTaskDefinitionCurrent -Task $task -ToolDir $PSScriptRoot
             }
             catch {}
             return [pscustomobject]@{ installed=$true; enabled=$enabled; running=($task.State -eq 'Running'); definitionCurrent=$definitionCurrent }
@@ -412,16 +410,8 @@ function New-CodexControlOperations {
         DisableNotificationGuardTask = { Disable-ScheduledTask -TaskPath '\' -TaskName 'Codex ntfy Notification Guard' -ErrorAction Stop | Out-Null }
         StartDetached = {
             param([Parameter(Mandatory)][string]$StartupPath, [Parameter(Mandatory)][ValidateSet('temporary')][string]$Mode)
-            $powerShellPath = (Get-Command pwsh -ErrorAction Stop).Source
-            $previousMode = $env:CODEX_DISCORD_START_MODE
-            $env:CODEX_DISCORD_START_MODE = $Mode
-            try {
-                Start-Process -FilePath $powerShellPath -ArgumentList @('-NoProfile', '-File', $StartupPath) -WindowStyle Hidden -ErrorAction Stop | Out-Null
-            }
-            finally {
-                if ($null -eq $previousMode) { Remove-Item -LiteralPath 'Env:CODEX_DISCORD_START_MODE' -ErrorAction SilentlyContinue }
-                else { $env:CODEX_DISCORD_START_MODE = $previousMode }
-            }
+            $supervisorPath = Join-Path (Split-Path -Parent $StartupPath) 'CodexDiscordControl.exe'
+            Start-Process -FilePath $supervisorPath -ArgumentList @('--bridge-supervisor', $Mode) -WindowStyle Hidden -ErrorAction Stop | Out-Null
         }
         OpenBridgeProcess = {
             param([Parameter(Mandatory)][int]$ProcessId)

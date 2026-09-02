@@ -263,13 +263,6 @@ if (-not $disableLongTerm.ok) { throw "long-term disable failed: $($disableLongT
 if ($bridgeState.running -or $bridgeState.enabled) { throw 'long-term disable did not persist' }
 
 $temporaryLaunchCapture = $null
-$previousTestStartMode = $env:CODEX_DISCORD_START_MODE
-function Get-Command {
-    [CmdletBinding()]
-    param([Parameter(Mandatory)][string]$Name)
-    if ($Name -notin @('pwsh','pwsh.exe')) { throw 'temporary launch resolved an unexpected executable' }
-    [pscustomobject]@{ Source='C:\Program Files\PowerShell\7\pwsh.exe' }
-}
 function Start-Process {
     [CmdletBinding()]
     param(
@@ -281,7 +274,6 @@ function Start-Process {
         FilePath=$FilePath
         Arguments=@($ArgumentList)
         WindowStyle=$WindowStyle
-        Mode=$env:CODEX_DISCORD_START_MODE
     }
 }
 try {
@@ -289,17 +281,13 @@ try {
     & $temporaryOperations.StartDetached 'G:\tools\mobile-notify\start-discord-bridge.ps1' temporary
 }
 finally {
-    Remove-Item Function:Get-Command -Force
     Remove-Item Function:Start-Process -Force
-    if ($null -eq $previousTestStartMode) { Remove-Item Env:CODEX_DISCORD_START_MODE -ErrorAction SilentlyContinue }
-    else { $env:CODEX_DISCORD_START_MODE = $previousTestStartMode }
 }
 if ($null -eq $temporaryLaunchCapture -or
-    $temporaryLaunchCapture.FilePath -cne 'C:\Program Files\PowerShell\7\pwsh.exe' -or
+    $temporaryLaunchCapture.FilePath -cne 'G:\tools\mobile-notify\CodexDiscordControl.exe' -or
     [string]$temporaryLaunchCapture.WindowStyle -cne 'Hidden' -or
-    $temporaryLaunchCapture.Mode -cne 'temporary' -or
-    ($temporaryLaunchCapture.Arguments -join '|') -cne '-NoProfile|-File|G:\tools\mobile-notify\start-discord-bridge.ps1') {
-    throw 'temporary bridge start can expose a persistent PowerShell window or changed its fixed startup contract'
+    ($temporaryLaunchCapture.Arguments -join '|') -cne '--bridge-supervisor|temporary') {
+    throw 'temporary bridge start does not use the windowless controller supervisor'
 }
 
 function Get-ScheduledTask {
@@ -327,8 +315,7 @@ finally {
 if ($disabledBridgeTask.enabled -or $disabledGuardTask.enabled) { throw 'production task status did not recognize the ScheduledTask Disabled state' }
 if ($disabledBridgeTask.definitionCurrent) { throw 'production task status accepted a stale visible bridge action as current' }
 
-$definitionPowerShellPath = (Microsoft.PowerShell.Core\Get-Command pwsh.exe -ErrorAction Stop).Source
-$currentBridgeDefinition = Get-DiscordBridgeTaskDefinition -ToolDir $sourceRoot -PowerShellPath $definitionPowerShellPath
+$currentBridgeDefinition = Get-DiscordBridgeTaskDefinition -ToolDir $sourceRoot
 $currentBridgeTask = [pscustomobject]@{
     Actions = @([pscustomobject]@{
         Execute = $currentBridgeDefinition.Execute
@@ -336,7 +323,7 @@ $currentBridgeTask = [pscustomobject]@{
         WorkingDirectory = $currentBridgeDefinition.WorkingDirectory
     })
 }
-if (-not (Test-CodexDiscordBridgeTaskDefinitionCurrent -Task $currentBridgeTask -ToolDir $sourceRoot -PowerShellPath $definitionPowerShellPath)) {
+if (-not (Test-CodexDiscordBridgeTaskDefinitionCurrent -Task $currentBridgeTask -ToolDir $sourceRoot)) {
     throw 'production task definition validator rejected the current hidden bridge action'
 }
 

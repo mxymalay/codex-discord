@@ -286,6 +286,71 @@ function Get-TaskNotificationEligibility {
     return [pscustomobject]@{ Allowed = $true; Reason = 'user-visible sidebar root task' }
 }
 
+function Add-NotificationTurnSupport {
+    param([object]$Notification)
+
+    $model = ([string](Get-OptionalValue -Object $Notification -Name 'model' -DefaultValue '')).Trim()
+    $effort = ([string](Get-OptionalValue -Object $Notification -Name 'reasoning-effort' -DefaultValue '')).Trim()
+    if ($model -match '\A[A-Za-z0-9._-]{1,80}\z' -and $effort -match '\A[A-Za-z0-9._-]{1,40}\z') {
+        return $Notification
+    }
+
+    $threadId = [string](Get-OptionalValue -Object $Notification -Name 'thread-id' -DefaultValue '')
+    $turnId = [string](Get-OptionalValue -Object $Notification -Name 'turn-id' -DefaultValue '')
+    $uuidPattern = '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+    if ($threadId -notmatch $uuidPattern -or $turnId -notmatch $uuidPattern -or -not (Test-Path -LiteralPath $sessionsPath -PathType Container)) {
+        return $Notification
+    }
+
+    try {
+        $escapedThreadId = [regex]::Escape($threadId)
+        $candidates = @(Get-ChildItem -LiteralPath $sessionsPath -Recurse -File -Filter "*$threadId*.jsonl" -ErrorAction Stop |
+            Where-Object {
+                $_.BaseName -match "(?i)(?:^|[-_])$escapedThreadId$" -and
+                ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq 0 -and
+                $_.Length -gt 0
+            })
+        if ($candidates.Count -ne 1) {
+            return $Notification
+        }
+
+        $matchingContext = $null
+        foreach ($line in [System.IO.File]::ReadLines($candidates[0].FullName, [System.Text.Encoding]::UTF8)) {
+            if ([string]::IsNullOrWhiteSpace($line)) {
+                continue
+            }
+            try {
+                $entry = $line | ConvertFrom-Json
+            }
+            catch {
+                continue
+            }
+            if ([string](Get-OptionalValue -Object $entry -Name 'type' -DefaultValue '') -ne 'turn_context') {
+                continue
+            }
+            $payload = Get-OptionalValue -Object $entry -Name 'payload' -DefaultValue $null
+            if ($null -ne $payload -and [string](Get-OptionalValue -Object $payload -Name 'turn_id' -DefaultValue '') -ceq $turnId) {
+                $matchingContext = $payload
+            }
+        }
+        if ($null -eq $matchingContext) {
+            return $Notification
+        }
+
+        $rolloutModel = ([string](Get-OptionalValue -Object $matchingContext -Name 'model' -DefaultValue '')).Trim()
+        $rolloutEffort = ([string](Get-OptionalValue -Object $matchingContext -Name 'effort' -DefaultValue '')).Trim()
+        if ($rolloutModel -notmatch '\A[A-Za-z0-9._-]{1,80}\z' -or $rolloutEffort -notmatch '\A[A-Za-z0-9._-]{1,40}\z') {
+            return $Notification
+        }
+        $Notification | Add-Member -NotePropertyName 'model' -NotePropertyValue $rolloutModel -Force
+        $Notification | Add-Member -NotePropertyName 'reasoning-effort' -NotePropertyValue $rolloutEffort -Force
+    }
+    catch {
+        return $Notification
+    }
+    return $Notification
+}
+
 function Get-ExactDiscordRootTurnEligibility {
     param([object]$Notification)
 
@@ -481,6 +546,26 @@ function ConvertTo-DiscordMarkdownBody {
     return $escaped -join "`n"
 }
 
+function Get-NotificationSupportLine {
+    param([object]$Notification)
+
+    $model = ([string](Get-OptionalValue -Object $Notification -Name 'model' -DefaultValue '')).Trim()
+    $effort = ([string](Get-OptionalValue -Object $Notification -Name 'reasoning-effort' -DefaultValue '')).Trim()
+    if ($model -notmatch '\A[A-Za-z0-9._-]{1,80}\z' -or $effort -notmatch '\A[A-Za-z0-9._-]{1,40}\z') {
+        return ''
+    }
+    $modelName = $model -replace '(?i)^gpt-', ''
+    $modelName = (($modelName -split '-') | ForEach-Object {
+        if ($_ -match '^\d') { $_ }
+        elseif ($_.Length -gt 0) { $_.Substring(0, 1).ToUpperInvariant() + $_.Substring(1) }
+    }) -join ' '
+    $effortName = switch ($effort.ToLowerInvariant()) {
+        'xhigh' { 'XHigh'; break }
+        default { $effort.Substring(0, 1).ToUpperInvariant() + $effort.Substring(1) }
+    }
+    return "由 $modelName $effortName 支持"
+}
+
 function New-DiscordWebhookPayload {
     param(
         [string]$Title,
@@ -500,8 +585,16 @@ function New-DiscordWebhookPayload {
         color = $color
     }
 
+    $supportLine = ''
+    $bodyWithoutSupport = $Body
+    $supportMatch = [regex]::Match($Body, '(?s)\r?\n\r?\n(由 [^\r\n]{1,160} 支持)\z')
+    if ($supportMatch.Success) {
+        $supportLine = $supportMatch.Groups[1].Value
+        $bodyWithoutSupport = $Body.Substring(0, $supportMatch.Index)
+    }
+
     $taskBodyPattern = '(?s)\A项目名：([^\r\n]*)\r?\n任务名：([^\r\n]*)(?:\r?\n\r?\n任务：(.*?))?(?:\r?\n\r?\n(结果|待确认)：(.*))?\z'
-    $taskBodyMatch = [regex]::Match($Body, $taskBodyPattern)
+    $taskBodyMatch = [regex]::Match($bodyWithoutSupport, $taskBodyPattern)
     if ($taskBodyMatch.Success) {
         $fields = @(
             [ordered]@{
@@ -532,8 +625,11 @@ function New-DiscordWebhookPayload {
         $embed.fields = $fields
     }
     else {
-        $markdownBody = ConvertTo-DiscordMarkdownBody -Value $Body
+        $markdownBody = ConvertTo-DiscordMarkdownBody -Value $bodyWithoutSupport
         $embed.description = Limit-DiscordText -Value $markdownBody -MaximumLength 4096
+    }
+    if (-not [string]::IsNullOrWhiteSpace($supportLine)) {
+        $embed.footer = [ordered]@{ text = Limit-DiscordText -Value $supportLine -MaximumLength 2048 }
     }
 
     return [ordered]@{
@@ -1359,6 +1455,8 @@ function Invoke-ConfirmationNotifier {
         $confirmationBody = if ([string]::IsNullOrWhiteSpace($assistantMessage)) { 'Codex 正在等待你的确认，请打开任务查看。' } else { $assistantMessage }
         $body = "项目名：$project`n任务名：$taskName`n`n任务：$taskBody`n`n待确认：$confirmationBody"
     }
+    $supportLine = Get-NotificationSupportLine -Notification $Notification
+    if (-not [string]::IsNullOrWhiteSpace($supportLine)) { $body += "`n`n$supportLine" }
 
     $endpointOverride = if ($provider -in @('ntfy', 'discord')) { $confirmationEndpoint } else { '' }
     Send-MobileMessage -Config $Config -Title $title -Body $body -Priority 4 -Tags @('question') -EventName 'user-task-confirmation-required' -Notification $Notification -EndpointOverride $endpointOverride
@@ -1396,6 +1494,8 @@ function Invoke-MobileNotifier {
         $resultBody = if ([string]::IsNullOrWhiteSpace($assistantMessage)) { '任务已结束，但未取得最终回复正文' } else { $assistantMessage }
         $body = "项目名：$project`n任务名：$taskName`n`n任务：$taskBody`n`n结果：$resultBody"
     }
+    $supportLine = Get-NotificationSupportLine -Notification $Notification
+    if (-not [string]::IsNullOrWhiteSpace($supportLine)) { $body += "`n`n$supportLine" }
 
     Send-MobileMessage -Config $Config -Title $title -Body $body -Priority 3 -Tags @('white_check_mark') -EventName 'user-task-complete' -Notification $Notification
 }
@@ -2296,6 +2396,7 @@ try {
             }
             return
         }
+        $notification = Add-NotificationTurnSupport -Notification $notification
         $notificationKind = Get-TaskNotificationKind -Notification $notification
         $sendTaskNotification = {
             if ($notificationKind -eq 'confirmation') {

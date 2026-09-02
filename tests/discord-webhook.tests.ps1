@@ -25,14 +25,21 @@ function Write-Utf8NoBom {
 function Invoke-TaskCase {
     param([string]$UserMessage, [string]$AssistantMessage)
 
+    $turnId = [guid]::NewGuid().ToString()
     $notification = [ordered]@{
         type = 'agent-turn-complete'
         'thread-id' = $script:rootId
-        'turn-id' = [guid]::NewGuid().ToString()
+        'turn-id' = $turnId
         cwd = 'C:\workspace\demo-project'
         'input-messages' = @($UserMessage)
         'last-assistant-message' = $AssistantMessage
     }
+    $turnContext = [ordered]@{
+        timestamp = '2026-08-31T00:00:01.000Z'
+        type = 'turn_context'
+        payload = [ordered]@{ turn_id = $turnId; model = 'gpt-5.6-sol'; effort = 'ultra' }
+    }
+    Add-Content -LiteralPath $script:sessionPath -Value ($turnContext | ConvertTo-Json -Depth 8 -Compress) -Encoding UTF8
     $raw = $notification | ConvertTo-Json -Depth 8 -Compress
     $output = @(& $script:testDispatcher $raw -MobileOnly -DryRun)
     return ((($output | ForEach-Object { [string]$_ }) -join "`n").Trim() | ConvertFrom-Json)
@@ -86,6 +93,7 @@ try {
         }
     }
     $sessionPath = Join-Path $tempRoot "sessions\2026\08\31\rollout-2026-08-31T00-00-00-$rootId.jsonl"
+    $script:sessionPath = $sessionPath
     Write-Utf8NoBom -Path $sessionPath -Content (($sessionEntry | ConvertTo-Json -Depth 12 -Compress) + "`n")
 
     $completed = Invoke-TaskCase -UserMessage '完成 Discord 通知接入' -AssistantMessage '已完成 Discord 通知接入，全部测试通过。'
@@ -108,6 +116,9 @@ try {
     if (($completedFields | Where-Object { $_.name -eq '结果' }).value -ne '已完成 Discord 通知接入，全部测试通过。') {
         $failures += '[complete fields] result field is missing or incorrect'
     }
+    if ([string]$completed.payload.embeds[0].footer.text -ne '由 5.6 Sol Ultra 支持') {
+        $failures += '[complete footer] model and reasoning effort support line is missing or incorrect'
+    }
     if (@($completed.payload.allowed_mentions.parse).Count -ne 0) {
         $failures += '[allowed mentions] Discord payload must disable automatic mentions'
     }
@@ -122,6 +133,9 @@ try {
     $confirmationFields = @($confirmation.payload.embeds[0].fields)
     if (($confirmationFields | Where-Object { $_.name -eq '待确认' }).value -ne '需要安装 JDK 17 和 Maven。现在直接安装，可以吗？') {
         $failures += '[confirmation fields] confirmation field is missing or incorrect'
+    }
+    if ([string]$confirmation.payload.embeds[0].footer.text -ne '由 5.6 Sol Ultra 支持') {
+        $failures += '[confirmation footer] model and reasoning effort support line is missing or incorrect'
     }
 
     $ntfyConfig = [ordered]@{

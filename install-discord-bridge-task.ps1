@@ -7,8 +7,7 @@ $ErrorActionPreference = 'Stop'
 $toolDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 . (Join-Path $toolDir 'discord-bridge-startup.ps1')
 
-$powerShellPath = (Get-Command pwsh -ErrorAction Stop).Source
-$definition = Get-DiscordBridgeTaskDefinition -ToolDir $toolDir -PowerShellPath $powerShellPath
+$definition = Get-DiscordBridgeTaskDefinition -ToolDir $toolDir
 $action = New-ScheduledTaskAction `
     -Execute $definition.Execute `
     -Argument $definition.Arguments `

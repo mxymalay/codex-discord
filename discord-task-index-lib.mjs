@@ -125,6 +125,11 @@ function cleanPageText(value) {
   return String(value ?? '').replaceAll('\u0000', '').replace(/\r\n?/g, '\n').trim();
 }
 
+function isUserAuthoredResponseMessage(payload) {
+  const kinds = payload?.internal_chat_message_metadata_passthrough?.content_item_kinds;
+  return !Array.isArray(kinds) || kinds.includes('user.text');
+}
+
 function normalizeSearch(value) {
   return cleanPageText(value).normalize('NFKC').toLocaleLowerCase().replace(/\s+/gu, ' ').trim();
 }
@@ -652,7 +657,7 @@ export async function readTaskDetail(record, options = {}) {
     if (entry?.type === 'response_item' && payload.type === 'message') {
       const role = String(payload.role ?? '').toLocaleLowerCase();
       const candidate = cleanPageText(textValue(payload.content));
-      if (role === 'user' && !taskText && candidate) taskText = candidate;
+      if (role === 'user' && !taskText && candidate && isUserAuthoredResponseMessage(payload)) taskText = candidate;
       if (role === 'assistant' && candidate && (!payload.phase || payload.phase === 'final_answer')) resultText = candidate;
     }
   }

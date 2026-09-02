@@ -32,6 +32,7 @@ import {
   getPendingReplies,
   initializeAppServerClient,
   initializeInboxCursors,
+  interruptCodexThread,
   isActiveWriterError,
   listContinuations,
   listRetryableContinuations,
@@ -45,6 +46,7 @@ import {
   resolveDiscordOrigin,
   resolveCodexExecutable,
   resumeCodexThread,
+  steerCodexThread,
   writeJsonAtomic,
 } from '../discord-bridge-lib.mjs';
 
@@ -1737,6 +1739,24 @@ test('source-channel progress sends deterministic Discord nonce without a fake r
   }]);
 });
 
+test('Discord reply transport preserves the shared queue embeds and buttons', async () => {
+  let body;
+  await bridgeLib.sendDiscordReply({
+    token: 'test-token',
+    channelId: '777777777777777777',
+    replyToMessageId: '888888888888888888',
+    content: '已安全排队',
+    embeds: [{ description: '任务清单' }],
+    components: [{ type: 1, components: [{ type: 2, style: 4, label: '中断当前运行并立即继续', custom_id: 'takeover-continue:test' }] }],
+    fetchImpl: async (_url, options) => {
+      body = JSON.parse(options.body);
+      return { ok: true, status: 200, json: async () => ({ id: '999999999999999999' }) };
+    },
+  });
+  assert.deepEqual(body.embeds, [{ description: '任务清单' }]);
+  assert.equal(body.components[0].components[0].label, '中断当前运行并立即继续');
+});
+
 test('queues an active-writer reply with encrypted text and no plaintext at rest', () => {
   const state = createEmptyInboxState();
   const accepted = classifyReply(makeMessage(), config, mapping, state);
@@ -2008,7 +2028,7 @@ test('cancels only continuations that have not started and delivered entries can
   assert.equal(cancelContinuation(state, delivered.queueId, '2026-09-01T00:03:00.000Z').status, 'already-started');
 });
 
-test('dispatch queues an active writer, retries delivery, and preserves legacy reply acknowledgements', async () => {
+test('dispatch queues an active writer without a duplicate plain acknowledgement, then reports delivery', async () => {
   const state = createEmptyInboxState();
   const acknowledgements = [];
   const persisted = [];
@@ -2041,16 +2061,181 @@ test('dispatch queues an active writer, retries delivery, and preserves legacy r
   assert.equal(queued.status, 'queued');
   assert.equal(listContinuations(state).length, 1);
   assert.equal(Object.values(state.pendingContinuations).some((item) => Object.hasOwn(item, 'text')), false);
-  assert.match(acknowledgements[0].content, /已排队/);
-  assert.match(acknowledgements[0].content, /其他写入者/);
-  assert.equal(acknowledgements[0].content.includes('桌面端占用'), false);
+  assert.equal(acknowledgements.length, 0);
 
   const delivered = await dispatchContinuation(listContinuations(state)[0], dependencies);
   assert.equal(delivered.status, 'started');
   assert.equal(delivered.turnId, 'turn-retried');
   assert.equal(listContinuations(state)[0].status, 'delivered');
-  assert.match(acknowledgements[1].content, /排队回复现已送达/);
+  assert.match(acknowledgements[0].content, /排队回复现已送达/);
   assert.equal(persisted.length >= 2, true);
+});
+
+test('desktop continuation sends into the exact task and keeps the active turn id', async () => {
+  const events = [];
+  let reads = 0;
+  const result = await steerCodexThread({
+    threadId: '11111111-1111-4111-8111-111111111111',
+    text: '继续处理这个任务',
+    onStartSubmitting: async () => { events.push('submitting'); },
+    onStartSubmitted: async () => { events.push('submitted'); },
+    appToolCall: async ({ tool, args, onSubmitted }) => {
+      events.push(tool);
+      if (tool === 'send_message_to_thread') {
+        assert.deepEqual(args, {
+          threadId: '11111111-1111-4111-8111-111111111111',
+          prompt: '继续处理这个任务',
+        });
+        await onSubmitted();
+        return { success: true, contentItems: [] };
+      }
+      reads += 1;
+      return {
+        success: true,
+        contentItems: [{
+          type: 'inputText',
+          text: JSON.stringify({
+            turns: [{ id: 'turn-active', status: 'inProgress' }],
+          }),
+        }],
+      };
+    },
+  });
+
+  assert.equal(result.turnId, 'turn-active');
+  assert.equal(result.completion, undefined);
+  assert.equal(reads >= 1, true);
+  assert.deepEqual(events.slice(0, 4), ['read_thread', 'submitting', 'send_message_to_thread', 'submitted']);
+});
+
+test('desktop continuation binds a newly completed fast turn instead of losing its Discord route', async () => {
+  let reads = 0;
+  const result = await steerCodexThread({
+    threadId: 'root-fast',
+    text: '快速回答',
+    appToolCall: async ({ tool, onSubmitted }) => {
+      if (tool === 'send_message_to_thread') {
+        await onSubmitted?.();
+        return { success: true, contentItems: [] };
+      }
+      reads += 1;
+      const turns = reads === 1
+        ? [{ id: 'turn-old', status: 'completed' }]
+        : [{ id: 'turn-fast', status: 'completed' }, { id: 'turn-old', status: 'completed' }];
+      return { success: true, contentItems: [{ type: 'inputText', text: JSON.stringify({ turns }) }] };
+    },
+  });
+  assert.equal(result.turnId, 'turn-fast');
+});
+
+test('task interruption discovers the exact owner and confirms the exact active turn', async () => {
+  const requests = [];
+  const session = {
+    request: async (request) => {
+      requests.push(request);
+      if (request.method === 'initialize') {
+        return { resultType: 'success', result: { clientId: 'bridge-client' } };
+      }
+      if (request.method === 'thread-owner-discovery') {
+        return { resultType: 'success', handledByClientId: 'desktop-owner', result: {} };
+      }
+      return {
+        resultType: 'success',
+        result: { ok: true, interruptedTurnId: 'turn-running' },
+      };
+    },
+    close: () => { requests.push({ method: 'closed' }); },
+  };
+  const result = await interruptCodexThread({
+    threadId: 'root-running',
+    appToolCall: async () => ({
+      success: true,
+      contentItems: [{ type: 'inputText', text: JSON.stringify({
+        turns: [{ id: 'turn-running', status: 'inProgress' }],
+      }) }],
+    }),
+    routerSessionFactory: async () => session,
+  });
+
+  assert.deepEqual(result, { ok: true, turnId: 'turn-running' });
+  assert.deepEqual(requests[0].params, { clientType: 'codex-discord-bridge' });
+  assert.deepEqual(requests[1].params, { hostId: 'local', conversationId: 'root-running' });
+  assert.equal(requests[2].version, 4);
+  assert.equal(requests[2].targetClientId, 'desktop-owner');
+  assert.deepEqual(requests[2].params, {
+    conversationId: 'root-running', mode: 'user-stop', expectedTurnId: 'turn-running',
+  });
+  assert.equal(requests.at(-1).method, 'closed');
+});
+
+test('task interruption is a no-op when the task is no longer running', async () => {
+  let opened = false;
+  const result = await interruptCodexThread({
+    threadId: 'root-idle',
+    appToolCall: async () => ({
+      success: true,
+      contentItems: [{ type: 'inputText', text: JSON.stringify({
+        turns: [{ id: 'turn-done', status: 'completed' }],
+      }) }],
+    }),
+    routerSessionFactory: async () => { opened = true; throw new Error('must not open'); },
+  });
+  assert.deepEqual(result, { ok: false, reason: 'not-running' });
+  assert.equal(opened, false);
+});
+
+test('dispatch prefers desktop steering, falls back only before submission, and does not track a steered turn', async () => {
+  const makeRequest = (id) => createContinuationRequest({
+    source: 'slash', requestId: id, threadId: 'root-steer', text: 'continue',
+  });
+  let resumeCount = 0;
+  let trackCount = 0;
+  const started = await dispatchContinuation(makeRequest('steer-success'), {
+    state: createEmptyInboxState(),
+    encryptText: async () => 'cipher',
+    persistState: async () => {},
+    steerCodexThread: async () => ({ turnId: 'turn-steered' }),
+    resumeCodexThread: async () => { resumeCount += 1; throw new Error('must not resume'); },
+    trackCompletion: async () => { trackCount += 1; },
+  });
+  assert.equal(started.turnId, 'turn-steered');
+  assert.equal(resumeCount, 0);
+  assert.equal(trackCount, 0);
+
+  const fallback = await dispatchContinuation(makeRequest('steer-pre-submit'), {
+    state: createEmptyInboxState(),
+    encryptText: async () => 'cipher',
+    persistState: async () => {},
+    steerCodexThread: async (options) => {
+      await options.onStartSubmitting();
+      const error = new Error('desktop unavailable');
+      error.submissionStage = 'pre-submit';
+      error.desktopUnavailable = true;
+      throw error;
+    },
+    resumeCodexThread: async (options) => {
+      await options.onStartSubmitting();
+      await options.onStartSubmitted();
+      resumeCount += 1;
+      return { turnId: 'turn-fallback', completion: Promise.resolve({ turn: { status: 'completed' } }) };
+    },
+  });
+  assert.equal(fallback.turnId, 'turn-fallback');
+  assert.equal(resumeCount, 1);
+
+  const uncertain = await dispatchContinuation(makeRequest('steer-post-submit'), {
+    state: createEmptyInboxState(),
+    encryptText: async () => 'cipher',
+    persistState: async () => {},
+    steerCodexThread: async () => {
+      const error = new Error('reply lost');
+      error.submissionStage = 'post-submit';
+      throw error;
+    },
+    resumeCodexThread: async () => { resumeCount += 1; throw new Error('must not retry'); },
+  });
+  assert.equal(uncertain.status, 'uncertain');
+  assert.equal(resumeCount, 1);
 });
 
 test('an active-writer downgrade durably records its structured blocking reason', async () => {

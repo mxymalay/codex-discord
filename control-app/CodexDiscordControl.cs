@@ -192,6 +192,10 @@ namespace CodexDiscordControl
             {
                 return RunHeadlessStatus();
             }
+            if (args.Length == 2 && String.Equals(args[0], "--bridge-supervisor", StringComparison.Ordinal))
+            {
+                return RunBridgeSupervisor(args[1]);
+            }
             if (args.Length != 0)
             {
                 WriteHeadlessJson("{\"ok\":false,\"errorCategory\":\"invalid-arguments\"}");
@@ -215,6 +219,33 @@ namespace CodexDiscordControl
 
             WriteHeadlessJson("{\"ok\":false,\"errorCategory\":\"" + JsonEscape(FixedErrorCategory(result)) + "\"}");
             return result.ExitCode == 0 ? 1 : result.ExitCode;
+        }
+
+        private static int RunBridgeSupervisor(string mode)
+        {
+            if (mode != "scheduled" && mode != "temporary") { return 2; }
+            string baseDirectory = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
+            string startupPath = Path.Combine(baseDirectory, "start-discord-bridge.ps1");
+            string powershellPath = ResolvePowerShell7Path();
+            if (!File.Exists(startupPath) || powershellPath == null) { return 1; }
+
+            ProcessStartInfo startInfo = new ProcessStartInfo();
+            startInfo.FileName = powershellPath;
+            startInfo.Arguments = "-NoProfile -File " + QuoteArgument(startupPath);
+            startInfo.WorkingDirectory = baseDirectory;
+            startInfo.UseShellExecute = false;
+            startInfo.CreateNoWindow = true;
+            startInfo.EnvironmentVariables["CODEX_DISCORD_START_MODE"] = mode;
+            try
+            {
+                using (Process process = Process.Start(startInfo))
+                {
+                    if (process == null) { return 1; }
+                    process.WaitForExit();
+                    return process.ExitCode;
+                }
+            }
+            catch { return 1; }
         }
 
         private static void WriteHeadlessJson(string value)

@@ -42,6 +42,14 @@ function taskStarted() {
   };
 }
 
+function turnContext(model = 'gpt-5.6-sol', effort = 'ultra') {
+  return {
+    timestamp: '2026-09-01T00:00:01.100Z',
+    type: 'turn_context',
+    payload: { turn_id: turnId, model, effort },
+  };
+}
+
 function userMessage(text = '请检查 Discord 通知为什么漏发') {
   return {
     timestamp: '2026-09-01T00:00:02.000Z',
@@ -70,7 +78,7 @@ async function fixture() {
 test('baselines existing bytes but preserves the active turn context for the next completion', async () => {
   const paths = await fixture();
   try {
-    await fs.writeFile(paths.rolloutPath, [sessionMeta(), taskStarted(), userMessage()].map(jsonLine).join(''), 'utf8');
+    await fs.writeFile(paths.rolloutPath, [sessionMeta(), taskStarted(), turnContext(), userMessage()].map(jsonLine).join(''), 'utf8');
     const state = createEmptyRolloutWatcherState();
     await initializeRolloutWatcherState({ sessionsRoot: paths.sessionsRoot, state });
 
@@ -90,7 +98,7 @@ test('baselines existing bytes but preserves the active turn context for the nex
 test('waits for a complete JSONL line and grace period, then dispatches one standard notification', async () => {
   const paths = await fixture();
   try {
-    await fs.writeFile(paths.rolloutPath, [sessionMeta(), taskStarted(), userMessage()].map(jsonLine).join(''), 'utf8');
+    await fs.writeFile(paths.rolloutPath, [sessionMeta(), taskStarted(), turnContext(), userMessage()].map(jsonLine).join(''), 'utf8');
     const state = createEmptyRolloutWatcherState();
     await initializeRolloutWatcherState({ sessionsRoot: paths.sessionsRoot, state });
     const dispatched = [];
@@ -132,6 +140,8 @@ test('waits for a complete JSONL line and grace period, then dispatches one stan
       cwd: 'C:\\workspace\\demo',
       'input-messages': ['请检查 Discord 通知为什么漏发'],
       'last-assistant-message': '已经完成修复。',
+      model: 'gpt-5.6-sol',
+      'reasoning-effort': 'ultra',
     }]);
 
     await pollRolloutCompletions({
@@ -370,6 +380,7 @@ test('formats every active Discord-origin progress message with the requested ta
     await fs.writeFile(paths.rolloutPath, [
       meta,
       taskStarted(),
+      turnContext(),
       {
         timestamp: '2026-09-01T00:00:05.000Z', type: 'event_msg',
         payload: { type: 'agent_message', phase: 'commentary', message: '这很有价值。我先核对实际稳定时长、有没有新增转储……' },
@@ -398,6 +409,8 @@ test('formats every active Discord-origin progress message with the requested ta
       '### **运行时间**',
       '',
       '已运行 18 秒',
+      '',
+      '由 5.6 Sol Ultra 支持',
     ].join('\n'));
   } finally {
     await fs.rm(paths.root, { recursive: true, force: true });

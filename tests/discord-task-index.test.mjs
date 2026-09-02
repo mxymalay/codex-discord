@@ -990,6 +990,37 @@ test('reads current response-item messages using first user and latest final ass
   }
 });
 
+test('task detail skips app-injected user context and keeps the first real user message', async () => {
+  const paths = await fixture();
+  try {
+    const rolloutPath = paths.rollout('injected-context-detail');
+    const injected = responseMessage(
+      '2026-09-01T00:01:00.000Z',
+      'user',
+      '<recommended_plugins>\n- Airtable\n</recommended_plugins>',
+    );
+    injected.payload.internal_chat_message_metadata_passthrough = {
+      turn_id: 'turn-injected',
+      content_item_kinds: ['plugins.recommendations', 'environments.environment_context'],
+    };
+    const authored = responseMessage('2026-09-01T00:01:01.000Z', 'user', '我的命令行怎么找不到 Codex');
+    authored.payload.internal_chat_message_metadata_passthrough = {
+      turn_id: 'turn-injected',
+      content_item_kinds: ['user.text'],
+    };
+    await writeJsonl(rolloutPath, [meta('injected-context-detail'), injected, authored]);
+
+    const detail = await readTaskDetail({
+      threadId: 'injected-context-detail', rolloutPath, offset: (await fs.stat(rolloutPath)).size,
+    });
+
+    assert.equal(detail.taskText, '我的命令行怎么找不到 Codex');
+    assert.equal(detail.markdown.includes('recommended_plugins'), false);
+  } finally {
+    await fs.rm(paths.root, { recursive: true, force: true });
+  }
+});
+
 test('marks missing rollout content unavailable and retries the same search cache key after restoration', async () => {
   const paths = await fixture();
   try {

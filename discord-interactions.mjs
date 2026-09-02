@@ -1,7 +1,7 @@
 import { createHash, randomBytes as cryptoRandomBytes } from 'node:crypto';
 import path from 'node:path';
 
-import { COMMAND_NAMES, authorizeInteraction, ephemeral } from './discord-commands-lib.mjs';
+import { COMMAND_NAMES, authorizeInteraction, ephemeral, validNewTaskModelEffort } from './discord-commands-lib.mjs';
 import { cancelContinuationPersisted as cancelPersistedContinuation, createContinuationRequest } from './discord-bridge-lib.mjs';
 import { renderHealthReport, runFullHealthChecks, runQuickHealthChecks } from './discord-health-lib.mjs';
 import { NO_PROJECT, resolveProjectSelection } from './discord-task-create-lib.mjs';
@@ -471,26 +471,28 @@ function continuationQueueView(items, taskIndex = null) {
       const task = tasks.find((candidate) => String(candidate?.threadId ?? '').toLocaleLowerCase() === String(item?.threadId ?? '').toLocaleLowerCase());
       const projectName = item?.projectName ?? task?.projectName ?? '无项目';
       const taskName = item?.taskName ?? task?.taskName ?? `任务 …${String(item?.threadId ?? '').slice(-8)}`;
-      const source = item?.source === 'reply' ? '通知回复' : 'Slash 命令';
       return [
-        `${index + 1}. **项目：** ${metadataText(projectName, '无项目')}`,
-        `   **任务：** ${metadataText(taskName, '未命名任务')}｜**队列编号：** …${metadataText(String(item?.queueId ?? '').slice(-8), '未知', 16)}`,
-        `   **内容：** ${metadataText(continuationSummaryText(item?.summary), '（无可用摘要）', 140)}`,
-        `   **来源：** ${source}｜**加入：** ${formatTimestamp(item?.createdAt ?? item?.queuedAt)}｜**最后尝试：** ${formatTimestamp(item?.lastAttemptAt)}｜**状态：** ${continuationStatusLabel(item?.status)}`,
-      ].join('\n');
+        `${index + 1}.`,
+        `**项目：** ${metadataText(projectName, '无项目')}`,
+        `**任务：** ${metadataText(taskName, '未命名任务')}`,
+        `**内容：** ${metadataText(continuationSummaryText(item?.summary), '（无可用摘要）', 140)}`,
+        `**状态：** ${continuationStatusLabel(item?.status)}`,
+        `**队列编号：** …${metadataText(String(item?.queueId ?? '').slice(-8), '未知', 16)}`,
+      ].join('\n\n');
     };
   const displayed = [];
   let description = '## 继续队列';
   for (let index = 0; index < candidates.length; index += 1) {
     const entry = entryText(candidates[index], index);
     const omittedAfter = values.length - displayed.length - 1;
-    const omittedText = omittedAfter > 0 ? `\n…另有 ${omittedAfter} 项未显示。` : '';
-    if (`${description}\n${entry}${omittedText}`.length > EMBED_MARKDOWN_LIMIT) break;
-    description += `\n${entry}`;
+    const separator = displayed.length ? '\n\n---\n\n' : '\n\n';
+    const omittedText = omittedAfter > 0 ? `\n\n…另有 ${omittedAfter} 项未显示。` : '';
+    if (`${description}${separator}${entry}${omittedText}`.length > EMBED_MARKDOWN_LIMIT) break;
+    description += `${separator}${entry}`;
     displayed.push(candidates[index]);
   }
   const omitted = values.length - displayed.length;
-  if (omitted > 0) description += `\n…另有 ${omitted} 项未显示。`;
+  if (omitted > 0) description += `\n\n…另有 ${omitted} 项未显示。`;
   return { description, displayed };
 }
 
@@ -644,11 +646,11 @@ export function renderSystemStatus(status = {}) {
 
 export function renderHelp() {
   const descriptions = {
-    任务列表: '查看最近主任务，可按状态筛选。',
+    任务列表: '查看最近主任务，可按状态筛选；运行中的任务可停止当前一轮。',
     任务详情: '选择主任务并查看完整任务与最新结果。',
     任务搜索: '按关键词搜索项目、标题和任务正文。',
-    新建任务: '从已保存项目或“无项目”创建持久任务。Git 项目自动使用隔离工作树，非 Git 项目使用保存目录。',
-    继续任务: '选择主任务并发送新的多行指令。',
+    新建任务: '从已保存项目或“无项目”创建持久任务，并可首次选择模型与推理强度；Git 项目使用隔离工作树。',
+    继续任务: '选择主任务并发送新的多行指令，优先转向指定任务。',
     继续队列: '查看或取消尚未开始的继续请求。',
     额度: '查看最后一份本机官方周额度快照。',
     系统状态: '查看 Gateway、监听、索引、队列与额度状态。',
@@ -661,7 +663,8 @@ export function renderHelp() {
     ...COMMAND_NAMES.map((name) => `- **/${name}** — ${descriptions[name]}`),
     '',
     '### 远程接管与任务进度',
-    '- `/继续任务` 遇到 active-writer（桌面写入者占用）时会先安全排队，再给出接管选项；不会同时让两个写入者操作同一任务。',
+    '- 长按回复与 `/继续任务` 共用同一流程：先转向指定任务；遇到写入者占用时安全排队，并可停止该任务当前一轮后立即继续。',
+    '- 精确停止失败时才会显示退出整个 Codex 的最终兜底；不会自动退出，也不会停止其他任务。',
     '- `/退出codex` 会先列出可能中断的主任务，只有你再次确认后才退出 Codex 桌面端；风险清单变化时必须重新确认。',
     '- 从 Discord 新建或继续的任务都会回到发起任务的原频道，包括 commentary、脱敏工具进度、待确认和最终结果。',
     '',
@@ -807,36 +810,58 @@ function createPageState(dependencies, pages, interaction, extraComponents = [])
   return { stateId, payload: pagePayload(stateId, state) };
 }
 
-function createContinueTargetButton(dependencies, interaction, threadId) {
+function createStopCurrentButton(dependencies, interaction, task) {
+  if (task?.status !== 'running') return null;
+  const stateId = makeStateId(dependencies);
+  dependencies.uiState.set(stateId, {
+    kind: 'stop-current',
+    userId: userId(interaction),
+    guildId: guildId(interaction),
+    threadId: String(task.threadId),
+    expiresAt: nowValue(dependencies) + UI_TTL_MS,
+  });
+  return { type: 2, style: 4, label: '停止当前运行', custom_id: `stop-current:${stateId}` };
+}
+
+function createContinueTargetButton(dependencies, interaction, task) {
   const stateId = makeStateId(dependencies);
   dependencies.uiState.set(stateId, {
     kind: 'continue-target',
     userId: userId(interaction),
     guildId: guildId(interaction),
-    threadId: String(threadId),
+    threadId: String(task.threadId),
     expiresAt: nowValue(dependencies) + UI_TTL_MS,
   });
+  const stopButton = createStopCurrentButton(dependencies, interaction, task);
   return {
     type: 1,
-    components: [{ type: 2, style: 1, label: '继续任务', custom_id: `continue-open:${stateId}` }],
+    components: [
+      { type: 2, style: 1, label: '继续任务', custom_id: `continue-open:${stateId}` },
+      stopButton,
+    ].filter(Boolean),
   };
 }
 
 function detailButtons(dependencies, tasks, interaction) {
-  const buttons = [];
-  for (const task of (Array.isArray(tasks) ? tasks : []).slice(0, 10)) {
-    const stateId = makeStateId(dependencies);
-    dependencies.uiState.set(stateId, {
-      kind: 'detail',
-      userId: userId(interaction),
-      guildId: guildId(interaction),
-      threadId: String(task.threadId),
-      expiresAt: nowValue(dependencies) + UI_TTL_MS,
-    });
-    buttons.push({ type: 2, style: 2, label: `查看：${plainLabel(task.taskName, '未命名任务', 77)}`, custom_id: `detail:${stateId}` });
-  }
   const rows = [];
-  for (let index = 0; index < buttons.length; index += 5) rows.push({ type: 1, components: buttons.slice(index, index + 5) });
+  const values = (Array.isArray(tasks) ? tasks : []).slice(0, 10);
+  for (let index = 0; index < values.length; index += 2) {
+    const buttons = [];
+    for (const task of values.slice(index, index + 2)) {
+      const stateId = makeStateId(dependencies);
+      dependencies.uiState.set(stateId, {
+        kind: 'detail',
+        userId: userId(interaction),
+        guildId: guildId(interaction),
+        threadId: String(task.threadId),
+        expiresAt: nowValue(dependencies) + UI_TTL_MS,
+      });
+      buttons.push({ type: 2, style: 2, label: `查看：${plainLabel(task.taskName, '未命名任务', 77)}`, custom_id: `detail:${stateId}` });
+      const stopButton = createStopCurrentButton(dependencies, interaction, task);
+      if (stopButton) buttons.push(stopButton);
+    }
+    rows.push({ type: 1, components: buttons });
+  }
   return rows;
 }
 
@@ -1002,13 +1027,35 @@ function takeoverComponents(stateId) {
 }
 
 function continuationTakeoverComponents(stateId) {
-  return [{
-    type: 1,
-    components: [
-      { type: 2, style: 4, label: '退出 Codex 并立即继续', custom_id: `takeover-continue:${stateId}` },
-      { type: 2, style: 2, label: '保持排队', custom_id: `takeover-keep:${stateId}` },
-    ],
-  }];
+  return [
+    {
+      type: 1,
+      components: [
+        { type: 2, style: 4, label: '中断当前运行并立即继续', custom_id: `takeover-continue:${stateId}` },
+        { type: 2, style: 1, label: '取消排队', custom_id: `takeover-queue-cancel:${stateId}` },
+      ],
+    },
+    {
+      type: 1,
+      components: [{ type: 2, style: 2, label: '保持排队', custom_id: `takeover-keep:${stateId}` }],
+    },
+  ];
+}
+
+function continuationGlobalFallbackComponents(stateId) {
+  return [
+    {
+      type: 1,
+      components: [
+        { type: 2, style: 4, label: '退出整个 Codex 并立即继续', custom_id: `takeover-global:${stateId}` },
+        { type: 2, style: 1, label: '取消排队', custom_id: `takeover-queue-cancel:${stateId}` },
+      ],
+    },
+    {
+      type: 1,
+      components: [{ type: 2, style: 2, label: '保持排队', custom_id: `takeover-keep:${stateId}` }],
+    },
+  ];
 }
 
 function queuedTakeoverUnavailable(reason = 'untrusted') {
@@ -1021,7 +1068,7 @@ function queuedTakeoverUnavailable(reason = 'untrusted') {
   };
 }
 
-async function inspectQueuedTakeover(dependencies, targetThreadId) {
+export async function inspectQueuedTakeover(dependencies, targetThreadId) {
   const [indexResult, statusResult] = await Promise.allSettled([
     Promise.resolve().then(() => dependencies.refreshTaskIndex()),
     Promise.resolve().then(() => dependencies.getCodexControlStatus()),
@@ -1040,10 +1087,12 @@ async function inspectQueuedTakeover(dependencies, targetThreadId) {
   };
 }
 
-async function publishContinuationTakeover(dependencies, interaction, {
+function continuationTakeoverStateAndPayload(dependencies, {
   queueId,
   targetThreadId,
   snapshot,
+  ownerUserId,
+  ownerGuildId,
   messageId = null,
   newTasksDetected = false,
 }) {
@@ -1052,8 +1101,8 @@ async function publishContinuationTakeover(dependencies, interaction, {
     ...createTakeoverUiState({
       id: stateId,
       kind: 'takeover-continue',
-      userId: userId(interaction),
-      guildId: guildId(interaction),
+      userId: ownerUserId,
+      guildId: ownerGuildId,
       targetThreadId,
       queueId,
       snapshot,
@@ -1061,12 +1110,31 @@ async function publishContinuationTakeover(dependencies, interaction, {
     }),
     messageId: messageId == null ? null : String(messageId),
   };
-  dependencies.uiState.set(stateId, state);
   const payload = mentionSafePayload({
     content: '目标任务正被其他写入者占用，继续请求已安全排队。请核对下列桌面任务后选择是否接管。',
     ...renderTakeoverPreview(snapshot, { desktopRunning: true, newTasksDetected }),
     components: continuationTakeoverComponents(stateId),
   });
+  return { stateId, state, payload };
+}
+
+async function publishContinuationTakeover(dependencies, interaction, {
+  queueId,
+  targetThreadId,
+  snapshot,
+  messageId = null,
+  newTasksDetected = false,
+}) {
+  const { stateId, state, payload } = continuationTakeoverStateAndPayload(dependencies, {
+    queueId,
+    targetThreadId,
+    snapshot,
+    ownerUserId: userId(interaction),
+    ownerGuildId: guildId(interaction),
+    messageId,
+    newTasksDetected,
+  });
+  dependencies.uiState.set(stateId, state);
   try {
     const reply = await dependencies.editOriginal?.(payload, interaction);
     const boundMessageId = state.messageId || String(reply?.id ?? '');
@@ -1080,6 +1148,67 @@ async function publishContinuationTakeover(dependencies, interaction, {
     dependencies.uiState.delete(stateId);
     throw new Error('Continuation takeover response failed');
   }
+}
+
+export async function publishContinuationTakeoverMessage(dependencies, {
+  queueId,
+  targetThreadId,
+  snapshot,
+  userId: ownerUserId,
+  guildId: ownerGuildId,
+  channelId,
+  replyToMessageId,
+}) {
+  const { stateId, state, payload } = continuationTakeoverStateAndPayload(dependencies, {
+    queueId,
+    targetThreadId,
+    snapshot,
+    ownerUserId,
+    ownerGuildId,
+  });
+  dependencies.uiState.set(stateId, state);
+  try {
+    const reply = await dependencies.sendMessage({ channelId, replyToMessageId, ...payload });
+    const messageId = String(reply?.id ?? '');
+    if (!messageId) throw new Error('Discord response did not include a message ID');
+    state.messageId = messageId;
+    return payload;
+  } catch (error) {
+    dependencies.uiState.delete(stateId);
+    throw error;
+  }
+}
+
+async function publishContinuationGlobalFallback(dependencies, interaction, state, {
+  snapshot = state.snapshot,
+  newTasksDetected = false,
+} = {}) {
+  const stateId = makeStateId(dependencies);
+  const fallback = {
+    ...createTakeoverUiState({
+      id: stateId,
+      kind: 'takeover-global-fallback',
+      userId: userId(interaction),
+      guildId: guildId(interaction),
+      targetThreadId: state.targetThreadId,
+      queueId: state.queueId,
+      snapshot,
+      nowMs: nowValue(dependencies),
+    }),
+    messageId: String(interaction?.message?.id ?? state.messageId ?? ''),
+  };
+  if (!fallback.messageId) {
+    return editOriginal(dependencies, interaction, {
+      content: '无法建立最终兜底确认；请求已保持排队。',
+      components: [],
+    });
+  }
+  dependencies.uiState.set(stateId, fallback);
+  return editOriginal(dependencies, interaction, mentionSafePayload({
+    content: '未能确认已停止目标任务的当前运行。为避免误伤其他任务，没有退出 Codex；如仍需立即继续，可选择最终兜底。',
+    ...renderTakeoverPreview(snapshot, { desktopRunning: true, newTasksDetected }),
+    components: continuationGlobalFallbackComponents(stateId),
+  }));
 }
 
 async function publishTakeoverConfirmation(dependencies, interaction, snapshot, {
@@ -1232,9 +1361,9 @@ async function confirmTakeoverExit(dependencies, routerState, interaction, state
   }
 }
 
-function continuationTakeoverStateError(dependencies, interaction, state) {
+function continuationTakeoverStateError(dependencies, interaction, state, kind = 'takeover-continue') {
   const validated = validateTakeoverUiState(state, {
-    kind: 'takeover-continue',
+    kind,
     userId: userId(interaction),
     guildId: guildId(interaction),
     nowMs: nowValue(dependencies),
@@ -1254,7 +1383,8 @@ function continuationTakeoverStateError(dependencies, interaction, state) {
 
 async function keepContinuationQueued(dependencies, interaction, stateId) {
   const state = dependencies.uiState.get(stateId);
-  const invalid = continuationTakeoverStateError(dependencies, interaction, state);
+  const kind = state?.kind === 'takeover-global-fallback' ? 'takeover-global-fallback' : 'takeover-continue';
+  const invalid = continuationTakeoverStateError(dependencies, interaction, state, kind);
   if (invalid) {
     if (state && nowValue(dependencies) >= Number(state.expiresAt)) dependencies.uiState.delete(stateId);
     return respond(dependencies, interaction, privateResponse(invalid));
@@ -1267,18 +1397,72 @@ async function keepContinuationQueued(dependencies, interaction, stateId) {
   });
 }
 
-function continuationTakeoverResult(result) {
+async function cancelTakeoverQueue(dependencies, interaction, stateId) {
+  const state = dependencies.uiState.get(stateId);
+  const kind = state?.kind === 'takeover-global-fallback' ? 'takeover-global-fallback' : 'takeover-continue';
+  const invalid = continuationTakeoverStateError(dependencies, interaction, state, kind);
+  if (invalid) {
+    if (state && nowValue(dependencies) >= Number(state.expiresAt)) dependencies.uiState.delete(stateId);
+    return respond(dependencies, interaction, privateResponse(invalid));
+  }
+  dependencies.uiState.delete(stateId);
+  await deferMessageUpdate(dependencies, interaction);
+  let result;
+  try {
+    const cancelledAt = new Date(nowValue(dependencies)).toISOString();
+    result = typeof dependencies.cancelContinuationPersisted === 'function'
+      ? await dependencies.cancelContinuationPersisted(state.queueId, cancelledAt)
+      : await cancelPersistedContinuation({
+        state: dependencies.continuationState,
+        queueId: state.queueId,
+        now: cancelledAt,
+        persistState: dependencies.persistContinuationState,
+      });
+  } catch {
+    result = { status: 'failed' };
+  }
+  const content = result?.status === 'cancelled'
+    ? '已取消排队；这条继续内容不会发送到 Codex。'
+    : result?.status === 'already-started'
+      ? '该请求已经开始，无法再取消排队。'
+      : '取消排队失败，请通过 /继续队列 检查当前状态。';
+  return editOriginal(dependencies, interaction, { content, components: [] });
+}
+
+async function stopCurrentTask(dependencies, interaction, stateId) {
+  const state = dependencies.uiState.get(stateId);
+  const invalid = componentStateError(dependencies, interaction, state);
+  if (invalid || state?.kind !== 'stop-current') {
+    return respond(dependencies, interaction, privateResponse(invalid ?? '停止按钮已失效，请刷新任务列表。'));
+  }
+  dependencies.uiState.delete(stateId);
+  await deferMessageUpdate(dependencies, interaction);
+  let result;
+  try {
+    result = await dependencies.interruptTask({ threadId: state.threadId });
+  } catch {
+    result = null;
+  }
+  const content = result?.ok
+    ? '已停止该任务的当前运行。任务本身仍保留，可稍后继续。'
+    : result?.reason === 'not-running'
+      ? '该任务当前已不在运行，无需停止。'
+      : '未能确认已停止该任务的当前运行，请刷新任务列表后重试。';
+  return editOriginal(dependencies, interaction, { content, components: [] });
+}
+
+function continuationTakeoverResult(result, action = '目标任务的当前运行已停止') {
   if (result?.status === 'started') {
     const suffix = result?.turnId ? `本轮 ID：…${String(result.turnId).slice(-8)}` : '';
-    return `Codex 桌面端退出操作已完成，目标任务已开始继续执行。${suffix}`;
+    return `${action}，目标任务已开始继续执行。${suffix}`;
   }
   if (result?.status === 'queued') {
-    return 'Codex 桌面端退出操作已完成，但目标任务仍被占用；请求将继续排队。占用者可能是其他 CLI 或插件。';
+    return `${action}，但目标任务仍被占用；请求将继续排队。`;
   }
   if (result?.status === 'uncertain') {
-    return 'Codex 桌面端退出操作已完成，但目标任务的启动结果不确定；为避免重复执行不会自动重试，请打开原任务确认实际状态。';
+    return `${action}，但目标任务的启动结果不确定；为避免重复执行不会自动重试，请打开原任务确认实际状态。`;
   }
-  return 'Codex 桌面端退出操作已完成，但目标任务没有成功立即继续；请通过 /继续队列 查看当前状态。';
+  return `${action}，但目标任务没有成功立即继续；请通过 /继续队列 查看当前状态。`;
 }
 
 async function confirmContinuationTakeover(dependencies, routerState, interaction, stateId) {
@@ -1291,33 +1475,11 @@ async function confirmContinuationTakeover(dependencies, routerState, interactio
 
   dependencies.uiState.delete(stateId);
   if (routerState.takeoverInProgress) {
-    return respond(dependencies, interaction, privateResponse('另一个退出操作正在执行；本接管建议未重复执行。'));
+    return respond(dependencies, interaction, privateResponse('另一个任务控制操作正在执行；本请求未重复执行。'));
   }
   routerState.takeoverInProgress = true;
   try {
     await deferMessageUpdate(dependencies, interaction);
-    const [indexResult, statusResult] = await Promise.allSettled([
-      Promise.resolve().then(() => dependencies.refreshTaskIndex()),
-      Promise.resolve().then(() => dependencies.getCodexControlStatus()),
-    ]);
-    const status = statusResult.status === 'fulfilled' ? statusResult.value : null;
-    if (!status?.ok || typeof status?.desktop?.running !== 'boolean') {
-      return editOriginal(dependencies, interaction, queuedTakeoverUnavailable());
-    }
-    const index = indexResult.status === 'fulfilled' ? indexResult.value : null;
-    if (!Array.isArray(index?.tasks)) {
-      return editOriginal(dependencies, interaction, queuedTakeoverUnavailable('index-unavailable'));
-    }
-    const currentSnapshot = buildTakeoverSnapshot(index, { targetThreadId: state.targetThreadId });
-    if (status.desktop.running && hasNewActiveTasks(state.snapshot, currentSnapshot)) {
-      return publishContinuationTakeover(dependencies, interaction, {
-        queueId: state.queueId,
-        targetThreadId: state.targetThreadId,
-        snapshot: currentSnapshot,
-        messageId: interaction?.message?.id,
-        newTasksDetected: true,
-      });
-    }
     let claim;
     try {
       claim = await dependencies.claimContinuationTakeover({
@@ -1329,29 +1491,115 @@ async function confirmContinuationTakeover(dependencies, routerState, interactio
     }
     if (claim?.status !== 'claimed') {
       const content = claim?.status === 'unavailable'
-        ? '队列状态已变化，目标请求可能已经取消或由其他处理器接管；未退出 Codex，也未重复执行。'
-        : '无法安全锁定目标队列；未退出 Codex，目标请求将保持排队。';
+        ? '队列状态已变化，目标请求可能已经取消或由其他处理器接管；未中断任务，也未重复执行。'
+        : '无法安全锁定目标队列；未中断任务，目标请求将保持排队。';
       return editOriginal(dependencies, interaction, { content, components: [] });
     }
-    if (status.desktop.running) {
-      let stopResult;
+    let interrupted;
+    try {
+      interrupted = await dependencies.interruptTask({ threadId: state.targetThreadId });
+    } catch {
+      interrupted = null;
+    }
+    if (!interrupted?.ok && interrupted?.reason !== 'not-running') {
+      let release;
       try {
-        stopResult = await dependencies.stopCodexDesktop();
+        release = await dependencies.releaseContinuationTakeoverClaim(claim);
       } catch {
-        stopResult = null;
+        release = { status: 'failed' };
       }
-      if (!stopResult?.ok) {
+      if (release?.status === 'queued' && interrupted?.reason === 'interrupt-not-confirmed') {
+        return publishContinuationGlobalFallback(dependencies, interaction, state);
+      }
+      if (release?.status === 'queued') {
+        return editOriginal(dependencies, interaction, {
+          content: '无法确认目标任务由 Codex 桌面端占用；没有退出 Codex，请求将保持排队。',
+          components: [],
+        });
+      }
+      return editOriginal(dependencies, interaction, {
+        content: '未能确认已停止目标任务的当前运行；队列锁定状态暂不可用，请通过 /继续队列 检查。',
+        components: [],
+      });
+    }
+    let result;
+    try {
+      result = await dependencies.retryContinuation(claim);
+    } catch {
+      result = { status: 'failed' };
+    }
+    return editOriginal(dependencies, interaction, {
+      content: continuationTakeoverResult(result),
+      components: [],
+    });
+  } finally {
+    routerState.takeoverInProgress = false;
+  }
+}
+
+async function confirmContinuationGlobalFallback(dependencies, routerState, interaction, stateId) {
+  const state = dependencies.uiState.get(stateId);
+  const invalid = continuationTakeoverStateError(dependencies, interaction, state, 'takeover-global-fallback');
+  if (invalid) {
+    if (state && nowValue(dependencies) >= Number(state.expiresAt)) dependencies.uiState.delete(stateId);
+    return respond(dependencies, interaction, privateResponse(invalid));
+  }
+  dependencies.uiState.delete(stateId);
+  if (routerState.takeoverInProgress) {
+    return respond(dependencies, interaction, privateResponse('另一个任务控制操作正在执行；本请求未重复执行。'));
+  }
+  routerState.takeoverInProgress = true;
+  try {
+    await deferMessageUpdate(dependencies, interaction);
+    const [indexResult, statusResult] = await Promise.allSettled([
+      Promise.resolve().then(() => dependencies.refreshTaskIndex()),
+      Promise.resolve().then(() => dependencies.getCodexControlStatus()),
+    ]);
+    const status = statusResult.status === 'fulfilled' ? statusResult.value : null;
+    const index = indexResult.status === 'fulfilled' ? indexResult.value : null;
+    if (!status?.ok || typeof status?.desktop?.running !== 'boolean' || !Array.isArray(index?.tasks)) {
+      return editOriginal(dependencies, interaction, queuedTakeoverUnavailable(!Array.isArray(index?.tasks) ? 'index-unavailable' : 'untrusted'));
+    }
+    const currentSnapshot = buildTakeoverSnapshot(index, { targetThreadId: state.targetThreadId });
+    if (status.desktop.running && hasNewActiveTasks(state.snapshot, currentSnapshot)) {
+      return publishContinuationGlobalFallback(dependencies, interaction, state, {
+        snapshot: currentSnapshot,
+        newTasksDetected: true,
+      });
+    }
+    let claim;
+    try {
+      claim = await dependencies.claimContinuationTakeover({
+        queueId: state.queueId,
+        targetThreadId: state.targetThreadId,
+      });
+    } catch {
+      claim = { status: 'failed' };
+    }
+    if (claim?.status !== 'claimed') {
+      return editOriginal(dependencies, interaction, {
+        content: '队列状态已变化或暂时无法锁定；未退出 Codex，也未重复执行。',
+        components: [],
+      });
+    }
+    if (status.desktop.running) {
+      let stopped;
+      try {
+        stopped = await dependencies.stopCodexDesktop();
+      } catch {
+        stopped = null;
+      }
+      if (!stopped?.ok) {
         let release;
         try {
           release = await dependencies.releaseContinuationTakeoverClaim(claim);
         } catch {
-          release = { status: 'failed' };
+          release = null;
         }
-        const content = release?.status === 'queued'
-          ? '退出 Codex 失败；未确认桌面端已停止，目标任务已恢复为保持排队。'
-          : '退出 Codex 失败；未确认桌面端已停止，接管状态将在服务恢复时安全回到继续队列。';
         return editOriginal(dependencies, interaction, {
-          content,
+          content: release?.status === 'queued'
+            ? '退出整个 Codex 失败；目标请求已恢复为保持排队。'
+            : '退出整个 Codex 失败；无法确认队列已恢复，请通过 /继续队列 检查当前状态。',
           components: [],
         });
       }
@@ -1363,7 +1611,7 @@ async function confirmContinuationTakeover(dependencies, routerState, interactio
       result = { status: 'failed' };
     }
     return editOriginal(dependencies, interaction, {
-      content: continuationTakeoverResult(result),
+      content: continuationTakeoverResult(result, '整个 Codex 已退出'),
       components: [],
     });
   } finally {
@@ -1406,7 +1654,7 @@ async function renderDetailInteraction(dependencies, interaction, record) {
   try {
     const detail = await dependencies.readTaskDetail(record);
     const pages = paginateMarkdown(renderTaskDetail(detail));
-    const continueRow = createContinueTargetButton(dependencies, interaction, record.threadId);
+    const continueRow = createContinueTargetButton(dependencies, interaction, record);
     const { payload } = createPageState(dependencies, pages, interaction, [continueRow]);
     return editOriginal(dependencies, interaction, payload);
   } catch {
@@ -1445,6 +1693,11 @@ async function handleCommand(dependencies, interaction) {
   }
   if (name === '新建任务') {
     const selectionId = String(optionValue(interaction, '项目') ?? '');
+    const model = String(optionValue(interaction, '模型') ?? '');
+    const effort = String(optionValue(interaction, '推理强度') ?? '');
+    if (!validNewTaskModelEffort(model, effort)) {
+      return respond(dependencies, interaction, privateResponse('所选模型不支持该推理强度，请重新选择。'));
+    }
     const project = cachedProject(dependencies, selectionId);
     if (!project) return respond(dependencies, interaction, privateResponse('项目选择无效，请重新执行 /新建任务。'));
     const stateId = makeStateId(dependencies);
@@ -1453,6 +1706,8 @@ async function handleCommand(dependencies, interaction) {
       userId: userId(interaction),
       guildId: guildId(interaction),
       selectionId,
+      model: model || undefined,
+      effort: effort || undefined,
       projectFingerprint: projectFingerprint(project),
       expiresAt: nowValue(dependencies) + UI_TTL_MS,
     });
@@ -1681,6 +1936,8 @@ async function handleModal(dependencies, submissions, interaction) {
           selection,
           worktreeRoot: dependencies.worktreeRoot,
           text: taskText,
+          model: state.model,
+          effort: state.effort,
           codexPath: dependencies.codexPath,
           processCwd: dependencies.processCwd,
           clientFactory: dependencies.clientFactory,
@@ -1723,6 +1980,12 @@ async function handleComponent(dependencies, interaction, routerState) {
   if (takeoverContinue) {
     return confirmContinuationTakeover(dependencies, routerState, interaction, takeoverContinue[1]);
   }
+  const takeoverGlobal = customId.match(/^takeover-global:([A-Za-z0-9_-]{16})$/u);
+  if (takeoverGlobal) {
+    return confirmContinuationGlobalFallback(dependencies, routerState, interaction, takeoverGlobal[1]);
+  }
+  const takeoverQueueCancel = customId.match(/^takeover-queue-cancel:([A-Za-z0-9_-]{16})$/u);
+  if (takeoverQueueCancel) return cancelTakeoverQueue(dependencies, interaction, takeoverQueueCancel[1]);
   const takeoverKeep = customId.match(/^takeover-keep:([A-Za-z0-9_-]{16})$/u);
   if (takeoverKeep) return keepContinuationQueued(dependencies, interaction, takeoverKeep[1]);
   const takeoverConfirm = customId.match(/^takeover-confirm:([A-Za-z0-9_-]{16})$/u);
@@ -1757,6 +2020,8 @@ async function handleComponent(dependencies, interaction, routerState) {
     }
     return editOriginal(dependencies, interaction, continuationQueuePayload(dependencies, interaction));
   }
+  const stopCurrent = customId.match(/^stop-current:([A-Za-z0-9_-]{16})$/u);
+  if (stopCurrent) return stopCurrentTask(dependencies, interaction, stopCurrent[1]);
   const continueMatch = customId.match(/^continue-open:([A-Za-z0-9_-]{16})$/u);
   if (continueMatch) {
     const state = dependencies.uiState.get(continueMatch[1]);
@@ -1798,7 +2063,8 @@ function isStateMutationInteraction(interaction) {
   if (type === 5) return customId.startsWith('new:') || customId.startsWith('continue:');
   if (type === 3) {
     return customId.startsWith('cancel:') || customId.startsWith('continue-open:') ||
-      customId.startsWith('takeover-continue:');
+      customId.startsWith('takeover-continue:') || customId.startsWith('takeover-global:') ||
+      customId.startsWith('takeover-queue-cancel:') || customId.startsWith('stop-current:');
   }
   return false;
 }

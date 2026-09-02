@@ -751,6 +751,8 @@ test('starts a durable thread before its first turn with exact workspace metadat
     selection: { kind: 'project', projectId: 'p1', projectName: 'POS', roots: ['C:\\repo'] },
     workspace: { mode: 'local', cwd: 'C:\\repo', runtimeWorkspaceRoots: ['C:\\repo'] },
     text: '检查支付流程',
+    model: 'gpt-5.6-sol',
+    effort: 'ultra',
     interactionId: 'interaction-1',
     codexPath: 'codex',
     processCwd: 'C:\\repo',
@@ -782,6 +784,8 @@ test('starts a durable thread before its first turn with exact workspace metadat
       runtimeWorkspaceRoots: ['C:\\repo'],
       clientUserMessageId: 'interaction-1',
       turnTrigger: 'discord-slash-command',
+      model: 'gpt-5.6-sol',
+      effort: 'ultra',
     },
   });
   assert.equal(result.threadId, 'thread-1');

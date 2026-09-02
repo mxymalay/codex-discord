@@ -63,6 +63,20 @@ test('defines exactly the approved eleven Chinese guild commands', () => {
     required: true,
     autocomplete: true,
   });
+  assert.deepEqual(create.options[1].choices, [
+    { name: 'GPT-5.6 Sol', value: 'gpt-5.6-sol' },
+    { name: 'GPT-5.6 Terra', value: 'gpt-5.6-terra' },
+    { name: 'GPT-5.6 Luna', value: 'gpt-5.6-luna' },
+    { name: 'GPT-5.5', value: 'gpt-5.5' },
+    { name: 'GPT-5.4', value: 'gpt-5.4' },
+    { name: 'GPT-5.4 Mini', value: 'gpt-5.4-mini' },
+    { name: 'GPT-5.3 Codex Spark', value: 'gpt-5.3-codex-spark' },
+  ]);
+  assert.equal(create.options[1].name, '模型');
+  assert.equal(create.options[1].required, false);
+  assert.deepEqual(create.options[2].choices.map((item) => item.value), ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
+  assert.equal(create.options[2].name, '推理强度');
+  assert.equal(create.options[2].required, false);
 
   const resume = commands.find((item) => item.name === '继续任务');
   assert.deepEqual(resume.options[0], details.options[0]);

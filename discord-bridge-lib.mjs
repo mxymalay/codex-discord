@@ -1,7 +1,8 @@
 import { spawn } from 'node:child_process';
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { createInterface } from 'node:readline';
 import { promises as fs } from 'node:fs';
+import net from 'node:net';
 import path from 'node:path';
 
 export function compareSnowflakes(left, right) {
@@ -42,6 +43,363 @@ const TASK_CREATION_STATUSES = new Set([
 const DISCORD_ORIGIN_SOURCES = new Set(['new-task', 'slash', 'reply']);
 const DISCORD_ORIGIN_DELIVERY_STATES = new Set(['pending', 'terminal-dispatching', 'terminal-delivered']);
 const CREATION_RECEIPT_STATUSES = new Set(['original-edited', 'followup-sent', 'failed']);
+const DESKTOP_TOOL_PIPE_PREFIX = 'codex-browser-use-';
+const MAX_PIPE_FRAME_BYTES = 8 * 1024 * 1024;
+let cachedDesktopToolPipe;
+
+function desktopUnavailable(error) {
+  const failure = error instanceof Error ? error : new Error(String(error ?? 'Codex desktop tools unavailable'));
+  failure.desktopUnavailable = true;
+  failure.submissionStage ??= 'pre-submit';
+  return failure;
+}
+
+async function requestFramedJsonPipe({
+  pipeName,
+  payload,
+  timeoutMs = 2_000,
+  onSubmitted,
+  connectImpl = (target) => net.createConnection(target),
+}) {
+  return new Promise((resolve, reject) => {
+    let socket;
+    let settled = false;
+    let submitted = false;
+    let buffer = Buffer.alloc(0);
+    let submission = Promise.resolve();
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket?.destroy();
+      if (error) {
+        error.submissionStage ??= submitted ? 'post-submit' : 'pre-submit';
+        reject(error);
+      } else {
+        resolve(value);
+      }
+    };
+    const timer = setTimeout(() => finish(new Error('Codex desktop pipe timed out')), timeoutMs);
+    try {
+      socket = connectImpl(`\\\\.\\pipe\\${pipeName}`);
+    } catch (error) {
+      finish(error);
+      return;
+    }
+    socket.once('connect', () => {
+      try {
+        const body = Buffer.from(JSON.stringify(payload));
+        if (body.length > MAX_PIPE_FRAME_BYTES) throw new Error('Codex desktop request is too large');
+        const header = Buffer.allocUnsafe(4);
+        header.writeUInt32LE(body.length);
+        socket.write(Buffer.concat([header, body]));
+        submitted = true;
+        submission = Promise.resolve().then(() => onSubmitted?.());
+        submission.catch((error) => finish(error));
+      } catch (error) {
+        finish(error);
+      }
+    });
+    socket.on('data', (chunk) => {
+      buffer = Buffer.concat([buffer, chunk]);
+      if (buffer.length < 4) return;
+      const length = buffer.readUInt32LE(0);
+      if (length > MAX_PIPE_FRAME_BYTES) {
+        finish(new Error('Codex desktop response is too large'));
+        return;
+      }
+      if (buffer.length < length + 4) return;
+      let response;
+      try {
+        response = JSON.parse(buffer.subarray(4, length + 4).toString('utf8'));
+      } catch (error) {
+        finish(error);
+        return;
+      }
+      submission.then(() => finish(null, response), (error) => finish(error));
+    });
+    socket.once('error', (error) => finish(error));
+    socket.once('close', () => {
+      if (!settled) finish(new Error('Codex desktop pipe closed before responding'));
+    });
+  });
+}
+
+async function findDesktopToolPipe({
+  listPipes = () => fs.readdir('\\\\.\\pipe\\'),
+  requestPipe = requestFramedJsonPipe,
+} = {}) {
+  let names;
+  try {
+    names = (await listPipes()).filter((name) => String(name).startsWith(DESKTOP_TOOL_PIPE_PREFIX));
+  } catch (error) {
+    throw desktopUnavailable(error);
+  }
+  const candidates = [...new Set([cachedDesktopToolPipe, ...names].filter(Boolean))];
+  for (const pipeName of candidates) {
+    try {
+      const response = await requestPipe({
+        pipeName,
+        payload: { jsonrpc: '2.0', id: randomUUID(), method: 'tools/list', params: { threadStartKind: 'all' } },
+      });
+      const tools = response?.result?.tools ?? [];
+      const names = new Set(tools.map((tool) => String(tool?.name ?? '')));
+      if (names.has('read_thread') && names.has('send_message_to_thread')) {
+        cachedDesktopToolPipe = pipeName;
+        return pipeName;
+      }
+    } catch {
+      if (cachedDesktopToolPipe === pipeName) cachedDesktopToolPipe = undefined;
+    }
+  }
+  throw desktopUnavailable(new Error('Codex desktop task tools are unavailable'));
+}
+
+export async function callCodexDesktopTool({
+  tool,
+  args,
+  threadId,
+  onSubmitted,
+  listPipes,
+  requestPipe = requestFramedJsonPipe,
+}) {
+  const pipeName = await findDesktopToolPipe({ listPipes, requestPipe });
+  let response;
+  try {
+    response = await requestPipe({
+      pipeName,
+      onSubmitted,
+      payload: {
+        jsonrpc: '2.0',
+        id: randomUUID(),
+        method: 'tools/call',
+        params: {
+          arguments: args,
+          callId: randomUUID(),
+          namespace: 'codex_app',
+          threadId,
+          tool,
+          turnId: randomUUID(),
+        },
+      },
+    });
+  } catch (error) {
+    if (typeof onSubmitted !== 'function') error.submissionStage = 'pre-submit';
+    throw desktopUnavailable(error);
+  }
+  if (!response?.result?.success) {
+    const error = desktopUnavailable(new Error(`Codex desktop rejected ${tool}`));
+    error.submissionStage = typeof onSubmitted === 'function' ? 'post-submit' : 'pre-submit';
+    throw error;
+  }
+  return response.result;
+}
+
+function desktopTurns(result) {
+  const text = result?.contentItems?.find((item) => item?.type === 'inputText' && typeof item?.text === 'string')?.text;
+  if (!text) return [];
+  try {
+    const parsed = JSON.parse(text);
+    return Array.isArray(parsed?.turns) ? parsed.turns : [];
+  } catch {
+    return [];
+  }
+}
+
+export async function steerCodexThread({
+  threadId,
+  text,
+  onStartSubmitting,
+  onStartSubmitted,
+  appToolCall = callCodexDesktopTool,
+}) {
+  const read = () => appToolCall({
+    tool: 'read_thread',
+    args: { threadId, turnLimit: 3, includeOutputs: false },
+    threadId,
+  });
+  let before;
+  try {
+    before = desktopTurns(await read());
+  } catch (error) {
+    throw desktopUnavailable(error);
+  }
+  await onStartSubmitting?.();
+  try {
+    await appToolCall({
+      tool: 'send_message_to_thread',
+      args: { threadId, prompt: text },
+      threadId,
+      onSubmitted: onStartSubmitted,
+    });
+  } catch (error) {
+    throw desktopUnavailable(error);
+  }
+  let after = [];
+  try {
+    after = desktopTurns(await read());
+  } catch {
+    // The message is already accepted; the pre-send active turn remains an exact binding when present.
+  }
+  const beforeIds = new Set(before.map((turn) => String(turn?.id ?? '')).filter(Boolean));
+  const newlyObserved = after.find((turn) => String(turn?.id ?? '') && !beforeIds.has(String(turn.id)));
+  const active = [...after, ...before].find((turn) => String(turn?.status ?? '').toLowerCase() === 'inprogress');
+  return { turnId: String(newlyObserved?.id ?? active?.id ?? '') || undefined };
+}
+
+function createCodexRouterSession({
+  connectImpl = (target) => net.createConnection(target),
+  timeoutMs = 3_000,
+} = {}) {
+  const socket = connectImpl('\\\\.\\pipe\\codex-ipc');
+  const pending = new Map();
+  let buffer = Buffer.alloc(0);
+  let closed = false;
+  let readyResolve;
+  let readyReject;
+  const ready = new Promise((resolve, reject) => {
+    readyResolve = resolve;
+    readyReject = reject;
+  });
+  const write = (message) => {
+    const body = Buffer.from(JSON.stringify(message));
+    if (body.length > MAX_PIPE_FRAME_BYTES) throw new Error('Codex router request is too large');
+    const header = Buffer.allocUnsafe(4);
+    header.writeUInt32LE(body.length);
+    socket.write(Buffer.concat([header, body]));
+  };
+  const fail = (error) => {
+    if (closed) return;
+    closed = true;
+    readyReject(error);
+    for (const entry of pending.values()) {
+      clearTimeout(entry.timer);
+      entry.reject(error);
+    }
+    pending.clear();
+  };
+  socket.once('connect', readyResolve);
+  socket.on('data', (chunk) => {
+    buffer = Buffer.concat([buffer, chunk]);
+    while (buffer.length >= 4) {
+      const length = buffer.readUInt32LE(0);
+      if (length > MAX_PIPE_FRAME_BYTES) {
+        fail(new Error('Codex router response is too large'));
+        socket.destroy();
+        return;
+      }
+      if (buffer.length < length + 4) return;
+      let message;
+      try {
+        message = JSON.parse(buffer.subarray(4, length + 4).toString('utf8'));
+      } catch (error) {
+        fail(error);
+        socket.destroy();
+        return;
+      }
+      buffer = buffer.subarray(length + 4);
+      if (message?.type === 'client-discovery-request') {
+        try {
+          write({ type: 'client-discovery-response', requestId: message.requestId, response: { canHandle: false } });
+        } catch (error) {
+          fail(error);
+        }
+        continue;
+      }
+      const entry = pending.get(String(message?.requestId ?? ''));
+      if (!entry) continue;
+      pending.delete(String(message.requestId));
+      clearTimeout(entry.timer);
+      entry.resolve(message);
+    }
+  });
+  socket.once('error', fail);
+  socket.once('close', () => fail(new Error('Codex router pipe closed')));
+  return {
+    async request(message) {
+      await ready;
+      const requestId = String(message?.requestId ?? randomUUID());
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          pending.delete(requestId);
+          reject(new Error(`Codex router timed out waiting for ${message?.method ?? 'request'}`));
+        }, timeoutMs);
+        pending.set(requestId, { resolve, reject, timer });
+        try {
+          write({ ...message, requestId });
+        } catch (error) {
+          clearTimeout(timer);
+          pending.delete(requestId);
+          reject(error);
+        }
+      });
+    },
+    close() {
+      if (!closed) socket.destroy();
+    },
+  };
+}
+
+export async function interruptCodexThread({
+  threadId,
+  appToolCall = callCodexDesktopTool,
+  routerSessionFactory = async () => createCodexRouterSession(),
+}) {
+  const turns = desktopTurns(await appToolCall({
+    tool: 'read_thread',
+    args: {
+      threadId,
+      hostId: 'local',
+      turnLimit: 1,
+      includeOutputs: false,
+      maxOutputCharsPerItem: 0,
+    },
+    threadId,
+  }));
+  const expectedTurnId = String(turns.find((turn) => turn?.status === 'inProgress')?.id ?? '');
+  if (!expectedTurnId) return { ok: false, reason: 'not-running' };
+
+  const session = await routerSessionFactory();
+  try {
+    const initialized = await session.request({
+      type: 'request',
+      requestId: randomUUID(),
+      sourceClientId: 'initializing-client',
+      version: 0,
+      method: 'initialize',
+      params: { clientType: 'codex-discord-bridge' },
+      timeoutMs: 3_000,
+    });
+    const clientId = String(initialized?.result?.clientId ?? '');
+    if (initialized?.resultType !== 'success' || !clientId) return { ok: false, reason: 'router-initialize-failed' };
+    const owner = await session.request({
+      type: 'request',
+      requestId: randomUUID(),
+      sourceClientId: clientId,
+      version: 1,
+      method: 'thread-owner-discovery',
+      params: { hostId: 'local', conversationId: threadId },
+      timeoutMs: 3_000,
+    });
+    const ownerId = String(owner?.handledByClientId ?? '');
+    if (owner?.resultType !== 'success' || !ownerId) return { ok: false, reason: 'task-owner-not-found' };
+    const interrupted = await session.request({
+      type: 'request',
+      requestId: randomUUID(),
+      sourceClientId: clientId,
+      targetClientId: ownerId,
+      version: 4,
+      method: 'thread-follower-interrupt-turn',
+      params: { conversationId: threadId, mode: 'user-stop', expectedTurnId },
+      timeoutMs: 3_000,
+    });
+    const clean = interrupted?.resultType === 'success' && interrupted?.result?.ok === true &&
+      String(interrupted?.result?.interruptedTurnId ?? '') === expectedTurnId && !interrupted?.result?.goalPauseError;
+    return clean ? { ok: true, turnId: expectedTurnId } : { ok: false, reason: 'interrupt-not-confirmed' };
+  } finally {
+    session.close?.();
+  }
+}
 
 function isRecord(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -1237,6 +1595,7 @@ export async function dispatchContinuation(request, dependencies = {}) {
   }
 
   const resume = dependencies.resumeCodexThread ?? resumeCodexThread;
+  const steer = dependencies.steerCodexThread;
   let started;
   const onStartSubmitting = async () => {
     await commitInboxState({
@@ -1246,7 +1605,8 @@ export async function dispatchContinuation(request, dependencies = {}) {
       entries: { pendingContinuations: [existing.queueId] },
       mutate: () => {
         const current = state.pendingContinuations[existing.queueId];
-        if (!current || current.status !== 'resuming') throw new Error('Continuation claim was lost');
+        if (!current || !['resuming', 'submitting'].includes(current.status)) throw new Error('Continuation claim was lost');
+        if (current.status === 'submitting') return;
         current.status = 'submitting';
         current.submittingAt = now;
         if (source === 'slash') recordProcessedInteraction(state, requestId, { status: 'attempting', queueId: current.queueId }, now);
@@ -1271,7 +1631,7 @@ export async function dispatchContinuation(request, dependencies = {}) {
     });
   };
   try {
-    started = await resume({
+    const options = {
       threadId: normalized.threadId,
       cwd: normalized.cwd,
       processCwd: normalized.cwd ?? dependencies.processCwd,
@@ -1280,7 +1640,15 @@ export async function dispatchContinuation(request, dependencies = {}) {
       clientFactory: dependencies.clientFactory,
       onStartSubmitting,
       onStartSubmitted,
-    });
+    };
+    if (typeof steer === 'function') {
+      try {
+        started = await steer(options);
+      } catch (error) {
+        if (error?.submissionStage !== 'pre-submit' || !error?.desktopUnavailable) throw error;
+      }
+    }
+    started ??= await resume(options);
   } catch (error) {
     if (isActiveWriterError(error)) {
       try {
@@ -1302,15 +1670,7 @@ export async function dispatchContinuation(request, dependencies = {}) {
         });
         return { status: 'failed', queueId: existing.queueId, reason: 'state-persist-failed' };
       }
-      const result = { status: 'queued', queueId: existing.queueId, reason: 'active-writer' };
-      if (!wasQueuedRequest) {
-        await acknowledgeContinuation(
-          dependencies,
-          normalized,
-          '⏳ 已排队：原 Codex 任务目前正被其他写入者占用；任务释放后会自动送达，无需再次回复。',
-        ).catch(() => {});
-      }
-      return result;
+      return { status: 'queued', queueId: existing.queueId, reason: 'active-writer' };
     }
     if (error?.submissionStage === 'post-submit') {
       try {
@@ -1401,14 +1761,14 @@ export async function dispatchContinuation(request, dependencies = {}) {
       }, now);
     });
     try {
-      await dependencies.trackCompletion?.(started, normalized);
+      if (started?.completion) await dependencies.trackCompletion?.(started, normalized);
     } catch {
       // The external turn remains started even when local tracking cannot attach.
     }
     return { ...result, status: 'uncertain', reason: 'state-persist-failed' };
   }
   try {
-    await dependencies.trackCompletion?.(started, normalized);
+    if (started?.completion) await dependencies.trackCompletion?.(started, normalized);
   } catch {
     // A confirmed external turn remains started even when local tracking cannot attach.
   }
@@ -1718,7 +2078,7 @@ export async function getDiscordMessagesAfter({ token, channelId, after = '0', f
 }
 
 export async function sendDiscordReply({
-  token, channelId, replyToMessageId, content, nonce, enforceNonce = false, fetchImpl = fetch,
+  token, channelId, replyToMessageId, content, embeds, components, nonce, enforceNonce = false, fetchImpl = fetch,
 }) {
   const normalizedNonce = /^\d{1,25}$/u.test(String(nonce ?? '')) ? String(nonce) : null;
   const referenceId = String(replyToMessageId ?? '').trim();
@@ -1730,6 +2090,8 @@ export async function sendDiscordReply({
     body: {
       content: String(content).slice(0, 2000),
       allowed_mentions: { parse: [] },
+      ...(Array.isArray(embeds) ? { embeds } : {}),
+      ...(Array.isArray(components) ? { components } : {}),
       ...(normalizedNonce ? { nonce: normalizedNonce, enforce_nonce: Boolean(enforceNonce) } : {}),
       ...(referenceId ? { message_reference: {
         message_id: replyToMessageId,

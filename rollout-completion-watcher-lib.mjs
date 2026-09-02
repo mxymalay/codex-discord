@@ -217,7 +217,29 @@ function elapsedText(milliseconds) {
   return `${hours} 小时 ${minutes} 分`;
 }
 
-function progressContent({ detail, origin, metadata, taskIndex, startedAtMs, nowMs }) {
+function turnSupport(entries, turnId) {
+  let model = '';
+  let effort = '';
+  for (const item of entries) {
+    const entry = item?.entry ?? item;
+    if (entry?.type !== 'turn_context' || String(entry.payload?.turn_id ?? '') !== String(turnId)) continue;
+    model = String(entry.payload?.model ?? model).trim();
+    effort = String(entry.payload?.effort ?? entry.payload?.reasoning_effort ?? effort).trim();
+  }
+  return { model, effort };
+}
+
+function supportText({ model, effort } = {}) {
+  if (!model || !effort) return '';
+  const modelName = model.replace(/^gpt-/iu, '').split('-')
+    .map((part) => /^\d/u.test(part) ? part : `${part.slice(0, 1).toLocaleUpperCase()}${part.slice(1)}`)
+    .join(' ');
+  const effortName = ({ xhigh: 'XHigh' })[effort.toLocaleLowerCase()] ??
+    `${effort.slice(0, 1).toLocaleUpperCase()}${effort.slice(1)}`;
+  return `由 ${modelName} ${effortName} 支持`;
+}
+
+function progressContent({ detail, origin, metadata, taskIndex, startedAtMs, nowMs, support }) {
   const task = (taskIndex?.tasks ?? []).find((candidate) =>
     String(candidate?.threadId ?? '').toLocaleLowerCase() === String(origin.threadId).toLocaleLowerCase());
   const explicitProject = [origin?.projectName, task?.projectName]
@@ -227,7 +249,7 @@ function progressContent({ detail, origin, metadata, taskIndex, startedAtMs, now
   const taskName = safeHeading(task?.taskName, '未命名任务');
   const clock = Number.isFinite(Number(nowMs)) ? Number(nowMs) : Date.now();
   const elapsed = Number.isFinite(startedAtMs) ? clock - startedAtMs : 0;
-  return [
+  const lines = [
     '## 任务进行中…',
     '',
     `### ${projectName} · ${taskName}`,
@@ -239,7 +261,10 @@ function progressContent({ detail, origin, metadata, taskIndex, startedAtMs, now
     '### **运行时间**',
     '',
     `已运行 ${elapsedText(elapsed)}`,
-  ].join('\n');
+  ];
+  const footer = supportText(support);
+  if (footer) lines.push('', footer);
+  return lines.join('\n');
 }
 
 function toolKind(payload) {
@@ -279,6 +304,7 @@ function extractOriginProgress(lines, origin, fingerprint, { taskIndex, nowMs } 
   let terminalSeen = false;
   let startedAtMs = Number.NaN;
   const metadata = lines.find(({ entry }) => rootSessionMeta(entry, origin.threadId))?.entry;
+  const support = turnSupport(lines, origin.turnId);
   for (const item of lines) {
     const { entry, start, end } = item;
     if (entry?.type === 'event_msg') {
@@ -340,7 +366,7 @@ function extractOriginProgress(lines, origin, fingerprint, { taskIndex, nowMs } 
     });
     return {
       ...event,
-      content: progressContent({ detail: event.content, origin, metadata, taskIndex, startedAtMs, nowMs }),
+      content: progressContent({ detail: event.content, origin, metadata, taskIndex, startedAtMs, nowMs, support }),
       eventId,
       nonce: discordNonce(eventId),
     };
@@ -718,7 +744,9 @@ async function reconstructNotification(item, turnId) {
   }
   let activeTurnId = '';
   let inputMessages = [];
-  for (const entry of parseLines(Buffer.from(content, 'utf8'))) {
+  const entries = parseLines(Buffer.from(content, 'utf8'));
+  const support = turnSupport(entries, turnId);
+  for (const entry of entries) {
     if (entry?.type !== 'event_msg') continue;
     const payload = entry.payload ?? {};
     if (payload.type === 'task_started') {
@@ -739,6 +767,8 @@ async function reconstructNotification(item, turnId) {
         cwd: String(item.cwd ?? ''),
         'input-messages': inputMessages,
         'last-assistant-message': boundedText(payload.last_agent_message),
+        ...(support.model ? { model: support.model } : {}),
+        ...(support.effort ? { 'reasoning-effort': support.effort } : {}),
       };
     }
   }

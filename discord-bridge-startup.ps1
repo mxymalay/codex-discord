@@ -221,17 +221,13 @@ function ConvertTo-ScheduledTaskArgument {
 
 function Get-DiscordBridgeTaskDefinition {
     [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)][string]$ToolDir,
-        [Parameter(Mandatory)][string]$PowerShellPath
-    )
+    param([Parameter(Mandatory)][string]$ToolDir)
 
     $fullToolDir = [System.IO.Path]::GetFullPath($ToolDir)
-    $startupPath = Join-Path $fullToolDir 'start-discord-bridge.ps1'
     return [pscustomobject][ordered]@{
         TaskName = 'Codex Discord Bridge'
-        Execute = [System.IO.Path]::GetFullPath($PowerShellPath)
-        Arguments = '-NoProfile -WindowStyle Hidden -File ' + (ConvertTo-ScheduledTaskArgument -Value $startupPath)
+        Execute = Join-Path $fullToolDir 'CodexDiscordControl.exe'
+        Arguments = '--bridge-supervisor scheduled'
         WorkingDirectory = $fullToolDir
     }
 }

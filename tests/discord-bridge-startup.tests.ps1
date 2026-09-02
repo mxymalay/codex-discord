@@ -21,17 +21,16 @@ try {
 finally { if ($emptyJob -ne [IntPtr]::Zero) { [CodexBridgeJobNative]::CloseHandle($emptyJob) | Out-Null } }
 
 $definition = Get-DiscordBridgeTaskDefinition `
-    -ToolDir 'G:\tools\mobile-notify' `
-    -PowerShellPath 'C:\Program Files\PowerShell\7\pwsh.exe'
+    -ToolDir 'G:\tools\mobile-notify'
 
 if ([string]$definition.TaskName -ne 'Codex Discord Bridge') {
     throw 'Discord bridge scheduled task name is incorrect'
 }
-if ([string]$definition.Execute -ne 'C:\Program Files\PowerShell\7\pwsh.exe') {
-    throw 'Discord bridge scheduled task executable is incorrect'
+if ([string]$definition.Execute -ne 'G:\tools\mobile-notify\CodexDiscordControl.exe') {
+    throw 'Discord bridge scheduled task does not use the windowless controller supervisor'
 }
-if ([string]$definition.Arguments -cne '-NoProfile -WindowStyle Hidden -File "G:\tools\mobile-notify\start-discord-bridge.ps1"') {
-    throw 'Discord bridge scheduled task does not launch its startup guard in a genuinely hidden PowerShell window'
+if ([string]$definition.Arguments -cne '--bridge-supervisor scheduled') {
+    throw 'Discord bridge scheduled task does not launch the scheduled windowless supervisor'
 }
 if ([string]$definition.Arguments -match 'discord-bridge\.mjs|node\.exe|codex\.exe') {
     throw 'Discord bridge scheduled task pins a runtime executable or bypasses the startup guard'

@@ -12,6 +12,32 @@ export const COMMAND_NAMES = Object.freeze([
 const STRING_OPTION = 3;
 const CHAT_INPUT_COMMAND = 1;
 
+export const NEW_TASK_MODEL_CHOICES = Object.freeze([
+  { name: 'GPT-5.6 Sol', value: 'gpt-5.6-sol', efforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] },
+  { name: 'GPT-5.6 Terra', value: 'gpt-5.6-terra', efforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] },
+  { name: 'GPT-5.6 Luna', value: 'gpt-5.6-luna', efforts: ['low', 'medium', 'high', 'xhigh', 'max'] },
+  { name: 'GPT-5.5', value: 'gpt-5.5', efforts: ['low', 'medium', 'high', 'xhigh'] },
+  { name: 'GPT-5.4', value: 'gpt-5.4', efforts: ['low', 'medium', 'high', 'xhigh'] },
+  { name: 'GPT-5.4 Mini', value: 'gpt-5.4-mini', efforts: ['low', 'medium', 'high', 'xhigh'] },
+  { name: 'GPT-5.3 Codex Spark', value: 'gpt-5.3-codex-spark', efforts: ['low', 'medium', 'high', 'xhigh'] },
+]);
+
+export const NEW_TASK_EFFORT_CHOICES = Object.freeze([
+  { name: 'Low', value: 'low' },
+  { name: 'Medium', value: 'medium' },
+  { name: 'High', value: 'high' },
+  { name: 'XHigh', value: 'xhigh' },
+  { name: 'Max', value: 'max' },
+  { name: 'Ultra', value: 'ultra' },
+]);
+
+export function validNewTaskModelEffort(model, effort) {
+  if (!model && !effort) return true;
+  if (!model) return NEW_TASK_EFFORT_CHOICES.some((item) => item.value === effort);
+  const selected = NEW_TASK_MODEL_CHOICES.find((item) => item.value === model);
+  return Boolean(selected && (!effort || selected.efforts.includes(effort)));
+}
+
 function choice(name) {
   return { name, value: name };
 }
@@ -53,13 +79,29 @@ export function buildGuildCommandDefinitions() {
       description: '搜索任务内容',
       required: true,
     }]),
-    command('新建任务', '从保存的项目创建 Codex 任务', [{
-      type: STRING_OPTION,
-      name: '项目',
-      description: '选择保存的项目',
-      required: true,
-      autocomplete: true,
-    }]),
+    command('新建任务', '从保存的项目创建 Codex 任务', [
+      {
+        type: STRING_OPTION,
+        name: '项目',
+        description: '选择保存的项目',
+        required: true,
+        autocomplete: true,
+      },
+      {
+        type: STRING_OPTION,
+        name: '模型',
+        description: '仅为新任务首次选择；留空使用 Codex 默认',
+        required: false,
+        choices: NEW_TASK_MODEL_CHOICES.map(({ name, value }) => ({ name, value })),
+      },
+      {
+        type: STRING_OPTION,
+        name: '推理强度',
+        description: '仅为新任务首次选择；留空使用模型默认',
+        required: false,
+        choices: NEW_TASK_EFFORT_CHOICES.map(({ name, value }) => ({ name, value })),
+      },
+    ]),
     command('继续任务', '向已有任务发送新的内容', [taskOption()]),
     command('继续队列', '查看等待发送的继续请求'),
     command('额度', '查看 Codex 周额度'),
