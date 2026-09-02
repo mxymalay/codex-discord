@@ -1159,7 +1159,7 @@ try {
 
     $readme = Get-Content -Raw -LiteralPath $readmePath
     Assert-True ($readme -match '11\s*个.*Slash Commands|11\s*条.*命令') 'README does not document all eleven commands'
-    Assert-True ($readme -match '/退出Codex[\s\S]{0,500}(?:风险|中断)[\s\S]{0,500}(?:二次|确认)') 'README does not explain the exit risk preview and confirmation'
+    Assert-True ($readme -match '/退出codex[\s\S]{0,500}(?:风险|中断)[\s\S]{0,500}(?:二次|确认)') 'README does not explain the exit risk preview and confirmation'
     Assert-True ($readme -match 'active-writer|写入者占用') 'README does not explain active-writer takeover'
     Assert-True ($readme -match '临时开启[\s\S]{0,1000}临时停止[\s\S]{0,1000}长期开启[\s\S]{0,1000}长期停用') 'README does not explain the four control modes'
     Assert-True ($readme -match '原频道[\s\S]{0,500}(?:commentary|工具进度|进度)') 'README does not document Discord-origin progress routing'

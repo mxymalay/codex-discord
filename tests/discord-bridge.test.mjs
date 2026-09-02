@@ -327,7 +327,7 @@ test('production index refreshes serialize an older scan before a fresh takeover
   const identity = { guild_id: config.discordGuildId, member: { user: { id: config.discordAllowedUserId } } };
   await handle({
     id: 'initial-exit', token: 'initial-token', type: 2, ...identity,
-    data: { name: '退出Codex', options: [] },
+    data: { name: '退出codex', options: [] },
   });
   const confirmId = edits[0].body.components[0].components[0].custom_id;
 
@@ -398,7 +398,7 @@ function makeBridgeDependencies(events, overrides = {}) {
     async registerCommands() { events.push('commands-registered'); },
     async fetchRegisteredCommands() { return [
       '任务列表', '任务详情', '任务搜索', '新建任务', '继续任务',
-      '继续队列', '额度', '系统状态', '系统测试', '退出Codex', '帮助',
+      '继续队列', '额度', '系统状态', '系统测试', '退出codex', '帮助',
     ].map((name) => ({ name })); },
     async loadTaskIndex() { events.push('index-ready'); return { version: 1, generatedAt: '2026-09-01T00:00:00.000Z', tasks: [] }; },
     async loadInboxState() { return createEmptyInboxState(); },
@@ -1072,7 +1072,7 @@ test('registration-only lifecycle verifies exactly eleven commands without start
 
   assert.deepEqual(result.commandNames, [
     '任务列表', '任务详情', '任务搜索', '新建任务', '继续任务',
-    '继续队列', '额度', '系统状态', '系统测试', '退出Codex', '帮助',
+    '继续队列', '额度', '系统状态', '系统测试', '退出codex', '帮助',
   ]);
   assert.deepEqual(events, ['commands-registered']);
 });

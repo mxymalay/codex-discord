@@ -653,7 +653,7 @@ export function renderHelp() {
     额度: '查看最后一份本机官方周额度快照。',
     系统状态: '查看 Gateway、监听、索引、队列与额度状态。',
     系统测试: '执行快速检查，或执行三路完整通知测试。',
-    退出Codex: '先查看可能中断的主任务，再通过一次性确认安全退出 Codex 桌面端。',
+    退出codex: '先查看可能中断的主任务，再通过一次性确认安全退出 Codex 桌面端。',
     帮助: '显示本帮助。',
   };
   return [
@@ -662,7 +662,7 @@ export function renderHelp() {
     '',
     '### 远程接管与任务进度',
     '- `/继续任务` 遇到 active-writer（桌面写入者占用）时会先安全排队，再给出接管选项；不会同时让两个写入者操作同一任务。',
-    '- `/退出Codex` 会先列出可能中断的主任务，只有你再次确认后才退出 Codex 桌面端；风险清单变化时必须重新确认。',
+    '- `/退出codex` 会先列出可能中断的主任务，只有你再次确认后才退出 Codex 桌面端；风险清单变化时必须重新确认。',
     '- 从 Discord 新建或继续的任务都会回到发起任务的原频道，包括 commentary、脱敏工具进度、待确认和最终结果。',
     '',
     '### 本机服务',
@@ -1109,7 +1109,7 @@ async function publishTakeoverConfirmation(dependencies, interaction, snapshot, 
     if (!boundMessageId) {
       dependencies.uiState.delete(stateId);
       return editOriginal(dependencies, interaction, {
-        content: '无法创建安全的退出确认，请重新执行 /退出Codex。',
+        content: '无法创建安全的退出确认，请重新执行 /退出codex。',
         components: [],
       });
     }
@@ -1152,9 +1152,9 @@ function takeoverStateError(dependencies, interaction, state) {
     nowMs: nowValue(dependencies),
   });
   if (!validated.ok) {
-    if (validated.reason === 'expired') return '此退出确认已过期，请重新执行 /退出Codex。';
+    if (validated.reason === 'expired') return '此退出确认已过期，请重新执行 /退出codex。';
     if (['wrong-user', 'wrong-guild'].includes(validated.reason)) return '此退出确认不属于当前用户或服务器，无权执行。';
-    return '此退出确认已使用、过期或无效，请重新执行 /退出Codex。';
+    return '此退出确认已使用、过期或无效，请重新执行 /退出codex。';
   }
   const componentMessageId = String(interaction?.message?.id ?? '');
   if (!state.messageId || componentMessageId !== String(state.messageId)) {
@@ -1508,7 +1508,7 @@ async function handleCommand(dependencies, interaction) {
       return respond(dependencies, interaction, privateResponse('系统状态暂不可用，请稍后重试。'));
     }
   }
-  if (name === '退出Codex') return beginTakeoverExit(dependencies, interaction);
+  if (name === '退出codex') return beginTakeoverExit(dependencies, interaction);
   if (name === '帮助') return respond(dependencies, interaction, privateResponse(renderHelp()));
   if (name === '系统测试') {
     const mode = optionValue(interaction, '类型') === '完整' ? '完整' : '快速';

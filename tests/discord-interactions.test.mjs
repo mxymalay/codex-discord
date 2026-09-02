@@ -1983,7 +1983,7 @@ test('takeover preview shows only escaped task names and statuses without local 
   assert.equal(output.includes('C:\\'), false);
 });
 
-test('/退出Codex defers before inspection and publishes a private five-minute bound preview', async () => {
+test('/退出codex defers before inspection and publishes a private five-minute bound preview', async () => {
   const uiState = new Map();
   const events = [];
   const taskIndex = { generatedAt: new Date(NOW).toISOString(), tasks: [
@@ -2001,7 +2001,7 @@ test('/退出Codex defers before inspection and publishes a private five-minute 
   });
   dependencies.respond = async (body) => { events.push(`respond-${body.type}`); responses.push(body); };
 
-  await createInteractionRouter(dependencies).handle(commandInteraction('退出Codex'));
+  await createInteractionRouter(dependencies).handle(commandInteraction('退出codex'));
 
   assert.equal(events[0], 'respond-5');
   assert.equal(responses[0].type, 5);
@@ -2023,14 +2023,14 @@ test('/退出Codex defers before inspection and publishes a private five-minute 
   assert.equal(JSON.stringify(edits[0]).includes('private'), false);
 });
 
-test('/退出Codex does not create a confirmation when desktop is stopped or task refresh fails', async () => {
+test('/退出codex does not create a confirmation when desktop is stopped or task refresh fails', async () => {
   {
     const uiState = new Map();
     const { dependencies, edits } = makeDependencies({
       uiState,
       getCodexControlStatus: async () => ({ ok: true, desktop: { running: false } }),
     });
-    await createInteractionRouter(dependencies).handle(commandInteraction('退出Codex', {}, { id: 'exit-stopped' }));
+    await createInteractionRouter(dependencies).handle(commandInteraction('退出codex', {}, { id: 'exit-stopped' }));
     assert.match(edits[0].content, /未运行/);
     assert.equal(edits[0].components?.length ?? 0, 0);
     assert.equal(uiState.size, 0);
@@ -2043,7 +2043,7 @@ test('/退出Codex does not create a confirmation when desktop is stopped or tas
       refreshTaskIndex: async () => { throw new Error('C:\\private\\sessions'); },
       getCodexControlStatus: async () => ({ ok: true, desktop: { running: true } }),
     });
-    await createInteractionRouter(dependencies).handle(commandInteraction('退出Codex', {}, { id: 'exit-no-index' }));
+    await createInteractionRouter(dependencies).handle(commandInteraction('退出codex', {}, { id: 'exit-no-index' }));
     assert.match(edits[0].embeds[0].description, /任务清单不可用/);
     assert.match(edits[0].embeds[0].description, /不会退出|未提供退出/);
     assert.equal(edits[0].components?.length ?? 0, 0);
@@ -2064,7 +2064,7 @@ test('takeover confirmation is message-bound, tenant-bound, atomically one-use, 
     stopCodexDesktop: async () => { stopCalls += 1; return { ok: true, stoppedProcessCount: 2 }; },
   });
   const router = createInteractionRouter(dependencies);
-  await router.handle(commandInteraction('退出Codex'));
+  await router.handle(commandInteraction('退出codex'));
   const confirmId = edits[0].components[0].components[0].custom_id;
 
   await router.handle(componentInteraction(confirmId, { userId: '444' }));
@@ -2103,7 +2103,7 @@ test('a failed component defer consumes only that confirmation and always releas
     }
   };
   const router = createInteractionRouter(dependencies);
-  await router.handle(commandInteraction('退出Codex', {}, { id: 'exit-before-callback-failure' }));
+  await router.handle(commandInteraction('退出codex', {}, { id: 'exit-before-callback-failure' }));
   const failedConfirmId = edits[0].components[0].components[0].custom_id;
 
   await assert.rejects(
@@ -2113,7 +2113,7 @@ test('a failed component defer consumes only that confirmation and always releas
   assert.equal(stopCalls, 0);
   assert.equal(uiState.size, 0);
 
-  await router.handle(commandInteraction('退出Codex', {}, { id: 'exit-after-callback-failure' }));
+  await router.handle(commandInteraction('退出codex', {}, { id: 'exit-after-callback-failure' }));
   const validConfirmId = edits.at(-1).components[0].components[0].custom_id;
   await router.handle(componentInteraction(validConfirmId, { id: 'valid-after-callback-failure' }));
   assert.equal(stopCalls, 1);
@@ -2134,7 +2134,7 @@ test('expired takeover and cancellation consume the state without stopping deskt
     stopCodexDesktop: async () => { stopCalls += 1; return { ok: true }; },
   });
   const router = createInteractionRouter(dependencies);
-  await router.handle(commandInteraction('退出Codex'));
+  await router.handle(commandInteraction('退出codex'));
   const expiredConfirm = edits[0].components[0].components[0].custom_id;
   clock += 5 * 60_000;
   await router.handle(componentInteraction(expiredConfirm));
@@ -2142,7 +2142,7 @@ test('expired takeover and cancellation consume the state without stopping deskt
   assert.equal(uiState.size, 0);
 
   clock = NOW;
-  await router.handle(commandInteraction('退出Codex', {}, { id: 'exit-cancel' }));
+  await router.handle(commandInteraction('退出codex', {}, { id: 'exit-cancel' }));
   const cancelId = edits.at(-1).components[0].components[1].custom_id;
   await router.handle(componentInteraction(cancelId, { id: 'cancel-valid' }));
   assert.equal(stopCalls, 0);
@@ -2167,7 +2167,7 @@ test('a newly active main task invalidates the old confirmation and requires a f
     return { id: editMessageIds.shift() };
   };
   const router = createInteractionRouter(dependencies);
-  await router.handle(commandInteraction('退出Codex'));
+  await router.handle(commandInteraction('退出codex'));
   const oldConfirmId = edits[0].components[0].components[0].custom_id;
 
   currentIndex = { tasks: [
@@ -2196,7 +2196,7 @@ test('help names all eleven commands and explains takeover, routing, control mod
   for (const commandName of COMMAND_NAMES) assert.match(help, new RegExp(`/${commandName}`));
   assert.match(help, /工作树/);
   assert.match(help, /无项目/);
-  assert.match(help, /退出Codex[\s\S]{0,300}(?:中断|风险)[\s\S]{0,300}确认/);
+  assert.match(help, /退出codex[\s\S]{0,300}(?:中断|风险)[\s\S]{0,300}确认/);
   assert.match(help, /active-writer|写入者占用/);
   assert.match(help, /临时开启[\s\S]{0,500}临时停止[\s\S]{0,500}长期开启[\s\S]{0,500}长期停用/);
   assert.match(help, /临时(?:开启|停止)[\s\S]{0,300}不改变[\s\S]{0,300}长期/);

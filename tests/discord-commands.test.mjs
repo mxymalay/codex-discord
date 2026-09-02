@@ -11,8 +11,12 @@ import {
 test('defines exactly the approved eleven Chinese guild commands', () => {
   const commands = buildGuildCommandDefinitions();
   assert.deepEqual(commands.map((item) => item.name), [
-    '任务列表', '任务详情', '任务搜索', '新建任务', '继续任务', '继续队列', '额度', '系统状态', '系统测试', '退出Codex', '帮助',
+    '任务列表', '任务详情', '任务搜索', '新建任务', '继续任务', '继续队列', '额度', '系统状态', '系统测试', '退出codex', '帮助',
   ]);
+  for (const name of commands.map((item) => item.name)) {
+    assert.match(name, /^[-_\p{L}\p{N}\p{sc=Devanagari}\p{sc=Thai}]{1,32}$/u, `invalid Discord command name characters: ${name}`);
+    assert.equal(name, name.toLocaleLowerCase('en-US'), `Discord command name must be lowercase: ${name}`);
+  }
 
   for (const command of commands) {
     assert.equal(command.type, 1);
@@ -84,7 +88,7 @@ test('registers commands with the guild PUT endpoint and sends definitions', asy
   assert.equal(calls[0].options.headers.Authorization, 'Bot test-token');
   assert.equal(calls[0].options.headers['Content-Type'], 'application/json');
   assert.deepEqual(JSON.parse(calls[0].options.body).map((item) => item.name), [
-    '任务列表', '任务详情', '任务搜索', '新建任务', '继续任务', '继续队列', '额度', '系统状态', '系统测试', '退出Codex', '帮助',
+    '任务列表', '任务详情', '任务搜索', '新建任务', '继续任务', '继续队列', '额度', '系统状态', '系统测试', '退出codex', '帮助',
   ]);
 });
 
