@@ -366,6 +366,18 @@ function formatTimestamp(value) {
   return new Date(milliseconds).toISOString().replace('T', ' ').replace('.000Z', 'Z');
 }
 
+function formatRelativeTimestamp(value, nowMs = Date.now()) {
+  const milliseconds = Date.parse(String(value ?? ''));
+  const elapsed = Math.max(0, Number(nowMs) - milliseconds);
+  if (!Number.isFinite(milliseconds) || !Number.isFinite(elapsed)) return '未知';
+  if (elapsed < 60_000) return '刚刚';
+  if (elapsed < 3_600_000) return `${Math.floor(elapsed / 60_000)}分钟前`;
+  if (elapsed < 86_400_000) return `${Math.floor(elapsed / 3_600_000)}小时前`;
+  if (elapsed < 2_592_000_000) return `${Math.floor(elapsed / 86_400_000)}天前`;
+  if (elapsed < 31_536_000_000) return `${Math.floor(elapsed / 2_592_000_000)}个月前`;
+  return `${Math.floor(elapsed / 31_536_000_000)}年前`;
+}
+
 function formatDuration(milliseconds) {
   const value = Number(milliseconds);
   if (!Number.isFinite(value) || value < 0) return '未知';
@@ -422,25 +434,27 @@ function taskListValues(tasks, { status = '全部' } = {}) {
     .slice(0, 10);
 }
 
-function taskListLines(values) {
+function taskListLines(values, nowMs) {
   return values.map((item, index) => [
-    `${index + 1}. **项目：** ${metadataText(item?.projectName, '无项目')}`,
-    `   **任务：** ${metadataText(item?.taskName, '未命名任务')}`,
-    `   **状态：** ${metadataText(statusLabel(item?.status))}｜**最后活动：** ${formatTimestamp(item?.lastActivityAt)}｜**运行时间：** ${formatDuration(item?.runtimeMs)}`,
-  ].join('\n'));
+    `${index + 1}.`,
+    `**项目：** ${metadataText(item?.projectName, '无项目')}`,
+    `**任务：** ${metadataText(item?.taskName, '未命名任务')}`,
+    `**状态：** ${metadataText(statusLabel(item?.status))}`,
+    `**最后活动：** ${formatRelativeTimestamp(item?.lastActivityAt, nowMs)}`,
+  ].join('\n\n'));
 }
 
-export function renderTaskList(tasks, { status = '全部' } = {}) {
+export function renderTaskList(tasks, { status = '全部', nowMs = Date.now() } = {}) {
   const desired = String(status ?? '全部');
   const values = taskListValues(tasks, { status: desired });
   const running = values.filter((item) => item?.status === 'running');
   const recent = values.filter((item) => item?.status !== 'running');
   return [
     '## 进行中的任务',
-    ...(running.length ? taskListLines(running) : ['当前没有进行中的任务。']),
+    running.length ? taskListLines(running, nowMs).join('\n\n') : '当前没有进行中的任务。',
     '',
     desired === '全部' ? '## 最近任务' : `## 最近任务（${metadataText(desired, '全部')}）`,
-    ...(recent.length ? taskListLines(recent) : [`没有符合“${metadataText(desired, '全部')}”条件的最近主任务。`]),
+    recent.length ? taskListLines(recent, nowMs).join('\n\n') : `没有符合“${metadataText(desired, '全部')}”条件的最近主任务。`,
   ].join('\n');
 }
 

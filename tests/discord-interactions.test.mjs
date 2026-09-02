@@ -388,6 +388,33 @@ test('task list separates running tasks first and keeps recent tasks below them'
   assert.equal(rendered.indexOf('较新的已完成任务') < rendered.indexOf('待确认任务'), true);
 });
 
+test('task list renders last activity relative to the current time', () => {
+  const rendered = renderTaskList([
+    task(1, { lastActivityAt: '2026-09-02T06:00:00.000Z' }),
+  ], { nowMs: Date.parse('2026-09-02T08:00:00.000Z') });
+
+  assert.match(rendered, /\*\*最后活动：\*\* 2小时前/u);
+  assert.equal(rendered.includes('2026-09-02'), false);
+});
+
+test('task list separates every field into its own paragraph', () => {
+  const rendered = renderTaskList([
+    task(1, {
+      projectName: 'POS',
+      taskName: '任务 A',
+      lastActivityAt: '2026-09-02T06:00:00.000Z',
+    }),
+  ], { nowMs: Date.parse('2026-09-02T08:00:00.000Z') });
+
+  assert.match(rendered, /1\.\n\n\*\*项目：\*\* POS\n\n\*\*任务：\*\* 任务 A\n\n\*\*状态：\*\* 已完成\n\n\*\*最后活动：\*\* 2小时前/u);
+});
+
+test('task list omits the unreliable runtime field', () => {
+  const rendered = renderTaskList([task(1)]);
+
+  assert.equal(rendered.includes('运行时间'), false);
+});
+
 test('search result renderer bounds untrusted query and display names for an embed', () => {
   const huge = '超长'.repeat(5_000);
   const rendered = renderSearchResults(
