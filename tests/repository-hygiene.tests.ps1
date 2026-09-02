@@ -7,33 +7,56 @@ $forbiddenFiles = @(
 )
 $trackedRelativePaths = @(& git -c core.quotepath=false -C $repo ls-files)
 if ($LASTEXITCODE -ne 0 -or $trackedRelativePaths.Count -eq 0) { throw 'could not enumerate repository-tracked files' }
-$repositoryFiles = @($trackedRelativePaths |
-    Where-Object { $_ -notmatch '^\.superpowers/|^docs/superpowers/' } |
-    ForEach-Object {
-        $fullPath = Join-Path $repo $_
-        if (-not (Test-Path -LiteralPath $fullPath -PathType Leaf)) { throw "tracked source file is unavailable: $_" }
-        Get-Item -LiteralPath $fullPath -Force
-    })
+$repositoryFiles = @($trackedRelativePaths | ForEach-Object {
+    $fullPath = Join-Path $repo $_
+    if (-not (Test-Path -LiteralPath $fullPath -PathType Leaf)) { throw "tracked source file is unavailable: $_" }
+    Get-Item -LiteralPath $fullPath -Force
+})
 foreach ($file in $repositoryFiles) {
     if ($forbiddenFiles -ccontains $file.Name -or $file.Extension -ieq '.log') { throw "runtime file tracked candidate: $($file.Name)" }
     if ($file.Name -match '(?i)^(?:discord-inbox-state|discord-task-index)\.corrupt-.*\.json$|^\.rollout-notification-.*\.json$') { throw "runtime recovery file tracked candidate: $($file.Name)" }
     if ($file.Extension -in @('.exe','.lnk')) { throw "built or shortcut artifact tracked candidate: $($file.Name)" }
     if ($file.Name -match '(?i)\.codex-discord-deploy\.|\.backup\.|\.stage\.|\.rollback\.') { throw "deployment artifact tracked candidate: $($file.Name)" }
 }
-$textExtensions = @('.cs','.json','.md','.mjs','.ps1','.toml','.txt','.yml','.yaml')
-$text = $repositoryFiles |
-    Where-Object { $textExtensions -contains $_.Extension } |
-    ForEach-Object { Get-Content -Raw -LiteralPath $_.FullName -ErrorAction SilentlyContinue }
+$binaryExtensions = @(
+    '.7z','.bin','.bmp','.dll','.doc','.docx','.exe','.gif','.gz','.ico','.jpeg','.jpg',
+    '.lnk','.pdf','.pdb','.png','.ppt','.pptx','.tar','.ttf','.webp','.woff','.woff2',
+    '.xls','.xlsx','.zip'
+)
+$utf8 = [System.Text.UTF8Encoding]::new($false, $true)
+$text = foreach ($file in $repositoryFiles) {
+    if ($binaryExtensions -contains $file.Extension.ToLowerInvariant()) { continue }
+    $bytes = [System.IO.File]::ReadAllBytes($file.FullName)
+    if ($bytes -contains 0) { continue }
+    try {
+        $utf8.GetString($bytes)
+    } catch {
+        throw "tracked non-binary file is not valid UTF-8: $($file.Name)"
+    }
+}
 $joined = $text -join "`n"
 if ($joined -match 'https://discord\.com/api/webhooks/[0-9]+/[A-Za-z0-9_-]{20,}') { throw 'real webhook pattern found' }
-if ($joined -match '(?m)^\s*(?:discordToken|botToken|token)\s*[:=]\s*["''][A-Za-z0-9_.-]{24,}["'']') { throw 'plaintext token assignment found' }
-$personalPaths = @(
-    ('C:' + '\Users\' + '86166'),
-    ('G:' + '\' + 'Codex' + 'Data')
-)
-foreach ($personalPath in $personalPaths) { if ($joined.Contains($personalPath)) { throw 'personal absolute path found' } }
-$realIds = @(('154397' + '9587627647036'), ('154396' + '9985800446053'), ('148378' + '9348146118708'))
-foreach ($id in $realIds) { if ($joined.Contains($id)) { throw 'personal Discord deployment id found' } }
+if ($joined -match '(?m)(?<![A-Za-z0-9_])["'']?(?:discordToken|botToken|token|clientSecret|discordClientSecret)["'']?(?![A-Za-z0-9_])[ \t]*[:=][ \t]*["''][A-Za-z0-9_./+=-]{24,}["'']') { throw 'plaintext token or secret assignment found' }
+if ($joined -match '-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----') { throw 'private key material found' }
+
+$profilePath = [Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)
+if ([string]::IsNullOrWhiteSpace($profilePath)) { $profilePath = $env:USERPROFILE }
+$personalPaths = @($profilePath)
+if (-not [string]::IsNullOrWhiteSpace($env:CODEX_HOME)) {
+    $personalPaths += Split-Path -Parent $env:CODEX_HOME
+}
+foreach ($personalPath in @($personalPaths | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)) {
+    $pathPattern = [regex]::Escape($personalPath.TrimEnd('\','/')).Replace('\\', '[\\/]+')
+    if ($joined -match $pathPattern) { throw 'personal absolute path found' }
+}
+
+$personalUserNames = @($env:USERNAME, (Split-Path -Leaf $profilePath)) |
+    Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+    Select-Object -Unique
+foreach ($personalUserName in $personalUserNames) {
+    $userPattern = '(?<![A-Za-z0-9])' + [regex]::Escape($personalUserName) + '(?![A-Za-z0-9])'
+    if ($joined -match $userPattern) { throw 'personal user name found' }
+}
 $gitIgnore = Get-Content -Raw -LiteralPath (Join-Path $repo '.gitignore')
 foreach ($pattern in @('*.exe','*.lnk','*.log','*.tmp','*.corrupt-*.json','.rollout-notification-*.json','config.json','discord-token.dpapi','discord-bridge-runtime.json','discord-bridge-health.json')) {
     if (($gitIgnore -split "`r?`n") -cnotcontains $pattern) { throw "gitignore is missing runtime artifact pattern: $pattern" }

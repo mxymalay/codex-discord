@@ -201,10 +201,10 @@ try {
     if ($completed.payload.PSObject.Properties['nonce'] -or $completed.payload.PSObject.Properties['enforce_nonce']) {
         throw 'Desktop fixed-channel notification unexpectedly received a Discord origin nonce'
     }
-    Write-InboxOriginState -OriginOverrides @{ projectId = 'ygf'; projectName = 'ygf' }
+    Write-InboxOriginState -OriginOverrides @{ projectId = 'example-project'; projectName = 'Example Project' }
     $originWithProject = Invoke-TaskCase -AssistantMessage '已经完成修改，全部测试通过。'
     $projectField = @($originWithProject.payload.embeds[0].fields | Where-Object { [string]$_.name -eq '项目名' })
-    if ($projectField.Count -ne 1 -or [string]$projectField[0].value -ne 'ygf') {
+    if ($projectField.Count -ne 1 -or [string]$projectField[0].value -ne 'Example Project') {
         throw 'Discord-origin terminal notification ignored its persisted saved-project identity'
     }
     Write-InboxOriginState

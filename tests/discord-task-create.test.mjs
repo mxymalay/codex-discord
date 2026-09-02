@@ -715,7 +715,7 @@ test('sanitizes failure to resolve both remote HEAD and current HEAD without cre
 
 test('expands an absolute CODEX_HOME worktree root and fails closed on missing or relative values', async () => {
   const previous = process.env.CODEX_HOME;
-  process.env.CODEX_HOME = 'G:\\CodexData\\.codex';
+  process.env.CODEX_HOME = 'D:\\codex-data\\.codex';
   try {
     const calls = [];
     const prepared = await prepareTaskWorkspace({
@@ -724,7 +724,7 @@ test('expands an absolute CODEX_HOME worktree root and fails closed on missing o
       fileSystem: fakeFileSystem({ gitRoots: ['C:\\repo'] }),
       gitRunner: fakeGitRunner(calls),
     });
-    assert.equal(prepared.worktreePath, 'G:\\CodexData\\.codex\\worktrees\\discord\\expanded1');
+    assert.equal(prepared.worktreePath, 'D:\\codex-data\\.codex\\worktrees\\discord\\expanded1');
 
     await assert.rejects(() => prepareTaskWorkspace({
       selection: { kind: 'project', projectId: 'p1', projectName: 'POS', roots: ['C:\\repo'] },

@@ -262,6 +262,113 @@ $disableLongTerm = Invoke-CodexBridgeServiceAction -Action 'disable-long-term' -
 if (-not $disableLongTerm.ok) { throw "long-term disable failed: $($disableLongTerm.errorCategory)" }
 if ($bridgeState.running -or $bridgeState.enabled) { throw 'long-term disable did not persist' }
 
+function Get-ScheduledTask {
+    param([string]$TaskPath, [string]$TaskName, [object]$ErrorAction)
+    [pscustomobject]@{
+        TaskPath = $TaskPath
+        TaskName = $TaskName
+        State = 'Disabled'
+        Settings = [pscustomobject]@{ AllowDemandStart=$true }
+        Actions = @([pscustomobject]@{ Execute='pwsh.exe'; Arguments='-NoProfile -File "ignored.ps1"' })
+        Principal = [pscustomobject]@{ UserId='operator' }
+        Triggers = @([pscustomobject]@{ Enabled=$true })
+    }
+}
+function Export-ScheduledTask { param([string]$TaskPath, [string]$TaskName, [object]$ErrorAction); '<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"><Settings><Enabled>false</Enabled></Settings></Task>' }
+try {
+    $productionTaskOperations = New-CodexControlOperations
+    $disabledBridgeTask = & $productionTaskOperations.GetTask
+    $disabledGuardTask = & $productionTaskOperations.GetNotificationGuardTask
+}
+finally {
+    Remove-Item Function:Get-ScheduledTask -Force
+    Remove-Item Function:Export-ScheduledTask -Force
+}
+if ($disabledBridgeTask.enabled -or $disabledGuardTask.enabled) { throw 'production task status did not recognize the ScheduledTask Disabled state' }
+
+$guardState = @{ exists=$true; enabled=$true; running=$true; actions=0 }
+$trustedGuardAction = [pscustomobject]@{
+    Execute = 'C:\Program Files\PowerShell\7\pwsh.exe'
+    Arguments = '-NoProfile -File "' + (Join-Path $sourceRoot 'watch-notify.ps1') + '"'
+    WorkingDirectory = $sourceRoot
+}
+$guardCurrentIdentity = [pscustomobject]@{Name='CONTOSO\operator';Sid='S-1-5-21-1000'}
+$guardScriptXml = [System.Security.SecurityElement]::Escape((Join-Path $sourceRoot 'watch-notify.ps1'))
+$guardToolXml = [System.Security.SecurityElement]::Escape($sourceRoot)
+$guardPowerShellXml = 'C:\Program Files\PowerShell\7\pwsh.exe'
+$guardDefinitionXml = '<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"><Principals><Principal id="Author"><UserId>S-1-5-21-1000</UserId><LogonType>InteractiveToken</LogonType></Principal></Principals><Triggers><LogonTrigger><Enabled>true</Enabled><UserId>CONTOSO\operator</UserId></LogonTrigger></Triggers><Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><Enabled>true</Enabled><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><RestartOnFailure><Interval>PT2S</Interval><Count>3</Count></RestartOnFailure></Settings><Actions Context="Author"><Exec><Command>' + $guardPowerShellXml + '</Command><Arguments>-NoProfile -File &quot;' + $guardScriptXml + '&quot;</Arguments><WorkingDirectory>' + $guardToolXml + '</WorkingDirectory></Exec></Actions></Task>'
+$guardDefinitionState = @{Xml=$guardDefinitionXml}
+$guardOperations = @{
+    GetNotificationGuardTask = {
+        if (-not $guardState.exists) { return $null }
+        [pscustomobject]@{ enabled=$guardState.enabled; running=$guardState.running; actions=@($trustedGuardAction); taskPath='\'; taskName='Codex ntfy Notification Guard'; principal=[pscustomobject]@{UserId='S-1-5-21-1000';LogonType='Interactive';RunLevel='Limited'}; triggers=@('logon'); settings=[pscustomobject]@{RestartCount=3}; definitionXml=$guardDefinitionState.Xml }
+    }
+    GetPowerShellPath = { 'C:\Program Files\PowerShell\7\pwsh.exe' }
+    GetCurrentUserIdentity = { $guardCurrentIdentity }
+    StopNotificationGuardTask = { $guardState.actions++; $guardState.running=$false }
+    StartNotificationGuardTask = { $guardState.actions++; $guardState.running=$true }
+    EnableNotificationGuardTask = { $guardState.actions++; $guardState.enabled=$true }
+    DisableNotificationGuardTask = { $guardState.actions++; $guardState.enabled=$false }
+}
+foreach ($name in @($guardOperations.Keys)) { $guardOperations[$name] = $guardOperations[$name].GetNewClosure() }
+$guardStatus = Get-CodexNotificationGuardStatus -Operations $guardOperations -ToolDir $sourceRoot
+if (-not $guardStatus.ok -or -not $guardStatus.exists -or -not $guardStatus.trusted -or -not $guardStatus.enabled -or -not $guardStatus.running) {
+    throw 'notification guard status did not retain its trusted exact task state'
+}
+$disabledDefinition = $guardDefinitionXml.Replace('<Enabled>true</Enabled><RestartOnFailure>', '<Enabled>false</Enabled><RestartOnFailure>')
+if ((Get-CodexNotificationGuardDefinitionHash -DefinitionXml $guardDefinitionXml) -cne (Get-CodexNotificationGuardDefinitionHash -DefinitionXml $disabledDefinition)) {
+    throw 'notification guard definition hash changed for the deployment-managed enabled bit'
+}
+$missingEnabledDefinition = $guardDefinitionXml.Replace('<Enabled>true</Enabled><ExecutionTimeLimit>', '<ExecutionTimeLimit>')
+if ((Get-CodexNotificationGuardDefinitionHash -DefinitionXml $guardDefinitionXml) -cne (Get-CodexNotificationGuardDefinitionHash -DefinitionXml $missingEnabledDefinition)) {
+    throw 'notification guard definition hash changed when the deployment-managed Enabled node was absent'
+}
+$extraTriggerDefinition = $guardDefinitionXml.Replace('</Triggers>', '<TimeTrigger><StartBoundary>2030-01-01T00:00:00</StartBoundary></TimeTrigger></Triggers>')
+if ((Get-CodexNotificationGuardDefinitionHash -DefinitionXml $guardDefinitionXml) -ceq (Get-CodexNotificationGuardDefinitionHash -DefinitionXml $extraTriggerDefinition)) {
+    throw 'notification guard definition hash ignored an additional trigger'
+}
+$restartChangedDefinition = $guardDefinitionXml.Replace('<Count>3</Count>', '<Count>99</Count>')
+if ((Get-CodexNotificationGuardDefinitionHash -DefinitionXml $guardDefinitionXml) -ceq (Get-CodexNotificationGuardDefinitionHash -DefinitionXml $restartChangedDefinition)) {
+    throw 'notification guard definition hash ignored restart settings'
+}
+$guardDefinitionState.Xml = $extraTriggerDefinition
+$extraTriggerStatus = Get-CodexNotificationGuardStatus -Operations $guardOperations -ToolDir $sourceRoot
+if ($extraTriggerStatus.trusted) { throw 'notification guard accepted an additional trigger' }
+$guardDefinitionState.Xml = $guardDefinitionXml.Replace('<UserId>S-1-5-21-1000</UserId><LogonType>', '<UserId>S-1-5-18</UserId><LogonType>')
+$wrongPrincipalStatus = Get-CodexNotificationGuardStatus -Operations $guardOperations -ToolDir $sourceRoot
+if ($wrongPrincipalStatus.trusted) { throw 'notification guard accepted a different or elevated principal' }
+$guardDefinitionState.Xml = $guardDefinitionXml.Replace('<Enabled>true</Enabled><UserId>CONTOSO\operator</UserId></LogonTrigger>', '<Enabled>true</Enabled><UserId>CONTOSO\other</UserId></LogonTrigger>')
+$wrongTriggerUserStatus = Get-CodexNotificationGuardStatus -Operations $guardOperations -ToolDir $sourceRoot
+if ($wrongTriggerUserStatus.trusted) { throw 'notification guard accepted another user logon trigger' }
+$guardDefinitionState.Xml = $guardDefinitionXml.Replace('</LogonType>', '</LogonType><RunLevel>HighestAvailable</RunLevel>')
+$elevatedRunLevelStatus = Get-CodexNotificationGuardStatus -Operations $guardOperations -ToolDir $sourceRoot
+if ($elevatedRunLevelStatus.trusted) { throw 'notification guard accepted an elevated run level' }
+$guardDefinitionState.Xml = $guardDefinitionXml.Replace('<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>', '<MultipleInstancesPolicy>Parallel</MultipleInstancesPolicy>')
+$parallelGuardStatus = Get-CodexNotificationGuardStatus -Operations $guardOperations -ToolDir $sourceRoot
+if ($parallelGuardStatus.trusted) { throw 'notification guard accepted unsafe multiple-instance settings' }
+$guardDefinitionState.Xml = $guardDefinitionXml
+$originalGuardDisable = $guardOperations.DisableNotificationGuardTask
+$guardOperations.DisableNotificationGuardTask = {
+    $guardState.actions++
+    $guardState.enabled = $false
+    $guardDefinitionState.Xml = $guardDefinitionXml.Replace('<Count>3</Count>', '<Count>4</Count>')
+}.GetNewClosure()
+$guardDefinitionMutation = Invoke-CodexNotificationGuardAction -Action disable -Operations $guardOperations -ToolDir $sourceRoot -PollAttempts 1 -PollMilliseconds 0
+if ($guardDefinitionMutation.ok) { throw 'notification guard action accepted a changed definition fingerprint' }
+$guardOperations.DisableNotificationGuardTask = $originalGuardDisable
+$guardDefinitionState.Xml = $guardDefinitionXml
+$guardState.enabled = $true
+$guardState.actions = 0
+$guardStop = Invoke-CodexNotificationGuardAction -Action stop -Operations $guardOperations -ToolDir $sourceRoot -PollAttempts 1 -PollMilliseconds 0
+if (-not $guardStop.ok -or $guardState.running -or -not $guardState.enabled -or $guardState.actions -ne 1) {
+    throw 'notification guard stop did not preserve its enabled setting'
+}
+$trustedGuardAction.Arguments = '-NoProfile -File "C:\Tools\other.ps1"'
+$untrustedGuard = Get-CodexNotificationGuardStatus -Operations $guardOperations -ToolDir $sourceRoot
+if (-not $untrustedGuard.ok -or $untrustedGuard.trusted -or -not $untrustedGuard.exists) { throw 'notification guard accepted an unrelated task action' }
+$untrustedStart = Invoke-CodexNotificationGuardAction -Action start -Operations $guardOperations -ToolDir $sourceRoot -PollAttempts 1 -PollMilliseconds 0
+if ($untrustedStart.ok -or $guardState.actions -ne 1) { throw 'notification guard mutated an untrusted scheduled task' }
+
 $reviewRuntimeRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('codex-reviewed-bridge-' + [guid]::NewGuid().ToString('N'))
 try {
     New-Item -ItemType Directory -Path $reviewRuntimeRoot -Force | Out-Null

@@ -112,21 +112,21 @@ test('root eligibility fails closed on empty IDs and compares dispatcher identit
 
 test('saved project inference prefers valid identity then the longest canonical Windows containing root', () => {
   const projects = [
-    { id: 'parent', name: 'Workspace', roots: [{ path: 'C:\\Users\\86166\\Desktop' }] },
-    { id: 'ygf', name: 'ygf', roots: ['c:/users/86166/desktop/ygf/'] },
-    { id: 'other', name: 'Other', roots: ['C:\\Users\\86166\\Desktop\\ygf-old'] },
+    { id: 'parent', name: 'Workspace', roots: [{ path: 'C:\\Users\\operator\\Desktop' }] },
+    { id: 'example-project', name: 'example-project', roots: ['c:/users/operator/desktop/example-project/'] },
+    { id: 'other', name: 'Other', roots: ['C:\\Users\\operator\\Desktop\\example-project-old'] },
   ];
 
   assert.deepEqual(inferSavedProject({
-    cwd: 'C:\\Users\\86166\\Desktop\\YGF\\apps\\cashier',
+    cwd: 'C:\\Users\\operator\\Desktop\\EXAMPLE-PROJECT\\apps\\cashier',
     projectId: 'parent',
     projectName: 'stale name',
   }, projects), { projectId: 'parent', projectName: 'Workspace' });
   assert.deepEqual(inferSavedProject({
-    cwd: 'C:/Users/86166/Desktop/YGF/apps/cashier',
-  }, projects), { projectId: 'ygf', projectName: 'ygf' });
+    cwd: 'C:/Users/operator/Desktop/EXAMPLE-PROJECT/apps/cashier',
+  }, projects), { projectId: 'example-project', projectName: 'example-project' });
   assert.deepEqual(inferSavedProject({
-    cwd: 'C:\\Users\\86166\\Desktop\\ygf-old-sibling\\app',
+    cwd: 'C:\\Users\\operator\\Desktop\\example-project-old-sibling\\app',
   }, projects), { projectId: 'parent', projectName: 'Workspace' });
   assert.deepEqual(inferSavedProject({
     cwd: 'D:\\outside\\task',
@@ -134,11 +134,11 @@ test('saved project inference prefers valid identity then the longest canonical 
 
   assert.deepEqual(inferSavedProject({
     cwd: 'D:\\generated\\outside',
-    worktreePath: 'C:\\Users\\86166\\Desktop\\ygf\\.codex\\worktree',
-  }, projects), { projectId: 'ygf', projectName: 'ygf' });
+    worktreePath: 'C:\\Users\\operator\\Desktop\\example-project\\.codex\\worktree',
+  }, projects), { projectId: 'example-project', projectName: 'example-project' });
 
   assert.deepEqual(inferSavedProject({
-    cwd: 'C:\\Users\\86166\\Desktop\\ygf\\manually-projectless',
+    cwd: 'C:\\Users\\operator\\Desktop\\example-project\\manually-projectless',
     projectId: null,
     projectName: '无项目',
   }, projects), { projectId: null, projectName: null });
@@ -146,21 +146,21 @@ test('saved project inference prefers valid identity then the longest canonical 
   assert.deepEqual(inferSavedProject({
     cwd: 'D:\\generated\\outside',
     projectId: 'deleted-project-id',
-    projectName: 'ygf',
-  }, projects), { projectId: 'ygf', projectName: 'ygf' });
+    projectName: 'example-project',
+  }, projects), { projectId: 'example-project', projectName: 'example-project' });
 });
 
 test('Discord managed worktree project provenance wins over generated path matching', () => {
   const projects = [
-    { id: 'ygf', name: 'ygf', roots: ['C:\\Users\\86166\\Desktop\\ygf'] },
-    { id: 'worktrees', name: 'Generated', roots: ['G:\\CodexData\\.codex\\worktrees'] },
+    { id: 'example-project', name: 'example-project', roots: ['C:\\Users\\operator\\Desktop\\example-project'] },
+    { id: 'worktrees', name: 'Generated', roots: ['D:\\codex-data\\.codex\\worktrees'] },
   ];
   assert.deepEqual(inferSavedProject({
-    cwd: 'G:\\CodexData\\.codex\\worktrees\\discord\\operation',
-    worktreePath: 'G:\\CodexData\\.codex\\worktrees\\discord\\operation',
-    projectId: 'ygf',
-    projectName: 'ygf',
-  }, projects), { projectId: 'ygf', projectName: 'ygf' });
+    cwd: 'D:\\codex-data\\.codex\\worktrees\\discord\\operation',
+    worktreePath: 'D:\\codex-data\\.codex\\worktrees\\discord\\operation',
+    projectId: 'example-project',
+    projectName: 'example-project',
+  }, projects), { projectId: 'example-project', projectName: 'example-project' });
 });
 
 test('indexes a persisted Discord-created root absent from sidebar but never promotes its child rollout', async () => {
@@ -172,7 +172,7 @@ test('indexes a persisted Discord-created root absent from sidebar but never pro
   try {
     await fs.writeFile(paths.sessionIndexPath, '', 'utf8');
     await writeJsonl(paths.rollout(`2026-09-01T20-55-55-${rootId}`), [
-      meta(rootId, { cwd: 'C:\\Users\\86166\\Desktop\\ygf\\app' }),
+      meta(rootId, { cwd: 'C:\\Users\\operator\\Desktop\\example-project\\app' }),
       event('2026-09-01T20:55:56.000Z', 'task_started', { turn_id: 'turn-root' }),
       event('2026-09-01T21:08:15.000Z', 'task_complete', { turn_id: 'turn-root', last_agent_message: '完成' }),
     ]);
@@ -193,15 +193,15 @@ test('indexes a persisted Discord-created root absent from sidebar but never pro
     const index = await buildTaskIndex({
       ...paths,
       nowMs: Date.parse('2026-09-01T21:08:16.000Z'),
-      projects: [{ id: 'ygf', name: 'ygf', roots: ['C:\\Users\\86166\\Desktop\\ygf'] }],
+      projects: [{ id: 'example-project', name: 'example-project', roots: ['C:\\Users\\operator\\Desktop\\example-project'] }],
       createdTasksByInteraction: {
         '1544329941024374935': {
           status: 'started', threadId: rootId, turnId: 'turn-root', taskName: 'Discord 新任务',
-          projectId: 'ygf', projectName: 'ygf',
+          projectId: 'example-project', projectName: 'example-project',
           workspace: {
-            mode: 'worktree', cwd: 'G:\\CodexData\\.codex\\worktrees\\discord\\incident',
-            worktreePath: 'G:\\CodexData\\.codex\\worktrees\\discord\\incident',
-            runtimeWorkspaceRoots: ['G:\\CodexData\\.codex\\worktrees\\discord\\incident'],
+            mode: 'worktree', cwd: 'D:\\codex-data\\.codex\\worktrees\\discord\\incident',
+            worktreePath: 'D:\\codex-data\\.codex\\worktrees\\discord\\incident',
+            runtimeWorkspaceRoots: ['D:\\codex-data\\.codex\\worktrees\\discord\\incident'],
             operationId: '1544329941024374935',
           },
         },
@@ -214,7 +214,7 @@ test('indexes a persisted Discord-created root absent from sidebar but never pro
 
     assert.deepEqual(index.tasks.map((item) => item.threadId), [rootId]);
     assert.equal(index.tasks[0].status, 'completed');
-    assert.equal(index.tasks[0].projectName, 'ygf');
+    assert.equal(index.tasks[0].projectName, 'example-project');
     assert.equal(index.tasks[0].taskName, 'Discord 新任务');
     const detail = await readTaskDetail(index.tasks[0]);
     assert.equal(detail.resultText, '完成');
@@ -436,14 +436,14 @@ test('reuses an unchanged previous record without opening its rollout body and r
   }
 });
 
-test('an unchanged historic null project is re-inferred from the latest ygf catalog', async () => {
+test('an unchanged historic null project is re-inferred from the latest example-project catalog', async () => {
   const paths = await fixture();
   const threadId = '019cdef0-4321-7890-abcd-1234567890ac';
   const rolloutPath = paths.rollout(`2026-09-01T00-00-00-${threadId}`);
   try {
-    await writeJsonl(paths.sessionIndexPath, [{ id: threadId, thread_name: 'ygf 历史任务' }]);
+    await writeJsonl(paths.sessionIndexPath, [{ id: threadId, thread_name: 'example-project 历史任务' }]);
     await writeJsonl(rolloutPath, [
-      meta(threadId, { cwd: 'C:\\Users\\86166\\Desktop\\ygf\\app' }),
+      meta(threadId, { cwd: 'C:\\Users\\operator\\Desktop\\example-project\\app' }),
       event('2026-09-01T00:04:00.000Z', 'task_started', { turn_id: 'body-turn' }),
       event('2026-09-01T00:05:00.000Z', 'task_complete', { turn_id: 'body-turn' }),
     ]);
@@ -456,11 +456,11 @@ test('an unchanged historic null project is re-inferred from the latest ygf cata
     const index = await buildTaskIndex({
       ...paths,
       previousIndex: { version: 1, generatedAt: null, tasks: [previous] },
-      projects: [{ id: 'ygf', name: 'ygf', roots: ['C:\\Users\\86166\\Desktop\\ygf'] }],
+      projects: [{ id: 'example-project', name: 'example-project', roots: ['C:\\Users\\operator\\Desktop\\example-project'] }],
     });
 
-    assert.equal(index.tasks[0].projectId, 'ygf');
-    assert.equal(index.tasks[0].projectName, 'ygf');
+    assert.equal(index.tasks[0].projectId, 'example-project');
+    assert.equal(index.tasks[0].projectName, 'example-project');
   } finally {
     await fs.rm(paths.root, { recursive: true, force: true });
   }
@@ -504,15 +504,15 @@ test('unchanged managed worktree fast path applies its valid persisted creation 
         threadId, projectId: null, projectName: null, taskName: '旧任务', status: 'running',
         rolloutPath, offset: size, worktreePath: 'G:\\generated\\discord-worktree', worktreeBranch: 'codex/discord-test',
       }] },
-      projects: [{ id: 'ygf', name: 'ygf', roots: ['C:\\Users\\86166\\Desktop\\ygf'] }],
+      projects: [{ id: 'example-project', name: 'example-project', roots: ['C:\\Users\\operator\\Desktop\\example-project'] }],
       createdTasksByInteraction: { create1: {
-        status: 'started', threadId, turnId: 'turn-1', projectId: 'ygf', projectName: 'ygf',
+        status: 'started', threadId, turnId: 'turn-1', projectId: 'example-project', projectName: 'example-project',
         taskName: '托管工作树任务',
         workspace: { mode: 'worktree', cwd: 'G:\\generated\\discord-worktree', runtimeWorkspaceRoots: ['G:\\generated\\discord-worktree'], operationId: 'create1' },
       } },
     });
-    assert.equal(index.tasks[0].projectId, 'ygf');
-    assert.equal(index.tasks[0].projectName, 'ygf');
+    assert.equal(index.tasks[0].projectId, 'example-project');
+    assert.equal(index.tasks[0].projectName, 'example-project');
   } finally { await fs.rm(paths.root, { recursive: true, force: true }); }
 });
 

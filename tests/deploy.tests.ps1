@@ -8,6 +8,7 @@ $sourceRoot = Split-Path -Parent $PSScriptRoot
 $deployScript = Join-Path $sourceRoot 'deploy.ps1'
 $readmePath = Join-Path $sourceRoot 'README.md'
 $testRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('codex discord deploy ' + [guid]::NewGuid().ToString('N'))
+$testJunctions = [System.Collections.Generic.List[string]]::new()
 
 $sourceFiles = @(
     'activate-discord-bot.ps1',
@@ -30,6 +31,7 @@ $sourceFiles = @(
     'discord-state.ps1',
     'discord-task-create-lib.mjs',
     'discord-task-index-lib.mjs',
+    'deploy-live-probe.ps1',
     'dispatcher.ps1',
     'get-discord-token.ps1',
     'install-control-app.ps1',
@@ -121,8 +123,30 @@ exit 0
 function Get-IsolatedBridgeScript {
     param([Parameter(Mandatory)][ValidateSet('new','old')][string]$Role)
     return @'
-import { appendFileSync } from 'node:fs';
+import { appendFileSync, writeFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
 appendFileSync(process.env.CODEX_DEPLOY_TEST_ACTION_PATH, 'register:__ROLE__\n', 'utf8');
+if (process.env.CODEX_DEPLOY_TEST_REMOTE_PATH) writeFileSync(process.env.CODEX_DEPLOY_TEST_REMOTE_PATH, '__ROLE__', 'utf8');
+const mode = process.env.CODEX_DEPLOY_TEST_REGISTRATION_MODE || '';
+if ('__ROLE__' === 'new' && mode === 'hang-new') {
+  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+  if (process.env.CODEX_DEPLOY_TEST_PID_PATH) writeFileSync(process.env.CODEX_DEPLOY_TEST_PID_PATH, `${process.pid}\n${child.pid}\n`, 'utf8');
+  setInterval(() => {}, 1000);
+}
+if ('__ROLE__' === 'new' && mode === 'huge-stdout-new') {
+  const sentinel = process.env.CODEX_DEPLOY_TEST_OUTPUT_SENTINEL || 'synthetic-output';
+  process.stdout.write(sentinel.repeat(20000));
+  setInterval(() => {}, 1000);
+}
+if ('__ROLE__' === 'new' && mode === 'huge-stderr-new') {
+  const sentinel = process.env.CODEX_DEPLOY_TEST_OUTPUT_SENTINEL || 'synthetic-output';
+  process.stderr.write(sentinel.repeat(20000));
+  setInterval(() => {}, 1000);
+}
+if ('__ROLE__' === 'new' && mode === 'slow-retry-new') {
+  appendFileSync(process.env.CODEX_DEPLOY_TEST_ACTION_PATH, 'register:synthetic-429-long-retry\n', 'utf8');
+  setTimeout(() => process.exit(0), 600000);
+}
 if (process.env.CODEX_DEPLOY_TEST_FAIL_REGISTRATION === '__ROLE__') process.exit(1);
 '@.Replace('__ROLE__', $Role)
 }
@@ -134,6 +158,11 @@ function Install-IsolatedDeploySource {
 function Read-IsolatedDeployState { return (Get-Content -Raw -LiteralPath $env:CODEX_DEPLOY_TEST_STATE_PATH | ConvertFrom-Json) }
 function Write-IsolatedDeployState { param($State) $State | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:CODEX_DEPLOY_TEST_STATE_PATH -Encoding UTF8 }
 function Add-IsolatedDeployAction { param([string]$Value) Add-Content -LiteralPath $env:CODEX_DEPLOY_TEST_ACTION_PATH -Value $Value -Encoding UTF8 }
+function Read-IsolatedGuardState {
+    if ([string]::IsNullOrWhiteSpace($env:CODEX_DEPLOY_TEST_GUARD_STATE_PATH)) { return [pscustomobject]@{exists=$false;trusted=$true;enabled=$false;running=$false} }
+    return (Get-Content -Raw -LiteralPath $env:CODEX_DEPLOY_TEST_GUARD_STATE_PATH | ConvertFrom-Json)
+}
+function Write-IsolatedGuardState { param($State) $State | ConvertTo-Json -Compress | Set-Content -LiteralPath $env:CODEX_DEPLOY_TEST_GUARD_STATE_PATH -Encoding UTF8 }
 function New-CodexControlOperations { return @{} }
 function Get-CodexBridgeServiceStatus {
     param([hashtable]$Operations,[string]$ToolDir)
@@ -151,6 +180,46 @@ function Invoke-CodexBridgeServiceAction {
     if ($Action -eq 'start-temporary') { $state.running=$true; $state.taskRunning=[bool]$state.autoStartEnabled; $state.mode=$(if($state.autoStartEnabled){'scheduled'}else{'temporary'}); Write-IsolatedDeployState $state }
     return [pscustomobject]@{ok=$true}
 }
+function Get-CodexNotificationGuardStatus {
+    param([hashtable]$Operations,[string]$ToolDir)
+    Add-IsolatedDeployAction 'guard:status'
+    $state = Read-IsolatedGuardState
+    if ($env:CODEX_DEPLOY_TEST_REPLACE_STAGE_ON_FINAL_GUARD -eq '1') {
+        $countPath = $env:CODEX_DEPLOY_TEST_GUARD_COUNT_PATH
+        $count = if (Test-Path -LiteralPath $countPath -PathType Leaf) { [int](Get-Content -Raw -LiteralPath $countPath) } else { 0 }
+        $count++
+        [System.IO.File]::WriteAllText($countPath, [string]$count, [System.Text.UTF8Encoding]::new($false))
+        if ($count -eq 2) {
+            $original = $PSScriptRoot + '.original'
+            Move-Item -LiteralPath $PSScriptRoot -Destination $original
+            New-Item -ItemType Directory -Path $PSScriptRoot | Out-Null
+            [System.IO.File]::WriteAllText((Join-Path $PSScriptRoot 'replacement-sentinel.txt'), 'replacement-must-survive', [System.Text.UTF8Encoding]::new($false))
+        }
+    }
+    $definitionHash = if ($null -ne $state.PSObject.Properties['definitionHash']) { [string]$state.definitionHash } else { 'isolated-guard-definition-v1' }
+    return [pscustomobject]@{ok=$true;exists=[bool]$state.exists;trusted=[bool]$state.trusted;enabled=[bool]$state.enabled;running=[bool]$state.running;definitionHash=$definitionHash}
+}
+function Invoke-CodexNotificationGuardAction {
+    param([string]$Action,[hashtable]$Operations,[string]$ToolDir)
+    Add-IsolatedDeployAction ("guard:$Action")
+    $state = Read-IsolatedGuardState
+    if (-not $state.exists -or -not $state.trusted) { return [pscustomobject]@{ok=$false;errorCategory='guard-unavailable'} }
+    switch ($Action) {
+        'stop' { $state.running=$(if ($state.enabled -and $null -ne $state.PSObject.Properties['autoRestartWhenEnabled'] -and [bool]$state.autoRestartWhenEnabled){$true}else{$false}) }
+        'start' { $state.running=$true }
+        'enable' { $state.enabled=$true }
+        'disable' {
+            $state.enabled=$false
+            if ($env:CODEX_DEPLOY_TEST_GUARD_MUTATE_DEFINITION_ON_DISABLE -eq '1') {
+                if ($null -eq $state.PSObject.Properties['definitionHash']) { $state | Add-Member -NotePropertyName definitionHash -NotePropertyValue 'isolated-guard-definition-changed' }
+                else { $state.definitionHash='isolated-guard-definition-changed' }
+            }
+        }
+    }
+    Write-IsolatedGuardState $state
+    if ($env:CODEX_DEPLOY_TEST_GUARD_ACTION_FAIL_AFTER -eq $Action) { return [pscustomobject]@{ok=$false;errorCategory='synthetic-guard-post-mutation-failure'} }
+    return [pscustomobject]@{ok=$true;guard=$state}
+}
 '@
     $fakeInstaller = @'
 [CmdletBinding()]
@@ -160,10 +229,21 @@ Add-Content -LiteralPath $env:CODEX_DEPLOY_TEST_ACTION_PATH -Value 'install:shor
 [System.IO.File]::WriteAllText((Join-Path $DesktopPath 'Codex Discord 控制台.lnk'), 'isolated-new-shortcut', [System.Text.UTF8Encoding]::new($false))
 if ($env:CODEX_DEPLOY_TEST_FAIL_SHORTCUT_AFTER_WRITE -eq '1') { throw 'synthetic-shortcut-failure' }
 '@
+    $fakeBuilder = @'
+[CmdletBinding()]
+param([Parameter(Mandatory)][string]$OutputDirectory)
+[System.IO.File]::WriteAllBytes((Join-Path $OutputDirectory 'CodexDiscordControl.exe'), [byte[]](0x4d,0x5a,1,2,3,4))
+if ($env:CODEX_DEPLOY_TEST_REPLACE_STAGE_AFTER_BUILD -eq '1') {
+    $original = $OutputDirectory + '.original'
+    Move-Item -LiteralPath $OutputDirectory -Destination $original
+    Copy-Item -LiteralPath $original -Destination $OutputDirectory -Recurse
+}
+'@
     [System.IO.File]::WriteAllText((Join-Path $Destination 'codex-control-lib.ps1'), $fakeLibrary, [System.Text.UTF8Encoding]::new($false))
     [System.IO.File]::WriteAllText((Join-Path $Destination 'codex-control.ps1'), (Get-IsolatedControlScript -Role new), [System.Text.UTF8Encoding]::new($false))
     [System.IO.File]::WriteAllText((Join-Path $Destination 'install-control-app.ps1'), $fakeInstaller, [System.Text.UTF8Encoding]::new($false))
     [System.IO.File]::WriteAllText((Join-Path $Destination 'discord-bridge.mjs'), (Get-IsolatedBridgeScript -Role new), [System.Text.UTF8Encoding]::new($false))
+    [System.IO.File]::WriteAllText((Join-Path $Destination 'build-control-app.ps1'), $fakeBuilder, [System.Text.UTF8Encoding]::new($false))
 }
 
 function Assert-DirectoryUnchanged {
@@ -177,6 +257,26 @@ function Assert-DirectoryUnchanged {
     foreach ($name in $Expected.Keys) {
         Assert-True ($actual.ContainsKey($name) -and $actual[$name] -ceq $Expected[$name]) "rejected deployment changed $name"
     }
+}
+
+function Get-TestShortPath {
+    param([Parameter(Mandatory)][string]$Path)
+
+    if ($null -eq ('CodexDeployTestPathNative' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Text;
+using System.Runtime.InteropServices;
+public static class CodexDeployTestPathNative {
+    [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+    public static extern uint GetShortPathName(string longPath, StringBuilder shortPath, uint bufferLength);
+}
+'@
+    }
+    $buffer = [System.Text.StringBuilder]::new(32768)
+    $length = [CodexDeployTestPathNative]::GetShortPathName([System.IO.Path]::GetFullPath($Path), $buffer, [uint32]$buffer.Capacity)
+    if ($length -eq 0 -or $length -ge $buffer.Capacity) { return $null }
+    return $buffer.ToString()
 }
 
 try {
@@ -293,6 +393,76 @@ try {
     Assert-True (-not [string]::IsNullOrWhiteSpace($nestedError)) 'deployment accepted a DesktopPath nested inside LiveRoot'
     Assert-True (@(Get-ChildItem -LiteralPath $nestedLive -Force).Count -eq 2) 'nested overlap rejection wrote into LiveRoot'
 
+    $rootSourceError = $null
+    try { & $deployScript -SourceRoot ([System.IO.Path]::GetPathRoot($testRoot)) -LiveRoot $overlapLive -DesktopPath $desktopRoot -SkipLiveActions | Out-Null }
+    catch { $rootSourceError = $_.Exception.Message }
+    Assert-True ($rootSourceError -match 'filesystem root') 'deployment accepted a filesystem root as a trusted directory'
+
+    $junctionPhysical = Join-Path $testRoot 'physical ancestor targets'
+    $junctionAlias = Join-Path $testRoot 'ancestor junction alias'
+    $junctionAvailable = $true
+    New-Item -ItemType Directory -Path $junctionPhysical -Force | Out-Null
+    try {
+        New-Item -ItemType Junction -Path $junctionAlias -Target $junctionPhysical -ErrorAction Stop | Out-Null
+        $testJunctions.Add($junctionAlias)
+    }
+    catch {
+        $junctionAvailable = $false
+        Write-Output 'SKIP: junction unavailable for ancestor-root safety cases'
+    }
+    if ($junctionAvailable) {
+        $junctionSourcePhysical = Join-Path $junctionPhysical 'source child'
+        $junctionLivePhysical = Join-Path $junctionPhysical 'live child'
+        $junctionDesktopPhysical = Join-Path $junctionPhysical 'Desktop child'
+        Copy-DeploymentSource -Destination $junctionSourcePhysical
+        New-Item -ItemType Directory -Path $junctionLivePhysical,$junctionDesktopPhysical -Force | Out-Null
+
+        $ancestorCases = @(
+            [pscustomobject]@{Name='SourceRoot'; Source=(Join-Path $junctionAlias 'source child'); Live=(Join-Path $testRoot 'ancestor source live'); Desktop=(Join-Path $testRoot 'ancestor source Desktop')},
+            [pscustomobject]@{Name='LiveRoot'; Source=$sourceRoot; Live=(Join-Path $junctionAlias 'live child'); Desktop=(Join-Path $testRoot 'ancestor live Desktop')},
+            [pscustomobject]@{Name='DesktopPath'; Source=$sourceRoot; Live=(Join-Path $testRoot 'ancestor Desktop live'); Desktop=(Join-Path $junctionAlias 'Desktop child')}
+        )
+        foreach ($case in $ancestorCases) {
+            New-Item -ItemType Directory -Path $case.Live,$case.Desktop -Force | Out-Null
+            Write-TestBytes -Path (Join-Path $case.Live 'sentinel.bin') -Bytes ([byte[]](8,6,7,5,3,0,9))
+            $ancestorBefore = @{ 'sentinel.bin' = Get-BytesHex -Path (Join-Path $case.Live 'sentinel.bin') }
+            $ancestorError = $null
+            try { & $deployScript -SourceRoot $case.Source -LiveRoot $case.Live -DesktopPath $case.Desktop -SkipLiveActions | Out-Null }
+            catch { $ancestorError = $_.Exception.Message }
+            Assert-True ($ancestorError -match 'reparse') "deployment accepted $($case.Name) beneath an ancestor junction"
+            Assert-DirectoryUnchanged -Directory $case.Live -Expected $ancestorBefore
+        }
+    }
+
+    $shortAliasDirectory = Join-Path $testRoot 'physical alias directory with long name'
+    New-Item -ItemType Directory -Path $shortAliasDirectory -Force | Out-Null
+    Write-TestBytes -Path (Join-Path $shortAliasDirectory 'sentinel.bin') -Bytes ([byte[]](1,6,1,8))
+    $shortAlias = Get-TestShortPath -Path $shortAliasDirectory
+    if ([string]::IsNullOrWhiteSpace($shortAlias) -or $shortAlias.Equals($shortAliasDirectory, [System.StringComparison]::OrdinalIgnoreCase)) {
+        Write-Output 'SKIP: distinct 8.3 alias unavailable'
+    }
+    else {
+        $aliasError = $null
+        try { & $deployScript -SourceRoot $sourceRoot -LiveRoot $shortAliasDirectory -DesktopPath $shortAlias -SkipLiveActions | Out-Null }
+        catch { $aliasError = $_.Exception.Message }
+        Assert-True (-not [string]::IsNullOrWhiteSpace($aliasError)) 'deployment accepted two aliases for the same physical directory'
+        Assert-True ((@(Get-ChildItem -LiteralPath $shortAliasDirectory -Force).Name -join ',') -eq 'sentinel.bin') 'same-physical alias rejection wrote into LiveRoot'
+
+        $shortNestedChild = Join-Path $shortAliasDirectory 'nested child with long name'
+        New-Item -ItemType Directory -Path $shortNestedChild -Force | Out-Null
+        $shortNestedAlias = Get-TestShortPath -Path $shortNestedChild
+        if ([string]::IsNullOrWhiteSpace($shortNestedAlias) -or $shortNestedAlias.Equals($shortNestedChild, [System.StringComparison]::OrdinalIgnoreCase)) {
+            Write-Output 'SKIP: distinct nested 8.3 alias unavailable'
+        }
+        else {
+            $nestedAliasError = $null
+            try { & $deployScript -SourceRoot $sourceRoot -LiveRoot $shortAliasDirectory -DesktopPath $shortNestedAlias -SkipLiveActions | Out-Null }
+            catch { $nestedAliasError = $_.Exception.Message }
+            Assert-True (-not [string]::IsNullOrWhiteSpace($nestedAliasError)) 'deployment accepted a physical child represented through an 8.3 alias'
+            Assert-True (-not (Test-Path -LiteralPath (Join-Path $shortAliasDirectory '.codex-discord-backups'))) 'nested physical alias rejection wrote a backup directory'
+        }
+    }
+
     $rollbackLive = Join-Path $testRoot 'rollback live'
     $rollbackDesktop = Join-Path $testRoot 'rollback Desktop'
     New-Item -ItemType Directory -Path $rollbackLive,$rollbackDesktop -Force | Out-Null
@@ -322,6 +492,196 @@ try {
     Assert-True (Test-Path -LiteralPath (Join-Path $rollbackBackups[0].FullName 'discord-bridge.mjs') -PathType Leaf) 'failed deployment backup cannot restore the old bridge'
     Assert-True (($rollbackOutput -join "`n") -match [regex]::Escape($rollbackBackups[0].FullName)) 'failed deployment did not report its recoverable backup before commit'
     Assert-True (@(Get-ChildItem -LiteralPath $rollbackLive -Recurse -Force | Where-Object { $_.Name -match '(?i)\.stage$|\.commit$|\.discard$|\.rollback$' }).Count -eq 0) 'failed deployment left transaction artifacts'
+
+    $casSource = Join-Path $testRoot 'identity and CAS source'
+    Install-IsolatedDeploySource -Destination $casSource
+
+    $backupSwapLive = Join-Path $testRoot 'backup identity live'
+    $backupSwapDesktop = Join-Path $testRoot 'backup identity Desktop'
+    $backupSwapOutside = Join-Path $testRoot 'backup identity outside'
+    New-Item -ItemType Directory -Path $backupSwapLive,$backupSwapDesktop,$backupSwapOutside -Force | Out-Null
+    Write-TestBytes -Path (Join-Path $backupSwapLive 'discord-bridge.mjs') -Bytes ([byte[]](7,7,1,1))
+    Write-TestBytes -Path (Join-Path $backupSwapOutside 'outside-sentinel.bin') -Bytes ([byte[]](9,9,8,8))
+    $backupSwapOldHash = Get-BytesHex -Path (Join-Path $backupSwapLive 'discord-bridge.mjs')
+    $backupSwapOutsideHash = Get-BytesHex -Path (Join-Path $backupSwapOutside 'outside-sentinel.bin')
+    $backupRootSwapHook = {
+        param($context)
+        Move-Item -LiteralPath $context.Path -Destination ($context.Path + '.original')
+        New-Item -ItemType Junction -Path $context.Path -Target $backupSwapOutside | Out-Null
+        $testJunctions.Add($context.Path)
+    }.GetNewClosure()
+    $backupSwapError = $null
+    try { & $deployScript -SourceRoot $casSource -LiveRoot $backupSwapLive -DesktopPath $backupSwapDesktop -SkipLiveActions -TestHooks @{AfterBackupRootCreated=$backupRootSwapHook} 3>&1 | Out-Null }
+    catch { $backupSwapError = $_.Exception.Message }
+    Assert-True (-not [string]::IsNullOrWhiteSpace($backupSwapError)) 'deployment accepted a replaced backup root identity'
+    Assert-True ((Get-BytesHex -Path (Join-Path $backupSwapLive 'discord-bridge.mjs')) -ceq $backupSwapOldHash) 'backup root replacement reached a live file commit'
+    Assert-True ((Get-BytesHex -Path (Join-Path $backupSwapOutside 'outside-sentinel.bin')) -ceq $backupSwapOutsideHash) 'backup root replacement wrote outside LiveRoot'
+
+    foreach ($casWindow in @('before-commit','between-precheck','absent-race')) {
+        $casLive = Join-Path $testRoot ("CAS $casWindow live")
+        $casDesktop = Join-Path $testRoot ("CAS $casWindow Desktop")
+        New-Item -ItemType Directory -Path $casLive,$casDesktop -Force | Out-Null
+        $casDestination = Join-Path $casLive 'discord-bridge.mjs'
+        if ($casWindow -ne 'absent-race') { Write-TestBytes -Path $casDestination -Bytes ([byte[]](1,2,1,2)) }
+        $thirdPartyBytes = [byte[]](203,17,203,17)
+        $hookName = if ($casWindow -eq 'before-commit') { 'BeforeCommit' } else { 'BetweenPrecheckAndReplace' }
+        $casChanged = $false
+        $casHook = {
+            param($record)
+            if (-not $casChanged -and $record.RelativePath -eq 'discord-bridge.mjs') {
+                $casChanged = $true
+                Write-TestBytes -Path $record.DestinationPath -Bytes $thirdPartyBytes
+            }
+        }.GetNewClosure()
+        $casError = $null
+        try { & $deployScript -SourceRoot $casSource -LiveRoot $casLive -DesktopPath $casDesktop -SkipLiveActions -TestHooks @{$hookName=$casHook} 3>&1 | Out-Null }
+        catch { $casError = $_.Exception.Message }
+        Assert-True (-not [string]::IsNullOrWhiteSpace($casError)) "deployment ignored concurrent destination bytes at $casWindow"
+        $casActualHex = Get-BytesHex -Path $casDestination
+        $casExpectedHex = [Convert]::ToHexString($thirdPartyBytes)
+        Assert-True ($casActualHex -ceq $casExpectedHex) "deployment overwrote concurrent destination bytes at $casWindow (expected=$casExpectedHex actual=$casActualHex error=$casError)"
+    }
+
+    $rollbackCasLive = Join-Path $testRoot 'rollback destination CAS live'
+    $rollbackCasDesktop = Join-Path $testRoot 'rollback destination CAS Desktop'
+    New-Item -ItemType Directory -Path $rollbackCasLive,$rollbackCasDesktop -Force | Out-Null
+    Write-TestBytes -Path (Join-Path $rollbackCasLive 'discord-bridge.mjs') -Bytes ([byte[]](8,1,8,1))
+    $rollbackThirdParty = [byte[]](222,173,190,239)
+    $rollbackCasHook = {
+        param($context)
+        $bridgeRecord = @($context.Records | Where-Object { $_.RelativePath -eq 'discord-bridge.mjs' }) | Select-Object -First 1
+        Write-TestBytes -Path $bridgeRecord.DestinationPath -Bytes $rollbackThirdParty
+    }.GetNewClosure()
+    $rollbackCasError = $null
+    try { & $deployScript -SourceRoot $casSource -LiveRoot $rollbackCasLive -DesktopPath $rollbackCasDesktop -SkipLiveActions -FailureInjectionStep 'after-third-commit' -TestHooks @{BeforeRollback=$rollbackCasHook} 3>&1 | Out-Null }
+    catch { $rollbackCasError = $_.Exception.Message }
+    Assert-True ($rollbackCasError -match 'rollback is incomplete') 'concurrent rollback bytes did not produce a safe incomplete-rollback result'
+    Assert-True ((Get-BytesHex -Path (Join-Path $rollbackCasLive 'discord-bridge.mjs')) -ceq [Convert]::ToHexString($rollbackThirdParty)) 'rollback overwrote concurrent destination bytes'
+
+    $rollbackAtomicLive = Join-Path $testRoot 'rollback atomic CAS live'
+    $rollbackAtomicDesktop = Join-Path $testRoot 'rollback atomic CAS Desktop'
+    New-Item -ItemType Directory -Path $rollbackAtomicLive,$rollbackAtomicDesktop -Force | Out-Null
+    Write-TestBytes -Path (Join-Path $rollbackAtomicLive 'discord-bridge.mjs') -Bytes ([byte[]](8,2,8,2))
+    $rollbackAtomicThirdParty = [byte[]](186,173,240,13)
+    $rollbackAtomicChanged = $false
+    $rollbackAtomicHook = {
+        param($record)
+        if (-not $rollbackAtomicChanged -and $record.RelativePath -eq 'discord-bridge.mjs') {
+            $rollbackAtomicChanged = $true
+            Write-TestBytes -Path $record.DestinationPath -Bytes $rollbackAtomicThirdParty
+        }
+    }.GetNewClosure()
+    $rollbackAtomicError = $null
+    try { & $deployScript -SourceRoot $casSource -LiveRoot $rollbackAtomicLive -DesktopPath $rollbackAtomicDesktop -SkipLiveActions -FailureInjectionStep 'after-third-commit' -TestHooks @{BetweenRollbackPrecheckAndReplace=$rollbackAtomicHook} 3>&1 | Out-Null }
+    catch { $rollbackAtomicError = $_.Exception.Message }
+    Assert-True ($rollbackAtomicError -match 'rollback is incomplete') 'atomic rollback race did not produce a safe incomplete-rollback result'
+    Assert-True ((Get-BytesHex -Path (Join-Path $rollbackAtomicLive 'discord-bridge.mjs')) -ceq [Convert]::ToHexString($rollbackAtomicThirdParty)) 'atomic rollback race overwrote concurrent destination bytes'
+
+    foreach ($rootSwapWindow in @('commit','rollback')) {
+        $rootSwapLive = Join-Path $testRoot ("root swap $rootSwapWindow live")
+        $rootSwapDesktop = Join-Path $testRoot ("root swap $rootSwapWindow Desktop")
+        New-Item -ItemType Directory -Path $rootSwapLive,$rootSwapDesktop -Force | Out-Null
+        Write-TestBytes -Path (Join-Path $rootSwapLive 'discord-bridge.mjs') -Bytes ([byte[]](6,2,6,2))
+        $replacementSentinel = [byte[]](5,5,5,5)
+        $rootSwapped = $false
+        $rootSwapHook = {
+            param($context)
+            if ($rootSwapped) { return }
+            $rootSwapped = $true
+            Move-Item -LiteralPath $rootSwapLive -Destination ($rootSwapLive + '.original')
+            New-Item -ItemType Directory -Path $rootSwapLive | Out-Null
+            Write-TestBytes -Path (Join-Path $rootSwapLive 'replacement-sentinel.bin') -Bytes $replacementSentinel
+        }.GetNewClosure()
+        $rootHooks = if ($rootSwapWindow -eq 'commit') { @{BeforeCommit=$rootSwapHook} } else { @{BeforeRollback=$rootSwapHook} }
+        $rootSwapError = $null
+        try { & $deployScript -SourceRoot $casSource -LiveRoot $rootSwapLive -DesktopPath $rootSwapDesktop -SkipLiveActions -FailureInjectionStep $(if($rootSwapWindow -eq 'rollback'){'after-third-commit'}else{'none'}) -TestHooks $rootHooks 3>&1 | Out-Null }
+        catch { $rootSwapError = $_.Exception.Message }
+        Assert-True (-not [string]::IsNullOrWhiteSpace($rootSwapError)) "deployment ignored a LiveRoot replacement before $rootSwapWindow"
+        Assert-True ((Get-BytesHex -Path (Join-Path $rootSwapLive 'replacement-sentinel.bin')) -ceq [Convert]::ToHexString($replacementSentinel)) "deployment changed replacement LiveRoot bytes before $rootSwapWindow"
+    }
+
+    $cleanupSource = Join-Path $testRoot 'cleanup injection source'
+    Install-IsolatedDeploySource -Destination $cleanupSource
+    $cleanupSuccessLive = Join-Path $testRoot 'cleanup success live'
+    $cleanupSuccessDesktop = Join-Path $testRoot 'cleanup success Desktop'
+    New-Item -ItemType Directory -Path $cleanupSuccessLive,$cleanupSuccessDesktop -Force | Out-Null
+    $cleanupSuccessError = $null
+    $cleanupSuccessOutput = [System.Collections.Generic.List[string]]::new()
+    try {
+        & $deployScript -SourceRoot $cleanupSource -LiveRoot $cleanupSuccessLive -DesktopPath $cleanupSuccessDesktop -SkipLiveActions -InjectCleanupFailure 3>&1 |
+            ForEach-Object { $cleanupSuccessOutput.Add([string]$_) }
+    }
+    catch { $cleanupSuccessError = $_.Exception.Message }
+    Assert-True ([string]::IsNullOrWhiteSpace($cleanupSuccessError)) 'stage cleanup failure falsely reported a committed deployment as failed'
+    Assert-True (($cleanupSuccessOutput -join "`n") -match 'deployment-stage-cleanup-failed') 'successful deployment cleanup failure omitted its fixed warning category'
+    Assert-True (Test-Path -LiteralPath (Join-Path $cleanupSuccessLive 'discord-bridge.mjs') -PathType Leaf) 'cleanup failure undid a committed deployment'
+    Assert-True (@(Get-ChildItem -LiteralPath $cleanupSuccessLive -Directory -Force | Where-Object { $_.Name -like '.codex-discord-deploy.*.stage' }).Count -eq 1) 'cleanup failure did not safely retain its stage'
+
+    $cleanupFailureLive = Join-Path $testRoot 'cleanup primary failure live'
+    $cleanupFailureDesktop = Join-Path $testRoot 'cleanup primary failure Desktop'
+    New-Item -ItemType Directory -Path $cleanupFailureLive,$cleanupFailureDesktop -Force | Out-Null
+    Write-TestBytes -Path (Join-Path $cleanupFailureLive 'discord-bridge.mjs') -Bytes ([byte[]](44,55,66))
+    $cleanupOldHash = Get-BytesHex -Path (Join-Path $cleanupFailureLive 'discord-bridge.mjs')
+    $cleanupPrimaryError = $null
+    $cleanupFailureOutput = [System.Collections.Generic.List[string]]::new()
+    try {
+        & $deployScript -SourceRoot $cleanupSource -LiveRoot $cleanupFailureLive -DesktopPath $cleanupFailureDesktop -SkipLiveActions -FailureInjectionStep 'after-third-commit' -InjectCleanupFailure 3>&1 |
+            ForEach-Object { $cleanupFailureOutput.Add([string]$_) }
+    }
+    catch { $cleanupPrimaryError = $_.Exception.Message }
+    Assert-True ($cleanupPrimaryError -eq 'injected-deploy-failure:after-third-commit') 'stage cleanup failure replaced the primary deployment error'
+    Assert-True (($cleanupFailureOutput -join "`n") -match 'deployment-stage-cleanup-failed') 'failed deployment cleanup failure omitted its fixed warning category'
+    Assert-True ((Get-BytesHex -Path (Join-Path $cleanupFailureLive 'discord-bridge.mjs')) -ceq $cleanupOldHash) 'cleanup failure prevented the primary transaction rollback'
+    Assert-True (@(Get-ChildItem -LiteralPath $cleanupFailureLive -Directory -Force | Where-Object { $_.Name -like '.codex-discord-deploy.*.stage' }).Count -eq 1) 'primary failure cleanup did not retain its stage for safe retry'
+
+    $stageSwapSource = Join-Path $testRoot 'stage identity source'
+    Install-IsolatedDeploySource -Destination $stageSwapSource
+    $stageSwapLive = Join-Path $testRoot 'stage identity live'
+    $stageSwapDesktop = Join-Path $testRoot 'stage identity Desktop'
+    New-Item -ItemType Directory -Path $stageSwapLive,$stageSwapDesktop -Force | Out-Null
+    Write-TestBytes -Path (Join-Path $stageSwapLive 'sentinel.bin') -Bytes ([byte[]](17,18,19))
+    $stageSwapSentinelHash = Get-BytesHex -Path (Join-Path $stageSwapLive 'sentinel.bin')
+    $env:CODEX_DEPLOY_TEST_REPLACE_STAGE_AFTER_BUILD = '1'
+    $stageSwapError = $null
+    try { & $deployScript -SourceRoot $stageSwapSource -LiveRoot $stageSwapLive -DesktopPath $stageSwapDesktop -SkipLiveActions 3>&1 | Out-Null }
+    catch { $stageSwapError = $_.Exception.Message }
+    finally { Remove-Item Env:CODEX_DEPLOY_TEST_REPLACE_STAGE_AFTER_BUILD -ErrorAction SilentlyContinue }
+    Assert-True ($stageSwapError -match 'stage physical identity changed') 'deployment did not reject a stage replaced before backup and commit'
+    Assert-True ((Get-BytesHex -Path (Join-Path $stageSwapLive 'sentinel.bin')) -ceq $stageSwapSentinelHash) 'stage replacement rejection changed preexisting live bytes'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $stageSwapLive 'discord-bridge.mjs') -PathType Leaf)) 'stage replacement reached the file commit window'
+    Assert-True (@(Get-ChildItem -LiteralPath $stageSwapLive -Directory -Force | Where-Object { $_.Name -like '.codex-discord-deploy.*.stage' }).Count -eq 1) 'replacement stage was recursively deleted instead of retained'
+
+    $cleanupSwapSource = Join-Path $testRoot 'cleanup identity source'
+    Install-IsolatedDeploySource -Destination $cleanupSwapSource
+    $cleanupSwapLive = Join-Path $testRoot 'cleanup identity live'
+    $cleanupSwapDesktop = Join-Path $testRoot 'cleanup identity Desktop'
+    New-Item -ItemType Directory -Path $cleanupSwapLive,$cleanupSwapDesktop -Force | Out-Null
+    $cleanupSwapState = Join-Path $testRoot 'cleanup identity state.json'
+    $cleanupSwapActions = Join-Path $testRoot 'cleanup identity actions.txt'
+    $cleanupSwapGuardCount = Join-Path $testRoot 'cleanup identity guard count.txt'
+    [System.IO.File]::WriteAllText($cleanupSwapState, '{"taskInstalled":false,"taskRunning":false,"running":false,"autoStartEnabled":false,"mode":"unknown"}', [System.Text.UTF8Encoding]::new($false))
+    $env:CODEX_DEPLOY_TEST_STATE_PATH = $cleanupSwapState
+    $env:CODEX_DEPLOY_TEST_ACTION_PATH = $cleanupSwapActions
+    $env:CODEX_DEPLOY_TEST_REPLACE_STAGE_ON_FINAL_GUARD = '1'
+    $env:CODEX_DEPLOY_TEST_GUARD_COUNT_PATH = $cleanupSwapGuardCount
+    $cleanupSwapError = $null
+    $cleanupSwapOutput = [System.Collections.Generic.List[string]]::new()
+    try {
+        & $deployScript -SourceRoot $cleanupSwapSource -LiveRoot $cleanupSwapLive -DesktopPath $cleanupSwapDesktop 3>&1 |
+            ForEach-Object { $cleanupSwapOutput.Add([string]$_) }
+    }
+    catch { $cleanupSwapError = $_.Exception.Message }
+    finally {
+        Remove-Item Env:CODEX_DEPLOY_TEST_STATE_PATH -ErrorAction SilentlyContinue
+        Remove-Item Env:CODEX_DEPLOY_TEST_ACTION_PATH -ErrorAction SilentlyContinue
+        Remove-Item Env:CODEX_DEPLOY_TEST_REPLACE_STAGE_ON_FINAL_GUARD -ErrorAction SilentlyContinue
+        Remove-Item Env:CODEX_DEPLOY_TEST_GUARD_COUNT_PATH -ErrorAction SilentlyContinue
+    }
+    Assert-True ([string]::IsNullOrWhiteSpace($cleanupSwapError)) "replacement-stage cleanup falsely failed a committed deployment: $cleanupSwapError"
+    Assert-True (($cleanupSwapOutput -join "`n") -match 'deployment-stage-cleanup-failed') 'replacement-stage cleanup omitted its fixed warning'
+    $retainedReplacementStages = @(Get-ChildItem -LiteralPath $cleanupSwapLive -Directory -Force | Where-Object { $_.Name -like '.codex-discord-deploy.*.stage' })
+    Assert-True ($retainedReplacementStages.Count -eq 1) 'replacement stage was not retained for safe manual review'
+    Assert-True ((Get-Content -Raw -LiteralPath (Join-Path $retainedReplacementStages[0].FullName 'replacement-sentinel.txt')) -eq 'replacement-must-survive') 'cleanup recursively deleted or changed an untrusted replacement stage'
 
     $skipSource = Join-Path $testRoot 'instrumented source'
     Copy-DeploymentSource -Destination $skipSource
@@ -353,7 +713,9 @@ try {
     New-Item -ItemType Directory -Path $outsideControl -Force | Out-Null
     Copy-Item -LiteralPath (Join-Path $sourceRoot 'control-app\CodexDiscordControl.cs') -Destination (Join-Path $outsideControl 'CodexDiscordControl.cs')
     Remove-Item -LiteralPath (Join-Path $reparseSource 'control-app') -Recurse -Force
-    New-Item -ItemType Junction -Path (Join-Path $reparseSource 'control-app') -Target $outsideControl | Out-Null
+    $sourceChildJunction = Join-Path $reparseSource 'control-app'
+    New-Item -ItemType Junction -Path $sourceChildJunction -Target $outsideControl | Out-Null
+    $testJunctions.Add($sourceChildJunction)
     $reparseLive = Join-Path $testRoot 'reparse live'
     $reparseDesktop = Join-Path $testRoot 'reparse Desktop'
     New-Item -ItemType Directory -Path $reparseLive,$reparseDesktop -Force | Out-Null
@@ -369,7 +731,9 @@ try {
     $destinationJunctionDesktop = Join-Path $testRoot 'destination junction Desktop'
     $outsideDestination = Join-Path $testRoot 'outside destination'
     New-Item -ItemType Directory -Path $destinationJunctionLive,$destinationJunctionDesktop,$outsideDestination -Force | Out-Null
-    New-Item -ItemType Junction -Path (Join-Path $destinationJunctionLive 'control-app') -Target $outsideDestination | Out-Null
+    $destinationChildJunction = Join-Path $destinationJunctionLive 'control-app'
+    New-Item -ItemType Junction -Path $destinationChildJunction -Target $outsideDestination | Out-Null
+    $testJunctions.Add($destinationChildJunction)
     $destinationJunctionError = $null
     try { & $deployScript -SourceRoot $sourceRoot -LiveRoot $destinationJunctionLive -DesktopPath $destinationJunctionDesktop -SkipLiveActions | Out-Null }
     catch { $destinationJunctionError = $_.Exception.Message }
@@ -380,10 +744,123 @@ try {
     # bundle has no control entrypoint. All actions below are isolated fakes in temporary paths.
     $nonSkipSource = Join-Path $testRoot 'non skip isolated source'
     Install-IsolatedDeploySource -Destination $nonSkipSource
+
+    $guardCases = @(
+        [pscustomobject]@{Name='absent'; Initial=@{exists=$false;trusted=$true;enabled=$false;running=$false}; Expected=@('guard:status','probe:status','install:shortcut','register:new','probe:status','guard:status')},
+        [pscustomobject]@{Name='enabled running auto restart'; Initial=@{exists=$true;trusted=$true;enabled=$true;running=$true;autoRestartWhenEnabled=$true}; Expected=@('guard:status','guard:disable','guard:stop','guard:status','probe:status','install:shortcut','register:new','probe:status','guard:status','guard:enable','guard:start','guard:status')},
+        [pscustomobject]@{Name='enabled stopped'; Initial=@{exists=$true;trusted=$true;enabled=$true;running=$false}; Expected=@('guard:status','guard:disable','guard:stop','guard:status','probe:status','install:shortcut','register:new','probe:status','guard:status','guard:status','guard:enable','guard:status')},
+        [pscustomobject]@{Name='disabled running'; Initial=@{exists=$true;trusted=$true;enabled=$false;running=$true}; Expected=@('guard:status','guard:disable','guard:stop','guard:status','probe:status','install:shortcut','register:new','probe:status','guard:status','guard:enable','guard:start','guard:disable','guard:status')},
+        [pscustomobject]@{Name='disabled stopped'; Initial=@{exists=$true;trusted=$true;enabled=$false;running=$false}; Expected=@('guard:status','guard:disable','guard:stop','guard:status','probe:status','install:shortcut','register:new','probe:status','guard:status','guard:status')}
+    )
+    foreach ($case in $guardCases) {
+        $caseLive = Join-Path $testRoot ("guard $($case.Name) live")
+        $caseDesktop = Join-Path $testRoot ("guard $($case.Name) Desktop")
+        $caseState = Join-Path $testRoot ("guard $($case.Name) bridge.json")
+        $caseGuard = Join-Path $testRoot ("guard $($case.Name) state.json")
+        $caseActions = Join-Path $testRoot ("guard $($case.Name) actions.txt")
+        New-Item -ItemType Directory -Path $caseLive,$caseDesktop -Force | Out-Null
+        [System.IO.File]::WriteAllText($caseState, '{"taskInstalled":true,"taskRunning":false,"running":false,"autoStartEnabled":false,"mode":"unknown"}', [System.Text.UTF8Encoding]::new($false))
+        [System.IO.File]::WriteAllText($caseGuard, ($case.Initial | ConvertTo-Json -Compress), [System.Text.UTF8Encoding]::new($false))
+        $env:CODEX_DEPLOY_TEST_STATE_PATH = $caseState
+        $env:CODEX_DEPLOY_TEST_GUARD_STATE_PATH = $caseGuard
+        $env:CODEX_DEPLOY_TEST_ACTION_PATH = $caseActions
+        try { & $deployScript -SourceRoot $nonSkipSource -LiveRoot $caseLive -DesktopPath $caseDesktop | Out-Null }
+        finally {
+            Remove-Item Env:CODEX_DEPLOY_TEST_STATE_PATH -ErrorAction SilentlyContinue
+            Remove-Item Env:CODEX_DEPLOY_TEST_GUARD_STATE_PATH -ErrorAction SilentlyContinue
+            Remove-Item Env:CODEX_DEPLOY_TEST_ACTION_PATH -ErrorAction SilentlyContinue
+        }
+        $caseFinal = Get-Content -Raw -LiteralPath $caseGuard | ConvertFrom-Json
+        Assert-True (
+            $caseFinal.exists -eq $case.Initial.exists -and $caseFinal.trusted -eq $case.Initial.trusted -and
+            $caseFinal.enabled -eq $case.Initial.enabled -and $caseFinal.running -eq $case.Initial.running
+        ) "guard $($case.Name) did not preserve exact existence/enabled/running state"
+        Assert-True ((@(Get-Content -LiteralPath $caseActions) -join ',') -eq ($case.Expected -join ',')) "guard $($case.Name) was not stopped first and restored last"
+    }
+
+    $untrustedGuardLive = Join-Path $testRoot 'untrusted guard live'
+    $untrustedGuardDesktop = Join-Path $testRoot 'untrusted guard Desktop'
+    $untrustedGuardState = Join-Path $testRoot 'untrusted guard bridge.json'
+    $untrustedGuardTask = Join-Path $testRoot 'untrusted guard state.json'
+    $untrustedGuardActions = Join-Path $testRoot 'untrusted guard actions.txt'
+    New-Item -ItemType Directory -Path $untrustedGuardLive,$untrustedGuardDesktop -Force | Out-Null
+    Write-TestBytes -Path (Join-Path $untrustedGuardLive 'sentinel.bin') -Bytes ([byte[]](2,7,1,8))
+    [System.IO.File]::WriteAllText($untrustedGuardState, '{"taskInstalled":true,"taskRunning":false,"running":false,"autoStartEnabled":false,"mode":"unknown"}', [System.Text.UTF8Encoding]::new($false))
+    [System.IO.File]::WriteAllText($untrustedGuardTask, '{"exists":true,"trusted":false,"enabled":true,"running":true}', [System.Text.UTF8Encoding]::new($false))
+    $env:CODEX_DEPLOY_TEST_STATE_PATH = $untrustedGuardState
+    $env:CODEX_DEPLOY_TEST_GUARD_STATE_PATH = $untrustedGuardTask
+    $env:CODEX_DEPLOY_TEST_ACTION_PATH = $untrustedGuardActions
+    $untrustedGuardError = $null
+    try { & $deployScript -SourceRoot $nonSkipSource -LiveRoot $untrustedGuardLive -DesktopPath $untrustedGuardDesktop | Out-Null }
+    catch { $untrustedGuardError = $_.Exception.Message }
+    finally {
+        Remove-Item Env:CODEX_DEPLOY_TEST_STATE_PATH -ErrorAction SilentlyContinue
+        Remove-Item Env:CODEX_DEPLOY_TEST_GUARD_STATE_PATH -ErrorAction SilentlyContinue
+        Remove-Item Env:CODEX_DEPLOY_TEST_ACTION_PATH -ErrorAction SilentlyContinue
+    }
+    Assert-True ($untrustedGuardError -eq 'notification guard identity is untrusted') 'deployment accepted or leaked details for an untrusted notification guard task'
+    Assert-True ((@(Get-ChildItem -LiteralPath $untrustedGuardLive -Force).Name -join ',') -eq 'sentinel.bin') 'untrusted guard rejection wrote into LiveRoot before failing'
+    Assert-True (@(Get-ChildItem -LiteralPath $untrustedGuardDesktop -Force).Count -eq 0) 'untrusted guard rejection changed DesktopPath'
+
+    $mutatedGuardLive = Join-Path $testRoot 'mutated guard definition live'
+    $mutatedGuardDesktop = Join-Path $testRoot 'mutated guard definition Desktop'
+    $mutatedGuardBridge = Join-Path $testRoot 'mutated guard definition bridge.json'
+    $mutatedGuardTask = Join-Path $testRoot 'mutated guard definition task.json'
+    $mutatedGuardActions = Join-Path $testRoot 'mutated guard definition actions.txt'
+    New-Item -ItemType Directory -Path $mutatedGuardLive,$mutatedGuardDesktop -Force | Out-Null
+    Write-TestBytes -Path (Join-Path $mutatedGuardLive 'sentinel.bin') -Bytes ([byte[]](4,2,4,2))
+    [System.IO.File]::WriteAllText($mutatedGuardBridge, '{"taskInstalled":true,"taskRunning":false,"running":false,"autoStartEnabled":false,"mode":"unknown"}', [System.Text.UTF8Encoding]::new($false))
+    [System.IO.File]::WriteAllText($mutatedGuardTask, '{"exists":true,"trusted":true,"enabled":true,"running":true,"definitionHash":"isolated-guard-definition-v1"}', [System.Text.UTF8Encoding]::new($false))
+    $env:CODEX_DEPLOY_TEST_STATE_PATH = $mutatedGuardBridge
+    $env:CODEX_DEPLOY_TEST_GUARD_STATE_PATH = $mutatedGuardTask
+    $env:CODEX_DEPLOY_TEST_ACTION_PATH = $mutatedGuardActions
+    $env:CODEX_DEPLOY_TEST_GUARD_MUTATE_DEFINITION_ON_DISABLE = '1'
+    $mutatedGuardError = $null
+    try { & $deployScript -SourceRoot $nonSkipSource -LiveRoot $mutatedGuardLive -DesktopPath $mutatedGuardDesktop | Out-Null }
+    catch { $mutatedGuardError = $_.Exception.Message }
+    finally {
+        Remove-Item Env:CODEX_DEPLOY_TEST_STATE_PATH -ErrorAction SilentlyContinue
+        Remove-Item Env:CODEX_DEPLOY_TEST_GUARD_STATE_PATH -ErrorAction SilentlyContinue
+        Remove-Item Env:CODEX_DEPLOY_TEST_ACTION_PATH -ErrorAction SilentlyContinue
+        Remove-Item Env:CODEX_DEPLOY_TEST_GUARD_MUTATE_DEFINITION_ON_DISABLE -ErrorAction SilentlyContinue
+    }
+    Assert-True (-not [string]::IsNullOrWhiteSpace($mutatedGuardError)) 'deployment ignored a Guard definition change during freeze'
+    Assert-True ((@(Get-ChildItem -LiteralPath $mutatedGuardLive -Force).Name -join ',') -eq 'sentinel.bin') 'Guard definition change reached a LiveRoot write'
+
+    $partialGuardLive = Join-Path $testRoot 'partial guard stop live'
+    $partialGuardDesktop = Join-Path $testRoot 'partial guard stop Desktop'
+    $partialGuardState = Join-Path $testRoot 'partial guard bridge.json'
+    $partialGuardTask = Join-Path $testRoot 'partial guard state.json'
+    $partialGuardActions = Join-Path $testRoot 'partial guard actions.txt'
+    New-Item -ItemType Directory -Path $partialGuardLive,$partialGuardDesktop -Force | Out-Null
+    Write-TestBytes -Path (Join-Path $partialGuardLive 'sentinel.bin') -Bytes ([byte[]](3,1,4,1,5))
+    [System.IO.File]::WriteAllText($partialGuardState, '{"taskInstalled":true,"taskRunning":false,"running":false,"autoStartEnabled":false,"mode":"unknown"}', [System.Text.UTF8Encoding]::new($false))
+    [System.IO.File]::WriteAllText($partialGuardTask, '{"exists":true,"trusted":true,"enabled":true,"running":true}', [System.Text.UTF8Encoding]::new($false))
+    $env:CODEX_DEPLOY_TEST_STATE_PATH = $partialGuardState
+    $env:CODEX_DEPLOY_TEST_GUARD_STATE_PATH = $partialGuardTask
+    $env:CODEX_DEPLOY_TEST_ACTION_PATH = $partialGuardActions
+    $env:CODEX_DEPLOY_TEST_GUARD_ACTION_FAIL_AFTER = 'stop'
+    $partialGuardError = $null
+    try { & $deployScript -SourceRoot $nonSkipSource -LiveRoot $partialGuardLive -DesktopPath $partialGuardDesktop | Out-Null }
+    catch { $partialGuardError = $_.Exception.Message }
+    finally {
+        Remove-Item Env:CODEX_DEPLOY_TEST_STATE_PATH -ErrorAction SilentlyContinue
+        Remove-Item Env:CODEX_DEPLOY_TEST_GUARD_STATE_PATH -ErrorAction SilentlyContinue
+        Remove-Item Env:CODEX_DEPLOY_TEST_ACTION_PATH -ErrorAction SilentlyContinue
+        Remove-Item Env:CODEX_DEPLOY_TEST_GUARD_ACTION_FAIL_AFTER -ErrorAction SilentlyContinue
+    }
+    $partialGuardFinal = Get-Content -Raw -LiteralPath $partialGuardTask | ConvertFrom-Json
+    Assert-True ($partialGuardError -eq 'service probe failed: guard-stop') 'partial guard stop replaced or hid its primary failure'
+    Assert-True ($partialGuardFinal.exists -and $partialGuardFinal.enabled -and $partialGuardFinal.running) 'partial guard stop failure did not restore the exact prior guard state'
+    Assert-True ((@(Get-ChildItem -LiteralPath $partialGuardLive -Force).Name -join ',') -eq 'sentinel.bin') 'partial guard stop wrote LiveRoot before confirmed guard suspension'
+    Assert-True ((@(Get-Content -LiteralPath $partialGuardActions) -join ',') -eq 'guard:status,guard:disable,guard:stop,guard:status,guard:enable,guard:start,guard:status') 'partial guard stop recovery did not restore the guard last'
+
     $serviceCases = @(
-        [pscustomobject]@{ Name='scheduled'; Initial=@{taskInstalled=$true;autoStartEnabled=$true;taskRunning=$true;running=$true;mode='scheduled'}; Expected=@('probe:status','probe:stop-temporary','install:shortcut','register:new','control:new:enable-long-term'); Running=$true; AutoStart=$true; Mode='scheduled' },
-        [pscustomobject]@{ Name='disabled'; Initial=@{taskInstalled=$true;autoStartEnabled=$false;taskRunning=$false;running=$false;mode='unknown'}; Expected=@('probe:status','install:shortcut','register:new'); Running=$false; AutoStart=$false; Mode='unknown' },
-        [pscustomobject]@{ Name='temporary'; Initial=@{taskInstalled=$true;autoStartEnabled=$false;taskRunning=$false;running=$true;mode='temporary'}; Expected=@('probe:status','probe:stop-temporary','install:shortcut','register:new','control:new:start-temporary'); Running=$true; AutoStart=$false; Mode='temporary' }
+        [pscustomobject]@{ Name='scheduled'; Initial=@{taskInstalled=$true;autoStartEnabled=$true;taskRunning=$true;running=$true;mode='scheduled'}; Expected=@('probe:status','probe:stop-temporary','install:shortcut','register:new','control:new:enable-long-term','probe:status'); Installed=$true; TaskRunning=$true; Running=$true; AutoStart=$true; Mode='scheduled' },
+        [pscustomobject]@{ Name='enabled stopped'; Initial=@{taskInstalled=$true;autoStartEnabled=$true;taskRunning=$false;running=$false;mode='unknown'}; Expected=@('probe:status','install:shortcut','register:new','control:new:enable-long-term','control:new:stop-temporary','probe:status'); Installed=$true; TaskRunning=$false; Running=$false; AutoStart=$true; Mode='unknown' },
+        [pscustomobject]@{ Name='disabled'; Initial=@{taskInstalled=$true;autoStartEnabled=$false;taskRunning=$false;running=$false;mode='unknown'}; Expected=@('probe:status','install:shortcut','register:new','probe:status'); Installed=$true; TaskRunning=$false; Running=$false; AutoStart=$false; Mode='unknown' },
+        [pscustomobject]@{ Name='temporary'; Initial=@{taskInstalled=$true;autoStartEnabled=$false;taskRunning=$false;running=$true;mode='temporary'}; Expected=@('probe:status','probe:stop-temporary','install:shortcut','register:new','control:new:start-temporary','probe:status'); Installed=$true; TaskRunning=$false; Running=$true; AutoStart=$false; Mode='temporary' },
+        [pscustomobject]@{ Name='no task'; Initial=@{taskInstalled=$false;autoStartEnabled=$false;taskRunning=$false;running=$false;mode='unknown'}; Expected=@('probe:status','install:shortcut','register:new','probe:status'); Installed=$false; TaskRunning=$false; Running=$false; AutoStart=$false; Mode='unknown' }
     )
     foreach ($case in $serviceCases) {
         $caseLive = Join-Path $testRoot ("non skip $($case.Name) live")
@@ -399,9 +876,16 @@ try {
             Remove-Item Env:CODEX_DEPLOY_TEST_STATE_PATH -ErrorAction SilentlyContinue
             Remove-Item Env:CODEX_DEPLOY_TEST_ACTION_PATH -ErrorAction SilentlyContinue
         }
-        Assert-True ((@(Get-Content -LiteralPath $caseActions) -join ',') -eq ($case.Expected -join ',')) "non-Skip $($case.Name) did not preserve the exact service action sequence"
+        $expectedServiceActions = @('guard:status') + @($case.Expected) + @('guard:status')
+        Assert-True ((@(Get-Content -LiteralPath $caseActions) -join ',') -eq ($expectedServiceActions -join ',')) "non-Skip $($case.Name) did not preserve the exact service action sequence"
         $caseFinal = Get-Content -Raw -LiteralPath $caseState | ConvertFrom-Json
-        Assert-True ($caseFinal.running -eq $case.Running -and $caseFinal.autoStartEnabled -eq $case.AutoStart -and $caseFinal.mode -eq $case.Mode) "non-Skip $($case.Name) changed the requested long-term/runtime state"
+        Assert-True (
+            $caseFinal.taskInstalled -eq $case.Installed -and
+            $caseFinal.taskRunning -eq $case.TaskRunning -and
+            $caseFinal.running -eq $case.Running -and
+            $caseFinal.autoStartEnabled -eq $case.AutoStart -and
+            $caseFinal.mode -eq $case.Mode
+        ) "non-Skip $($case.Name) changed the exact installed/enabled/running/owner state"
         Assert-True (Test-Path -LiteralPath (Join-Path $caseDesktop 'Codex Discord 控制台.lnk') -PathType Leaf) "non-Skip $($case.Name) did not install the isolated shortcut"
     }
 
@@ -455,6 +939,38 @@ try {
     Assert-True ((Get-BytesHex -Path (Join-Path $registrationFailureLive 'discord-bridge.mjs')) -ceq $registrationOldBridge) 'ambiguous registration failure did not restore the old bridge file'
     Assert-True ((@(Get-Content -LiteralPath $registrationFailureActions | Where-Object { $_ -like 'register:*' }) -join ',') -eq 'register:new,register:old') 'ambiguous registration failure did not compensate with the restored Guild commands'
 
+    $shortcutCasLive = Join-Path $testRoot 'shortcut rollback CAS live'
+    $shortcutCasDesktop = Join-Path $testRoot 'shortcut rollback CAS Desktop'
+    $shortcutCasState = Join-Path $testRoot 'shortcut rollback CAS state.json'
+    $shortcutCasActions = Join-Path $testRoot 'shortcut rollback CAS actions.txt'
+    New-Item -ItemType Directory -Path $shortcutCasLive,$shortcutCasDesktop -Force | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $shortcutCasLive 'codex-control.ps1'), (Get-IsolatedControlScript -Role old), [System.Text.UTF8Encoding]::new($false))
+    [System.IO.File]::WriteAllText((Join-Path $shortcutCasLive 'discord-bridge.mjs'), (Get-IsolatedBridgeScript -Role old), [System.Text.UTF8Encoding]::new($false))
+    Write-TestBytes -Path (Join-Path $shortcutCasDesktop 'Codex Discord 控制台.lnk') -Bytes ([byte[]](71,72,73,74))
+    [System.IO.File]::WriteAllText($shortcutCasState, '{"taskInstalled":true,"taskRunning":false,"running":false,"autoStartEnabled":false,"mode":"unknown"}', [System.Text.UTF8Encoding]::new($false))
+    $shortcutCasThirdParty = [byte[]](240,13,202,254)
+    $shortcutCasChanged = $false
+    $shortcutCasHook = {
+        param($record)
+        if (-not $shortcutCasChanged) {
+            $shortcutCasChanged = $true
+            Write-TestBytes -Path $record.DestinationPath -Bytes $shortcutCasThirdParty
+        }
+    }.GetNewClosure()
+    $env:CODEX_DEPLOY_TEST_STATE_PATH = $shortcutCasState
+    $env:CODEX_DEPLOY_TEST_ACTION_PATH = $shortcutCasActions
+    $env:CODEX_DEPLOY_TEST_FAIL_REGISTRATION = 'new'
+    $shortcutCasError = $null
+    try { & $deployScript -SourceRoot $nonSkipSource -LiveRoot $shortcutCasLive -DesktopPath $shortcutCasDesktop -TestHooks @{BetweenShortcutRollbackPrecheckAndReplace=$shortcutCasHook} 3>&1 | Out-Null }
+    catch { $shortcutCasError = $_.Exception.Message }
+    finally {
+        Remove-Item Env:CODEX_DEPLOY_TEST_STATE_PATH -ErrorAction SilentlyContinue
+        Remove-Item Env:CODEX_DEPLOY_TEST_ACTION_PATH -ErrorAction SilentlyContinue
+        Remove-Item Env:CODEX_DEPLOY_TEST_FAIL_REGISTRATION -ErrorAction SilentlyContinue
+    }
+    Assert-True ($shortcutCasError -match 'rollback is incomplete') 'shortcut rollback CAS race did not report incomplete rollback'
+    Assert-True ((Get-BytesHex -Path (Join-Path $shortcutCasDesktop 'Codex Discord 控制台.lnk')) -ceq [Convert]::ToHexString($shortcutCasThirdParty)) 'shortcut rollback CAS race overwrote concurrent bytes'
+
     # A service action can start the new bridge and then report failure. The new runtime must be
     # stopped while the new files still exist, before local files and the old service are restored.
     $serviceMutationLive = Join-Path $testRoot 'service post mutation live'
@@ -477,7 +993,7 @@ try {
         Remove-Item Env:CODEX_DEPLOY_TEST_FAIL_ACTION_AFTER_MUTATION -ErrorAction SilentlyContinue
     }
     Assert-True ($serviceMutationError -eq 'control action failed: enable-long-term') 'deployment hid the post-mutation service failure'
-    Assert-True ((@(Get-Content -LiteralPath $serviceMutationActions) -join ',') -eq 'probe:status,probe:stop-temporary,install:shortcut,register:new,control:new:enable-long-term,probe:stop-temporary,register:old,control:old:enable-long-term') 'post-mutation service rollback replaced files before stopping the new runtime'
+    Assert-True ((@(Get-Content -LiteralPath $serviceMutationActions) -join ',') -eq 'guard:status,probe:status,probe:stop-temporary,install:shortcut,register:new,control:new:enable-long-term,probe:stop-temporary,register:old,control:old:enable-long-term,probe:status,guard:status') 'post-mutation service rollback replaced files before stopping the new runtime'
     $serviceMutationFinal = Get-Content -Raw -LiteralPath $serviceMutationState | ConvertFrom-Json
     Assert-True ($serviceMutationFinal.running -eq $true -and $serviceMutationFinal.autoStartEnabled -eq $true -and $serviceMutationFinal.mode -eq 'scheduled') 'post-mutation service rollback did not restore the prior state'
 
@@ -505,7 +1021,7 @@ try {
     Assert-True ($partialStopError -eq 'service probe failed: stop-temporary') 'deployment hid or replaced the trusted partial-stop failure'
     $restoredPartialStopState = Get-Content -Raw -LiteralPath $partialStopState | ConvertFrom-Json
     Assert-True ($restoredPartialStopState.running -eq $true -and $restoredPartialStopState.autoStartEnabled -eq $true) 'failed partial stop did not restore the prior running/long-term state'
-    Assert-True ((@(Get-Content -LiteralPath $partialStopActions) -join ',') -eq 'probe:status,probe:stop-temporary,probe:status,probe:enable-long-term') 'first-upgrade partial-stop recovery did not use the staged trusted probe'
+    Assert-True ((@(Get-Content -LiteralPath $partialStopActions) -join ',') -eq 'guard:status,probe:status,probe:stop-temporary,probe:status,probe:enable-long-term,probe:status,guard:status') 'first-upgrade partial-stop recovery did not use the staged trusted probe'
 
     # If a later service restore fails after new Guild commands were registered, both the local
     # bundle and the remote command set must return to their old versions.
@@ -546,12 +1062,94 @@ try {
     $externalActions = @(Get-Content -LiteralPath $externalRollbackActions)
     Assert-True ((@($externalActions | Where-Object { $_ -like 'register:*' }) -join ',') -eq 'register:new,register:old') 'external rollback did not restore the old Discord Guild commands'
 
+    foreach ($registrationMode in @('hang-new','huge-stdout-new','huge-stderr-new','slow-retry-new')) {
+        $boundedSource = Join-Path $testRoot ("bounded $registrationMode source")
+        Install-IsolatedDeploySource -Destination $boundedSource
+        $boundedLive = Join-Path $testRoot ("bounded $registrationMode live")
+        $boundedDesktop = Join-Path $testRoot ("bounded $registrationMode Desktop")
+        New-Item -ItemType Directory -Path $boundedLive,$boundedDesktop -Force | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $boundedLive 'codex-control.ps1'), (Get-IsolatedControlScript -Role old), [System.Text.UTF8Encoding]::new($false))
+        [System.IO.File]::WriteAllText((Join-Path $boundedLive 'discord-bridge.mjs'), (Get-IsolatedBridgeScript -Role old), [System.Text.UTF8Encoding]::new($false))
+        Write-TestBytes -Path (Join-Path $boundedLive 'CodexDiscordControl.exe') -Bytes ([byte[]](31,41,59,26))
+        Write-TestBytes -Path (Join-Path $boundedDesktop 'Codex Discord 控制台.lnk') -Bytes ([byte[]](53,58,97,93))
+        $boundedOldControl = Get-BytesHex -Path (Join-Path $boundedLive 'codex-control.ps1')
+        $boundedOldBridge = Get-BytesHex -Path (Join-Path $boundedLive 'discord-bridge.mjs')
+        $boundedOldExe = Get-BytesHex -Path (Join-Path $boundedLive 'CodexDiscordControl.exe')
+        $boundedOldShortcut = Get-BytesHex -Path (Join-Path $boundedDesktop 'Codex Discord 控制台.lnk')
+        $boundedState = Join-Path $testRoot ("bounded $registrationMode state.json")
+        $boundedActions = Join-Path $testRoot ("bounded $registrationMode actions.txt")
+        $boundedRemote = Join-Path $testRoot ("bounded $registrationMode remote.txt")
+        $boundedPids = Join-Path $testRoot ("bounded $registrationMode pids.txt")
+        [System.IO.File]::WriteAllText($boundedState, '{"taskInstalled":true,"taskRunning":true,"running":true,"autoStartEnabled":true,"mode":"scheduled"}', [System.Text.UTF8Encoding]::new($false))
+        $secretSentinel = 'DO-NOT-LEAK-REGISTRATION-OUTPUT'
+        $env:CODEX_DEPLOY_TEST_STATE_PATH = $boundedState
+        $env:CODEX_DEPLOY_TEST_ACTION_PATH = $boundedActions
+        $env:CODEX_DEPLOY_TEST_REMOTE_PATH = $boundedRemote
+        $env:CODEX_DEPLOY_TEST_PID_PATH = $boundedPids
+        $env:CODEX_DEPLOY_TEST_REGISTRATION_MODE = $registrationMode
+        $env:CODEX_DEPLOY_TEST_OUTPUT_SENTINEL = $secretSentinel
+        $boundedError = $null
+        $boundedText = [System.Collections.Generic.List[string]]::new()
+        $clock = [System.Diagnostics.Stopwatch]::StartNew()
+        try {
+            & $deployScript -SourceRoot $boundedSource -LiveRoot $boundedLive -DesktopPath $boundedDesktop -RegistrationDeadlineMilliseconds 1400 -RegistrationOutputLimitBytes 4096 2>&1 |
+                ForEach-Object { $boundedText.Add([string]$_) }
+        }
+        catch {
+            $boundedError = $_.Exception.Message
+            $boundedText.Add($boundedError)
+        }
+        finally {
+            $clock.Stop()
+            Remove-Item Env:CODEX_DEPLOY_TEST_STATE_PATH -ErrorAction SilentlyContinue
+            Remove-Item Env:CODEX_DEPLOY_TEST_ACTION_PATH -ErrorAction SilentlyContinue
+            Remove-Item Env:CODEX_DEPLOY_TEST_REMOTE_PATH -ErrorAction SilentlyContinue
+            Remove-Item Env:CODEX_DEPLOY_TEST_PID_PATH -ErrorAction SilentlyContinue
+            Remove-Item Env:CODEX_DEPLOY_TEST_REGISTRATION_MODE -ErrorAction SilentlyContinue
+            Remove-Item Env:CODEX_DEPLOY_TEST_OUTPUT_SENTINEL -ErrorAction SilentlyContinue
+        }
+        Assert-True ($boundedError -eq 'Discord command registration failed') "bounded $registrationMode registration did not preserve the fixed primary error"
+        # Registration itself is capped at 1.4s; the larger outer bound also includes the
+        # intentionally separate old-command, bridge, shortcut, file, and Guard compensations.
+        Assert-True ($clock.ElapsedMilliseconds -lt 30000) "bounded $registrationMode registration plus full recovery exceeded its outer bound ($($clock.ElapsedMilliseconds)ms)"
+        Assert-True (-not (($boundedText -join "`n").Contains($secretSentinel))) "bounded $registrationMode registration leaked child output"
+        Assert-True ((Get-Content -Raw -LiteralPath $boundedRemote) -eq 'old') "bounded $registrationMode rollback did not restore remote Guild commands"
+        $boundedRegistrationActions = @(Get-Content -LiteralPath $boundedActions | Where-Object { $_ -like 'register:*' })
+        $expectedRegistrationActions = if ($registrationMode -eq 'slow-retry-new') {
+            'register:new,register:synthetic-429-long-retry,register:old'
+        } else { 'register:new,register:old' }
+        Assert-True (($boundedRegistrationActions -join ',') -eq $expectedRegistrationActions) "bounded $registrationMode rollback did not compensate a possibly-effective registration"
+        Assert-True ((Get-BytesHex -Path (Join-Path $boundedLive 'codex-control.ps1')) -ceq $boundedOldControl) "bounded $registrationMode rollback changed the old control"
+        Assert-True ((Get-BytesHex -Path (Join-Path $boundedLive 'discord-bridge.mjs')) -ceq $boundedOldBridge) "bounded $registrationMode rollback changed the old bridge"
+        Assert-True ((Get-BytesHex -Path (Join-Path $boundedLive 'CodexDiscordControl.exe')) -ceq $boundedOldExe) "bounded $registrationMode rollback changed the old executable"
+        Assert-True ((Get-BytesHex -Path (Join-Path $boundedDesktop 'Codex Discord 控制台.lnk')) -ceq $boundedOldShortcut) "bounded $registrationMode rollback changed the old shortcut"
+        $boundedFinalState = Get-Content -Raw -LiteralPath $boundedState | ConvertFrom-Json
+        Assert-True ($boundedFinalState.running -eq $true -and $boundedFinalState.autoStartEnabled -eq $true -and $boundedFinalState.mode -eq 'scheduled') "bounded $registrationMode rollback changed bridge ownership"
+        Assert-True (@(Get-ChildItem -LiteralPath $boundedLive -Directory -Force | Where-Object { $_.Name -like '.codex-discord-deploy.*.stage' }).Count -eq 0) "bounded $registrationMode rollback left a deployment stage"
+        if ($registrationMode -eq 'hang-new') {
+            Assert-True (Test-Path -LiteralPath $boundedPids -PathType Leaf) 'bounded registration did not prove its process tree was created'
+            $boundedProcessIds = @(Get-Content -LiteralPath $boundedPids)
+            Assert-True ($boundedProcessIds.Count -eq 2) 'bounded registration did not record exactly one parent and one descendant'
+            foreach ($pidText in $boundedProcessIds) {
+                $processId = 0
+                Assert-True ([int]::TryParse($pidText, [ref]$processId)) 'bounded registration recorded an invalid process id'
+                Assert-True ($null -eq (Get-Process -Id $processId -ErrorAction SilentlyContinue)) 'bounded registration left a process-tree member alive'
+            }
+        }
+    }
+
     $deployText = Get-Content -Raw -LiteralPath $deployScript
+    $probeText = Get-Content -Raw -LiteralPath (Join-Path $sourceRoot 'deploy-live-probe.ps1')
     Assert-True ($deployText -notmatch '(?i)Invoke-Expression|cmd(?:\.exe)?\s+/c|powershell(?:\.exe)?\s+-Command') 'deployment constructs or invokes shell text'
+    Assert-True ($deployText -match 'ProcessStartInfo' -and $deployText -match 'ArgumentList\.Add') 'Discord registration is not launched with bounded exact argv process control'
+    Assert-True ($deployText -match 'RegistrationDeadlineMilliseconds' -and $deployText -match 'RegistrationOutputLimitBytes') 'Discord registration has no explicit deadline or output cap'
+    Assert-True ($deployText -match 'TerminateJobObject|Kill\(\$true\)') 'Discord registration cannot terminate a hung process tree'
+    Assert-True ($deployText -notmatch '(?m)^\s*&\s+\$NodePath\s+\$BridgePath') 'Discord registration still invokes an unbounded synchronous child process'
     Assert-True ($deployText -notmatch '(?m)^\s*&\s*\(Join-Path\s+\$live\s+''install-discord-bridge-task\.ps1''\)') 'deployment unconditionally installs and enables a missing scheduled task'
     Assert-True ($deployText -notmatch '-Action\s+\S*stop-codex') 'deployment can terminate Codex desktop instead of only the bridge'
     Assert-True ($deployText -match 'GetFileHash|Get-FileHash') 'deployment does not hash-verify its complete stage'
-    Assert-True ($deployText -match '\$operations\[[''"]InstallTask[''"]\]\s*=\s*\{\s*throw') 'staged recovery probe can install a scheduled task that points into its temporary stage'
+    Assert-True ($deployText -match '\$stageIdentity\s*=\s*Resolve-DeployDirectory' -and $deployText -match 'Assert-DeployStageIdentity') 'deployment does not pin and revalidate the physical stage identity'
+    Assert-True ($probeText -match '\$operations\[[''"]InstallTask[''"]\]\s*=\s*\{\s*throw') 'staged recovery probe can install a scheduled task that points into its temporary stage'
     Assert-True ($deployText -match 'ForbiddenDeployNames\s+-contains\s+\[System\.IO\.Path\]::GetFileName') 'forbidden allowlist check is not Windows case-insensitive by leaf name'
     $allowlistMatch = [regex]::Match($deployText, '(?s)\$script:DeployFileAllowlist\s*=\s*@\((.*?)\)')
     Assert-True $allowlistMatch.Success 'deployment does not expose one fixed internal file allowlist'
@@ -572,6 +1170,16 @@ try {
     Write-Output 'PASS: safe allowlisted deployment, rollback, and recovery documentation'
 }
 finally {
+    for ($junctionIndex = $testJunctions.Count - 1; $junctionIndex -ge 0; $junctionIndex--) {
+        $junction = $testJunctions[$junctionIndex]
+        if (-not (Test-Path -LiteralPath $junction)) { continue }
+        $junctionPath = [System.IO.Path]::GetFullPath($junction)
+        $validatedTestRoot = [System.IO.Path]::GetFullPath($testRoot).TrimEnd([System.IO.Path]::DirectorySeparatorChar) + [System.IO.Path]::DirectorySeparatorChar
+        if (-not $junctionPath.StartsWith($validatedTestRoot, [System.StringComparison]::OrdinalIgnoreCase)) { throw 'refusing unsafe junction cleanup' }
+        $junctionItem = Get-Item -LiteralPath $junction -Force
+        if (($junctionItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -eq 0) { throw 'refusing to delete a non-junction as a junction' }
+        Remove-Item -LiteralPath $junction -Force -ErrorAction SilentlyContinue
+    }
     if (Test-Path -LiteralPath $testRoot) {
         $resolved = [System.IO.Path]::GetFullPath($testRoot)
         $temp = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath())

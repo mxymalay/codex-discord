@@ -327,7 +327,7 @@ function New-CodexControlOperations {
         GetTask = {
             $task = Get-ScheduledTask -TaskName 'Codex Discord Bridge' -ErrorAction SilentlyContinue
             if ($null -eq $task) { return [pscustomobject]@{ installed=$false; enabled=$false; running=$false } }
-            $enabled = $true
+            $enabled = -not ([string]$task.State).Equals('Disabled', [System.StringComparison]::OrdinalIgnoreCase)
             if ($null -ne $task.Settings -and $null -ne $task.Settings.PSObject.Properties['Enabled']) {
                 $enabled = [bool]$task.Settings.Enabled
             }
@@ -341,6 +341,36 @@ function New-CodexControlOperations {
         DisableTask = { Disable-ScheduledTask -TaskName 'Codex Discord Bridge' -ErrorAction Stop | Out-Null }
         StartTask = { Start-ScheduledTask -TaskName 'Codex Discord Bridge' -ErrorAction Stop }
         StopTask = { Stop-ScheduledTask -TaskName 'Codex Discord Bridge' -ErrorAction Stop }
+        GetNotificationGuardTask = {
+            $tasks = @(Get-ScheduledTask -TaskPath '\' -TaskName 'Codex ntfy Notification Guard' -ErrorAction SilentlyContinue)
+            if ($tasks.Count -eq 0) { return $null }
+            if ($tasks.Count -ne 1) { throw 'notification guard task identity is ambiguous' }
+            $task = $tasks[0]
+            $enabled = -not ([string]$task.State).Equals('Disabled', [System.StringComparison]::OrdinalIgnoreCase)
+            if ($null -ne $task.Settings -and $null -ne $task.Settings.PSObject.Properties['Enabled']) {
+                $enabled = [bool]$task.Settings.Enabled
+            }
+            [pscustomobject]@{
+                enabled = $enabled
+                running = ($task.State -eq 'Running')
+                actions = @($task.Actions)
+                taskPath = [string]$task.TaskPath
+                taskName = [string]$task.TaskName
+                principal = $task.Principal
+                triggers = @($task.Triggers)
+                settings = $task.Settings
+                definitionXml = Export-ScheduledTask -TaskPath '\' -TaskName 'Codex ntfy Notification Guard' -ErrorAction Stop
+            }
+        }
+        GetPowerShellPath = { (Get-Command pwsh.exe -ErrorAction Stop).Source }
+        GetCurrentUserIdentity = {
+            $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+            [pscustomobject]@{ Name=$identity.Name; Sid=$identity.User.Value }
+        }
+        StopNotificationGuardTask = { Stop-ScheduledTask -TaskPath '\' -TaskName 'Codex ntfy Notification Guard' -ErrorAction Stop }
+        StartNotificationGuardTask = { Start-ScheduledTask -TaskPath '\' -TaskName 'Codex ntfy Notification Guard' -ErrorAction Stop }
+        EnableNotificationGuardTask = { Enable-ScheduledTask -TaskPath '\' -TaskName 'Codex ntfy Notification Guard' -ErrorAction Stop | Out-Null }
+        DisableNotificationGuardTask = { Disable-ScheduledTask -TaskPath '\' -TaskName 'Codex ntfy Notification Guard' -ErrorAction Stop | Out-Null }
         StartDetached = {
             param([Parameter(Mandatory)][string]$StartupPath, [Parameter(Mandatory)][ValidateSet('temporary')][string]$Mode)
             $powerShellPath = (Get-Command pwsh -ErrorAction Stop).Source
@@ -390,6 +420,250 @@ function New-CodexControlOperations {
         TerminateBridgeJob = { param($Job) if(-not [CodexBridgeJobNative]::TerminateJobObject($Job.Handle,1)){throw 'bridge-job-terminate-failed'} }
         GetBridgeJobActiveProcesses = { param($Job) $a=New-Object CodexBridgeJobNative+Accounting; if(-not [CodexBridgeJobNative]::QueryInformationJobObject($Job.Handle,1,[ref]$a,[Runtime.InteropServices.Marshal]::SizeOf($a),[IntPtr]::Zero)){throw 'bridge-job-query-failed'}; [int]$a.ActiveProcesses }
         CloseBridgeJob = { param($Job) Close-BridgeJob $Job.Handle }
+    }
+}
+
+function ConvertFrom-CodexControlCommandLine {
+    [CmdletBinding()]
+    param([AllowEmptyString()][string]$Arguments)
+
+    $tokens = [System.Collections.Generic.List[string]]::new()
+    $current = [System.Text.StringBuilder]::new()
+    $quoted = $false
+    $tokenStarted = $false
+    foreach ($character in $Arguments.ToCharArray()) {
+        if ($character -eq '"') {
+            $quoted = -not $quoted
+            $tokenStarted = $true
+            continue
+        }
+        if ([char]::IsWhiteSpace($character) -and -not $quoted) {
+            if ($tokenStarted) {
+                $tokens.Add($current.ToString())
+                [void]$current.Clear()
+                $tokenStarted = $false
+            }
+            continue
+        }
+        [void]$current.Append($character)
+        $tokenStarted = $true
+    }
+    if ($quoted) { return $null }
+    if ($tokenStarted) { $tokens.Add($current.ToString()) }
+    return @($tokens)
+}
+
+function Test-CodexNotificationGuardTaskIdentity {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][object]$Task,
+        [Parameter(Mandatory)][string]$ToolDir,
+        [Parameter(Mandatory)][string]$PowerShellPath,
+        [Parameter(Mandatory)][object]$CurrentUserIdentity
+    )
+
+    try {
+        if (-not ([string]$Task.taskPath).Equals('\', [System.StringComparison]::Ordinal) -or
+            -not ([string]$Task.taskName).Equals('Codex ntfy Notification Guard', [System.StringComparison]::Ordinal)) { return $false }
+        if ([string]::IsNullOrWhiteSpace([string]$Task.definitionXml)) { return $false }
+        $trustedPowerShell = [System.IO.Path]::GetFullPath($PowerShellPath)
+        $expectedScript = [System.IO.Path]::GetFullPath((Join-Path $ToolDir 'watch-notify.ps1'))
+        $trustedWorkingDirectory = [System.IO.Path]::GetFullPath($ToolDir).TrimEnd('\','/')
+        $testAction = {
+            param([object]$Action)
+            try {
+                $execute = [System.IO.Path]::GetFullPath([string]$Action.Execute)
+                if (-not $execute.Equals($trustedPowerShell, [System.StringComparison]::OrdinalIgnoreCase)) { return $false }
+                $workingDirectory = [string]$Action.WorkingDirectory
+                if (-not [string]::IsNullOrWhiteSpace($workingDirectory) -and
+                    -not [System.IO.Path]::GetFullPath($workingDirectory).TrimEnd('\','/').Equals($trustedWorkingDirectory, [System.StringComparison]::OrdinalIgnoreCase)) { return $false }
+                $arguments = @(ConvertFrom-CodexControlCommandLine -Arguments ([string]$Action.Arguments))
+                if ($null -eq $arguments -or $arguments.Count -lt 3) { return $false }
+                $sawNoProfile = $false
+                $sawNonInteractive = $false
+                $sawWindowStyle = $false
+                for ($index = 0; $index -lt $arguments.Count; $index++) {
+                    $argument = [string]$arguments[$index]
+                    if ($argument.Equals('-NoProfile', [System.StringComparison]::OrdinalIgnoreCase) -and -not $sawNoProfile) { $sawNoProfile=$true; continue }
+                    if ($argument.Equals('-NonInteractive', [System.StringComparison]::OrdinalIgnoreCase) -and -not $sawNonInteractive) { $sawNonInteractive=$true; continue }
+                    if ($argument.Equals('-WindowStyle', [System.StringComparison]::OrdinalIgnoreCase) -and -not $sawWindowStyle) {
+                        if (($index + 1) -ge $arguments.Count -or -not ([string]$arguments[$index + 1]).Equals('Hidden', [System.StringComparison]::OrdinalIgnoreCase)) { return $false }
+                        $sawWindowStyle=$true; $index++; continue
+                    }
+                    if ($argument.Equals('-File', [System.StringComparison]::OrdinalIgnoreCase)) {
+                        if (-not $sawNoProfile -or ($index + 2) -ne $arguments.Count) { return $false }
+                        $scriptPath = [System.IO.Path]::GetFullPath([string]$arguments[$index + 1])
+                        return $scriptPath.Equals($expectedScript, [System.StringComparison]::OrdinalIgnoreCase)
+                    }
+                    return $false
+                }
+                return $false
+            }
+            catch { return $false }
+        }.GetNewClosure()
+
+        $actions = @($Task.actions)
+        if ($actions.Count -ne 1 -or -not (& $testAction $actions[0])) { return $false }
+
+        $document = [System.Xml.XmlDocument]::new()
+        $document.PreserveWhitespace = $false
+        $document.LoadXml([string]$Task.definitionXml)
+        $namespace = [System.Xml.XmlNamespaceManager]::new($document.NameTable)
+        $namespace.AddNamespace('task', 'http://schemas.microsoft.com/windows/2004/02/mit/task')
+        if ($document.DocumentElement.LocalName -cne 'Task' -or $document.DocumentElement.NamespaceURI -cne 'http://schemas.microsoft.com/windows/2004/02/mit/task') { return $false }
+
+        $principals = @($document.SelectNodes('/task:Task/task:Principals/task:Principal', $namespace))
+        if ($principals.Count -ne 1) { return $false }
+        $principal = $principals[0]
+        $principalId = [string]$principal.GetAttribute('id')
+        if ([string]::IsNullOrWhiteSpace($principalId)) { return $false }
+        $principalUser = [string]$principal.SelectSingleNode('task:UserId', $namespace).InnerText
+        $trustedUsers = @([string]$CurrentUserIdentity.Name, [string]$CurrentUserIdentity.Sid) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+        if ($trustedUsers.Count -eq 0 -or -not @($trustedUsers | Where-Object { $principalUser.Equals($_, [System.StringComparison]::OrdinalIgnoreCase) }).Count) { return $false }
+        if ([string]$principal.SelectSingleNode('task:LogonType', $namespace).InnerText -cne 'InteractiveToken') { return $false }
+        $runLevel = $principal.SelectSingleNode('task:RunLevel', $namespace)
+        # Task Scheduler's schema default is LeastPrivilege when RunLevel is omitted.
+        if ($null -ne $runLevel -and [string]$runLevel.InnerText -cne 'LeastPrivilege') { return $false }
+
+        $triggers = @($document.SelectNodes('/task:Task/task:Triggers/*', $namespace))
+        if ($triggers.Count -ne 1 -or $triggers[0].LocalName -cne 'LogonTrigger') { return $false }
+        $triggerEnabled = $triggers[0].SelectSingleNode('task:Enabled', $namespace)
+        if ($null -ne $triggerEnabled -and ([string]$triggerEnabled.InnerText).Equals('false', [System.StringComparison]::OrdinalIgnoreCase)) { return $false }
+        $triggerUser = $triggers[0].SelectSingleNode('task:UserId', $namespace)
+        if ($null -ne $triggerUser -and -not @($trustedUsers | Where-Object { ([string]$triggerUser.InnerText).Equals($_, [System.StringComparison]::OrdinalIgnoreCase) }).Count) { return $false }
+
+        $settings = @($document.SelectNodes('/task:Task/task:Settings', $namespace))
+        if ($settings.Count -ne 1) { return $false }
+        $multipleInstances = $settings[0].SelectSingleNode('task:MultipleInstancesPolicy', $namespace)
+        if ($null -eq $multipleInstances -or [string]$multipleInstances.InnerText -cne 'IgnoreNew') { return $false }
+        $allowDemandStart = $settings[0].SelectSingleNode('task:AllowStartOnDemand', $namespace)
+        if ($null -ne $allowDemandStart -and -not ([string]$allowDemandStart.InnerText).Equals('true', [System.StringComparison]::OrdinalIgnoreCase)) { return $false }
+
+        $xmlActions = @($document.SelectNodes('/task:Task/task:Actions/*', $namespace))
+        if ($xmlActions.Count -ne 1 -or $xmlActions[0].LocalName -cne 'Exec') { return $false }
+        $actionsParent = $xmlActions[0].ParentNode
+        if (-not ([string]$actionsParent.GetAttribute('Context')).Equals($principalId, [System.StringComparison]::Ordinal)) { return $false }
+        $xmlCommand = $xmlActions[0].SelectSingleNode('task:Command', $namespace)
+        $xmlArguments = $xmlActions[0].SelectSingleNode('task:Arguments', $namespace)
+        $xmlWorkingDirectory = $xmlActions[0].SelectSingleNode('task:WorkingDirectory', $namespace)
+        if ($null -eq $xmlCommand -or $null -eq $xmlArguments) { return $false }
+        $xmlAction = [pscustomobject]@{
+            Execute = [string]$xmlCommand.InnerText
+            Arguments = [string]$xmlArguments.InnerText
+            WorkingDirectory = if ($null -eq $xmlWorkingDirectory) { '' } else { [string]$xmlWorkingDirectory.InnerText }
+        }
+        if (-not (& $testAction $xmlAction)) { return $false }
+        return $true
+    }
+    catch { return $false }
+}
+
+function Get-CodexNotificationGuardDefinitionHash {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$DefinitionXml,
+        [string]$TaskPath = '\',
+        [string]$TaskName = 'Codex ntfy Notification Guard'
+    )
+
+    try {
+        $document = [System.Xml.XmlDocument]::new()
+        $document.PreserveWhitespace = $false
+        $document.LoadXml($DefinitionXml)
+        $namespace = [System.Xml.XmlNamespaceManager]::new($document.NameTable)
+        $namespace.AddNamespace('task', 'http://schemas.microsoft.com/windows/2004/02/mit/task')
+        foreach ($enabledNode in @($document.SelectNodes('//task:Settings/task:Enabled', $namespace))) {
+            [void]$enabledNode.ParentNode.RemoveChild($enabledNode)
+        }
+        $identityText = $TaskPath + "`n" + $TaskName + "`n" + $document.OuterXml
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($identityText)
+        return [Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+    }
+    catch { return $null }
+}
+
+function Get-CodexNotificationGuardStatus {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][hashtable]$Operations,
+        [Parameter(Mandatory)][string]$ToolDir
+    )
+
+    foreach ($name in @('GetNotificationGuardTask','GetPowerShellPath','GetCurrentUserIdentity')) {
+        if (-not $Operations.ContainsKey($name) -or $Operations[$name] -isnot [scriptblock]) {
+            return [pscustomobject]@{ ok=$false; errorCategory='invalid-guard-operations' }
+        }
+    }
+    try {
+        $task = & $Operations.GetNotificationGuardTask
+        if ($null -eq $task) {
+            return [pscustomobject][ordered]@{ ok=$true; exists=$false; trusted=$true; enabled=$false; running=$false }
+        }
+        $trusted = Test-CodexNotificationGuardTaskIdentity -Task $task -ToolDir $ToolDir -PowerShellPath (& $Operations.GetPowerShellPath) -CurrentUserIdentity (& $Operations.GetCurrentUserIdentity)
+        $definitionHash = Get-CodexNotificationGuardDefinitionHash -DefinitionXml ([string]$task.definitionXml) -TaskPath ([string]$task.taskPath) -TaskName ([string]$task.taskName)
+        if ([string]::IsNullOrWhiteSpace($definitionHash)) { $trusted = $false }
+        return [pscustomobject][ordered]@{
+            ok = $true
+            exists = $true
+            trusted = [bool]$trusted
+            enabled = [bool]$task.enabled
+            running = [bool]$task.running
+            definitionHash = $definitionHash
+        }
+    }
+    catch { return [pscustomobject]@{ ok=$false; errorCategory='guard-status-failed' } }
+}
+
+function Invoke-CodexNotificationGuardAction {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][ValidateSet('stop','start','enable','disable')][string]$Action,
+        [Parameter(Mandatory)][hashtable]$Operations,
+        [Parameter(Mandatory)][string]$ToolDir,
+        [ValidateRange(1,100)][int]$PollAttempts = 10,
+        [ValidateRange(0,30000)][int]$PollMilliseconds = 100
+    )
+
+    $operationByAction = @{
+        stop='StopNotificationGuardTask'; start='StartNotificationGuardTask'
+        enable='EnableNotificationGuardTask'; disable='DisableNotificationGuardTask'
+    }
+    $operationName = $operationByAction[$Action]
+    if (-not $Operations.ContainsKey($operationName) -or $Operations[$operationName] -isnot [scriptblock]) {
+        return [pscustomobject]@{ ok=$false; action=$Action; errorCategory='invalid-guard-operations' }
+    }
+    $initial = Get-CodexNotificationGuardStatus -Operations $Operations -ToolDir $ToolDir
+    if (-not $initial.ok) { return [pscustomobject]@{ ok=$false; action=$Action; errorCategory=$initial.errorCategory } }
+    if (-not $initial.exists) { return [pscustomobject]@{ ok=$false; action=$Action; errorCategory='guard-task-missing' } }
+    if (-not $initial.trusted) { return [pscustomobject]@{ ok=$false; action=$Action; errorCategory='guard-identity-untrusted' } }
+
+    $needsAction = switch ($Action) {
+        stop { $initial.running }
+        start { -not $initial.running }
+        enable { -not $initial.enabled }
+        disable { $initial.enabled }
+    }
+    try {
+        if ($needsAction) { & $Operations[$operationName] }
+        $final = $initial
+        for ($attempt = 0; $attempt -lt $PollAttempts; $attempt++) {
+            $final = Get-CodexNotificationGuardStatus -Operations $Operations -ToolDir $ToolDir
+            $sameDefinition = $final.ok -and -not [string]::IsNullOrWhiteSpace([string]$final.definitionHash) -and
+                ([string]$final.definitionHash).Equals([string]$initial.definitionHash, [System.StringComparison]::OrdinalIgnoreCase)
+            $complete = $final.ok -and $final.exists -and $final.trusted -and $sameDefinition -and $(switch ($Action) {
+                stop { -not $final.running -and $final.enabled -eq $initial.enabled }
+                start { $final.running -and $final.enabled -eq $initial.enabled }
+                enable { $final.enabled -and $final.running -eq $initial.running }
+                disable { -not $final.enabled -and $final.running -eq $initial.running }
+            })
+            if ($complete) { return [pscustomobject][ordered]@{ ok=$true; action=$Action; guard=$final } }
+            if ($attempt -lt ($PollAttempts - 1) -and $Operations.ContainsKey('Sleep')) { & $Operations.Sleep $PollMilliseconds }
+        }
+        return [pscustomobject][ordered]@{ ok=$false; action=$Action; errorCategory='guard-action-incomplete'; guard=$final }
+    }
+    catch {
+        $fresh = Get-CodexNotificationGuardStatus -Operations $Operations -ToolDir $ToolDir
+        return [pscustomobject][ordered]@{ ok=$false; action=$Action; errorCategory='guard-action-failed'; guard=$fresh }
     }
 }
 

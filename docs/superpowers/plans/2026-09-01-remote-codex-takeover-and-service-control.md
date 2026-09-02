@@ -869,7 +869,7 @@ git commit -m "feat: offer safe takeover for queued continuations"
 
 - [ ] **Step 1: Write failing project-attribution tests**
 
-Cover explicit project metadata, case-insensitive canonical Windows roots, longest-root selection, sibling-prefix rejection, saved worktree provenance, and tasks outside every project. Prove the current production pattern (`cwd` under `C:\Users\86166\Desktop\ygf` with null metadata) resolves to `ygf` rather than `无项目`.
+Cover explicit project metadata, case-insensitive canonical Windows roots, longest-root selection, sibling-prefix rejection, saved worktree provenance, and tasks outside every project. Prove the representative production pattern (`cwd` under `C:\Users\operator\Desktop\example-project` with null metadata) resolves to `example-project` rather than `无项目`.
 
 - [ ] **Step 2: Write failing provenance and source-channel tests**
 
