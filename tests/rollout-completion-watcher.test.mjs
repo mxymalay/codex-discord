@@ -254,11 +254,6 @@ test('streams only exact-root commentary and sanitized tool lifecycle to the per
       timestamp: '2026-09-01T00:00:05.000Z', type: 'event_msg',
       payload: { type: 'sub_agent_activity', turn_id: turnId, message: secretOutput },
     },
-    taskComplete('最终结果由完成通知发送。'),
-    {
-      timestamp: '2026-09-01T00:00:11.000Z', type: 'event_msg',
-      payload: { type: 'agent_message', phase: 'commentary', message: 'COMPLETE-AFTER-CANARY' },
-    },
   ];
   const state = createEmptyInboxState();
   state.discordTurnOrigins[turnId] = {
@@ -337,14 +332,135 @@ test('suspicious commentary is default-denied to one fixed coarse progress messa
       }].map(jsonLine).join(''), 'utf8');
       await pollDiscordOriginEvents({
         sessionsRoot: paths.sessionsRoot, inboxState: state, persistInboxState: async () => {},
+        nowMs: Date.parse('2026-09-01T00:00:19.000Z'),
         dispatchMessage: async (message) => { sent.push(message); return { id: `m-${index}` }; },
       });
       const commentary = sent.find((item) => item.kind === 'commentary');
-      assert.equal(commentary.content, '### 任务进度\n正在处理任务（详细进度包含本机或敏感内容，已隐藏）。');
+      assert.equal(commentary.content, [
+        '## 任务进行中…',
+        '',
+        '### demo · 未命名任务',
+        '',
+        '### 任务进度',
+        '',
+        '正在处理任务（详细进度包含本机或敏感内容，已隐藏）。',
+        '',
+        '### **运行时间**',
+        '',
+        '已运行 18 秒',
+      ].join('\n'));
       assert.equal(JSON.stringify(sent).includes(sample), false);
     } finally {
       await fs.rm(paths.root, { recursive: true, force: true });
     }
+  }
+});
+
+test('formats every active Discord-origin progress message with the requested task identity and elapsed runtime', async () => {
+  const paths = await fixture();
+  const state = createEmptyInboxState();
+  state.discordTurnOrigins[turnId] = {
+    threadId, guildId: '222222222222222222', channelId: '777777777777777777', source: 'slash',
+    createdAt: '2026-09-01T00:00:00.000Z', rolloutCursor: 0, deliveredEventIds: [], deliveryState: 'pending',
+  };
+  const sent = [];
+  const meta = sessionMeta();
+  meta.payload.cwd = 'C:\\workspace\\new-chat';
+  try {
+    await fs.writeFile(paths.rolloutPath, [
+      meta,
+      taskStarted(),
+      {
+        timestamp: '2026-09-01T00:00:05.000Z', type: 'event_msg',
+        payload: { type: 'agent_message', phase: 'commentary', message: '这很有价值。我先核对实际稳定时长、有没有新增转储……' },
+      },
+    ].map(jsonLine).join(''), 'utf8');
+
+    await pollDiscordOriginEvents({
+      sessionsRoot: paths.sessionsRoot,
+      inboxState: state,
+      taskIndex: { tasks: [{ threadId, projectName: null, taskName: '诊断电脑故障和终端自启' }] },
+      nowMs: Date.parse('2026-09-01T00:00:19.000Z'),
+      persistInboxState: async () => {},
+      dispatchMessage: async (message) => { sent.push(message); return { id: `message-${sent.length}` }; },
+    });
+
+    assert.equal(sent[0].content.includes('任务已开始'), false);
+    assert.equal(sent[1].content, [
+      '## 任务进行中…',
+      '',
+      '### new-chat · 诊断电脑故障和终端自启',
+      '',
+      '### 任务进度',
+      '',
+      '这很有价值。我先核对实际稳定时长、有没有新增转储……',
+      '',
+      '### **运行时间**',
+      '',
+      '已运行 18 秒',
+    ].join('\n'));
+  } finally {
+    await fs.rm(paths.root, { recursive: true, force: true });
+  }
+});
+
+test('keeps elapsed runtime anchored to task start after earlier progress was already delivered', async () => {
+  const paths = await fixture();
+  const state = createEmptyInboxState();
+  state.discordTurnOrigins[turnId] = {
+    threadId, guildId: '222222222222222222', channelId: '777777777777777777', source: 'slash',
+    createdAt: '2026-09-01T00:00:00.000Z', rolloutCursor: 0, deliveredEventIds: [], deliveryState: 'pending',
+  };
+  const sent = [];
+  try {
+    await fs.writeFile(paths.rolloutPath, [sessionMeta(), taskStarted()].map(jsonLine).join(''), 'utf8');
+    const options = {
+      sessionsRoot: paths.sessionsRoot,
+      inboxState: state,
+      taskIndex: { tasks: [{ threadId, projectName: 'new-chat', taskName: '诊断电脑故障和终端自启' }] },
+      persistInboxState: async () => {},
+      dispatchMessage: async (message) => { sent.push(message); return { id: '777777777777777901' }; },
+    };
+    await pollDiscordOriginEvents({ ...options, nowMs: Date.parse('2026-09-01T00:00:05.000Z') });
+    await fs.appendFile(paths.rolloutPath, jsonLine({
+      timestamp: '2026-09-01T00:00:18.000Z', type: 'event_msg',
+      payload: { type: 'agent_message', phase: 'commentary', message: '第二次进度。' },
+    }), 'utf8');
+    await pollDiscordOriginEvents({ ...options, nowMs: Date.parse('2026-09-01T00:00:19.000Z') });
+
+    assert.match(sent.at(-1).content, /已运行 18 秒$/u);
+  } finally {
+    await fs.rm(paths.root, { recursive: true, force: true });
+  }
+});
+
+test('drops unsent intermediate progress when the exact turn is already complete', async () => {
+  const paths = await fixture();
+  const state = createEmptyInboxState();
+  state.discordTurnOrigins[turnId] = {
+    threadId, guildId: '222222222222222222', channelId: '777777777777777777', source: 'slash',
+    createdAt: '2026-09-01T00:00:00.000Z', rolloutCursor: 0, deliveredEventIds: [], deliveryState: 'pending',
+  };
+  const sent = [];
+  try {
+    await fs.writeFile(paths.rolloutPath, [
+      sessionMeta(), taskStarted(),
+      { timestamp: '2026-09-01T00:00:05.000Z', type: 'event_msg', payload: { type: 'agent_message', phase: 'commentary', message: '迟到进度不得发送' } },
+      taskComplete('最终结果已经发送'),
+    ].map(jsonLine).join(''), 'utf8');
+
+    await pollDiscordOriginEvents({
+      sessionsRoot: paths.sessionsRoot, inboxState: state,
+      taskIndex: { tasks: [{ threadId, projectName: '项目', taskName: '任务' }] },
+      nowMs: Date.parse('2026-09-01T00:00:11.000Z'),
+      persistInboxState: async () => {},
+      dispatchMessage: async (message) => { sent.push(message); return { id: `message-${sent.length}` }; },
+    });
+
+    assert.deepEqual(sent, []);
+    assert.equal(state.discordTurnOrigins[turnId].rolloutCursor, (await fs.stat(paths.rolloutPath)).size);
+  } finally {
+    await fs.rm(paths.root, { recursive: true, force: true });
   }
 });
 
@@ -435,7 +551,7 @@ test('a durable progress intent preserves A and later sends B after A state comm
   }
 });
 
-test('terminal delivery never overtakes B after retrying a sent A intent', async () => {
+test('terminal delivery drops unsent B after retrying a sent A intent', async () => {
   const paths = await fixture();
   const inboxState = createEmptyInboxState();
   inboxState.discordTurnOrigins[turnId] = {
@@ -483,9 +599,9 @@ test('terminal delivery never overtakes B after retrying a sent A intent', async
     await pollDiscordOriginEvents({ sessionsRoot: paths.sessionsRoot, inboxState, persistInboxState, dispatchMessage });
 
     const delivered = [...discordMessages.values()];
-    assert.deepEqual(delivered.map((item) => item.kind), ['started', 'commentary', 'commentary']);
+    assert.deepEqual(delivered.map((item) => item.kind), ['started', 'commentary']);
     assert.match(delivered[1].content, /进度 A/u);
-    assert.match(delivered[2].content, /进度 B/u);
+    assert.equal(JSON.stringify(delivered).includes('进度 B'), false);
     assert.equal(finalNotifications.length, 1);
     assert.equal(inboxState.discordTurnOrigins[turnId].deliveryState, 'terminal-delivered');
     assert.equal(inboxState.discordTurnOrigins[turnId].progressDispatch, undefined);

@@ -207,6 +207,11 @@ try {
     if ($projectField.Count -ne 1 -or [string]$projectField[0].value -ne 'Example Project') {
         throw 'Discord-origin terminal notification ignored its persisted saved-project identity'
     }
+    Write-InboxOriginState -OriginOverrides @{ messageIds = @('777777777777777901', '777777777777777902') }
+    $originWithReplyMessages = Invoke-TaskCase -AssistantMessage '已经完成修改，全部测试通过。'
+    if ([string]$originWithReplyMessages.channelId -ne $originChannelId) {
+        throw 'Discord-origin terminal notification rejected persisted reply-routing message IDs'
+    }
     Write-InboxOriginState
     $originConfirmation = Invoke-TaskCase -AssistantMessage '我准备修改配置，可以吗？'
     if ([string]$originConfirmation.channelId -ne $originChannelId) {

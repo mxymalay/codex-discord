@@ -27,6 +27,7 @@ const MAX_PROCESSED_INTERACTIONS = 2_000;
 const MAX_CREATED_TASK_RECORDS = 2_000;
 const MAX_DISCORD_TURN_ORIGINS = 2_000;
 const MAX_ORIGIN_EVENT_IDS = 128;
+const MAX_ORIGIN_MESSAGE_IDS = 128;
 const MAX_TERMINAL_CONTINUATIONS = 200;
 const CONTINUATION_STATUSES = new Set(['queued', 'takeover-claimed', 'resuming', 'submitting', 'attempting', 'start-submitted', 'start-uncertain', 'confirmed-start', 'acknowledging', 'delivered', 'cancelled', 'failed']);
 const TERMINAL_CONTINUATION_STATUSES = new Set(['delivered', 'cancelled', 'failed']);
@@ -176,6 +177,7 @@ function validDiscordTurnOrigin(_turnId, value) {
     'rolloutFingerprint',
     'terminalEventId',
     'progressDispatch',
+    'messageIds',
   ]);
   return hasOnlyKeys(value, allowed) && isNonEmptyString(value.threadId) &&
     /^\d{17,20}$/u.test(String(value.guildId ?? '')) && /^\d{17,20}$/u.test(String(value.channelId ?? '')) &&
@@ -186,6 +188,9 @@ function validDiscordTurnOrigin(_turnId, value) {
     Number.isInteger(value.rolloutCursor) && value.rolloutCursor >= 0 &&
     Array.isArray(value.deliveredEventIds) && value.deliveredEventIds.length <= MAX_ORIGIN_EVENT_IDS &&
     value.deliveredEventIds.every(isNonEmptyString) &&
+    (value.messageIds === undefined || (Array.isArray(value.messageIds) &&
+      value.messageIds.length <= MAX_ORIGIN_MESSAGE_IDS &&
+      value.messageIds.every((item) => typeof item === 'string' && /^\d{17,20}$/u.test(item)))) &&
     DISCORD_ORIGIN_DELIVERY_STATES.has(String(value.deliveryState ?? '')) &&
     isOptionalTimestamp(value.deliveredAt) && validProgressDispatch(value.progressDispatch);
 }
@@ -333,6 +338,9 @@ function pruneDiscordTurnOrigins(state) {
   for (const origin of Object.values(origins)) {
     origin.deliveredEventIds = Array.isArray(origin?.deliveredEventIds)
       ? origin.deliveredEventIds.map(String).filter(Boolean).slice(-MAX_ORIGIN_EVENT_IDS)
+      : [];
+    origin.messageIds = Array.isArray(origin?.messageIds)
+      ? [...new Set(origin.messageIds.filter((item) => typeof item === 'string' && /^\d{17,20}$/u.test(item)))].slice(-MAX_ORIGIN_MESSAGE_IDS)
       : [];
   }
   let overflow = Math.max(0, Object.keys(origins).length - MAX_DISCORD_TURN_ORIGINS);
@@ -559,6 +567,9 @@ function normalizedDiscordTurnOrigin(origin) {
     deliveredEventIds: Array.isArray(origin?.deliveredEventIds)
       ? origin.deliveredEventIds.map(String).filter(Boolean).slice(-MAX_ORIGIN_EVENT_IDS)
       : [],
+    messageIds: Array.isArray(origin?.messageIds)
+      ? [...new Set(origin.messageIds.filter((item) => typeof item === 'string' && /^\d{17,20}$/u.test(item)))].slice(-MAX_ORIGIN_MESSAGE_IDS)
+      : [],
     deliveryState: String(origin?.deliveryState ?? 'pending'),
   };
   const projectId = String(origin?.projectId ?? '').trim();
@@ -695,12 +706,14 @@ export async function advanceDiscordTurnOrigin({
   lastMessageId,
   terminalDeliveredAt,
   rolloutFingerprint,
+  discardPendingProgress = false,
 }) {
   const key = String(turnId ?? '').trim();
   if (!key || !state?.discordTurnOrigins?.[key]) throw new Error('Discord turn origin was not found');
   return commitInboxState({
     state,
     persistState,
+    fields: ['cursors'],
     entries: { discordTurnOrigins: [key] },
     mutate: () => {
       const current = state.discordTurnOrigins[key];
@@ -710,7 +723,18 @@ export async function advanceDiscordTurnOrigin({
         current.deliveredEventIds = current.deliveredEventIds.slice(-MAX_ORIGIN_EVENT_IDS);
       }
       if (current.progressDispatch?.eventId === String(eventId ?? '').trim()) delete current.progressDispatch;
-      if (String(lastMessageId ?? '').trim()) current.lastMessageId = String(lastMessageId);
+      if (discardPendingProgress) delete current.progressDispatch;
+      if (String(lastMessageId ?? '').trim()) {
+        const messageId = String(lastMessageId);
+        current.lastMessageId = messageId;
+        if (/^\d{17,20}$/u.test(messageId)) {
+          current.messageIds = [...new Set([...(current.messageIds ?? []), messageId])].slice(-MAX_ORIGIN_MESSAGE_IDS);
+          state.cursors ??= {};
+          if (!Object.hasOwn(state.cursors, current.channelId)) {
+            state.cursors[current.channelId] = messageId;
+          }
+        }
+      }
       if (String(rolloutFingerprint ?? '').trim()) {
         const fingerprint = String(rolloutFingerprint).trim().toLocaleLowerCase();
         if (!/^[a-f0-9]{64}$/u.test(fingerprint)) throw new Error('Discord rollout fingerprint is invalid');
@@ -1478,10 +1502,7 @@ export function classifyReply(message, config, mappingState, inboxState) {
       String(message.guild_id) !== String(config.discordGuildId ?? '')) return reject('wrong-guild');
 
   const channelId = String(message.channel_id ?? '');
-  const allowedChannels = new Set([
-    String(config.discordTaskChannelId ?? ''),
-    String(config.discordConfirmationChannelId ?? ''),
-  ]);
+  const allowedChannels = new Set(discordReplyChannelIds(config, inboxState));
   if (!allowedChannels.has(channelId)) return reject('wrong-channel');
   if (channelId === String(config.discordQuotaChannelId ?? '')) return reject('quota-channel');
 
@@ -1497,14 +1518,28 @@ export function classifyReply(message, config, mappingState, inboxState) {
 
   const reference = message.message_reference;
   const referencedMessageId = String(reference?.message_id ?? '');
-  if (!referencedMessageId) return reject('not-a-reply');
+  if (!referencedMessageId) return { ...reject('not-a-reply'), guidance: true, messageId, channelId };
   if (reference?.guild_id && String(reference.guild_id) !== String(config.discordGuildId ?? '')) return reject('reference-wrong-guild');
   if (reference?.channel_id && String(reference.channel_id) !== channelId) return reject('reference-wrong-channel');
 
-  const mapped = mappingState?.messages?.[referencedMessageId];
-  if (!mapped) return reject('unknown-reference');
+  let mapped = mappingState?.messages?.[referencedMessageId];
+  if (!mapped) {
+    const origin = Object.values(inboxState?.discordTurnOrigins ?? {}).find((candidate) =>
+      String(candidate?.guildId ?? '') === String(config.discordGuildId ?? '') &&
+      String(candidate?.channelId ?? '') === channelId &&
+      Array.isArray(candidate?.messageIds) && candidate.messageIds.includes(referencedMessageId));
+    if (origin) {
+      mapped = {
+        threadId: origin.threadId,
+        channelId: origin.channelId,
+        eventName: 'discord-origin-progress',
+        createdAt: origin.createdAt,
+      };
+    }
+  }
+  if (!mapped) return { ...reject('unknown-reference'), guidance: true, messageId, channelId };
   if (String(mapped.channelId ?? '') !== channelId) return reject('mapping-channel-mismatch');
-  if (!['user-task-complete', 'user-task-confirmation-required'].includes(String(mapped.eventName ?? ''))) {
+  if (!['user-task-complete', 'user-task-confirmation-required', 'discord-origin-progress'].includes(String(mapped.eventName ?? ''))) {
     return reject('mapping-event-not-actionable');
   }
   if (!/^[0-9a-f-]{36}$/i.test(String(mapped.threadId ?? ''))) return reject('invalid-thread-id');
@@ -1517,6 +1552,22 @@ export function classifyReply(message, config, mappingState, inboxState) {
     text,
     mapping: mapped,
   };
+}
+
+export function discordReplyChannelIds(config, state) {
+  const quotaChannel = String(config?.discordQuotaChannelId ?? '');
+  const result = [];
+  const add = (value) => {
+    const channelId = String(value ?? '');
+    if (!/^\d{17,20}$/u.test(channelId) || channelId === quotaChannel || result.includes(channelId)) return;
+    result.push(channelId);
+  };
+  add(config?.discordTaskChannelId);
+  add(config?.discordConfirmationChannelId);
+  for (const origin of Object.values(state?.discordTurnOrigins ?? {})) {
+    if (String(origin?.guildId ?? '') === String(config?.discordGuildId ?? '')) add(origin?.channelId);
+  }
+  return result;
 }
 
 export function buildCodexAppServerMessages({ threadId, cwd, text }) {

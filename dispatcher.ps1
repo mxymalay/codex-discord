@@ -640,7 +640,7 @@ function Test-DiscordTurnOriginRecord {
     $allowed = @(
         'threadId', 'guildId', 'channelId', 'source', 'createdAt', 'projectId', 'projectName',
         'rolloutCursor', 'deliveredEventIds', 'deliveryState', 'deliveredAt', 'lastMessageId',
-        'rolloutFingerprint', 'terminalEventId', 'progressDispatch'
+        'rolloutFingerprint', 'terminalEventId', 'progressDispatch', 'messageIds'
     )
     $required = @(
         'threadId', 'guildId', 'channelId', 'source', 'createdAt',
@@ -663,6 +663,17 @@ function Test-DiscordTurnOriginRecord {
     foreach ($eventId in @($Value.deliveredEventIds)) {
         if ($eventId -isnot [string] -or [string]::IsNullOrWhiteSpace($eventId)) {
             return $false
+        }
+    }
+    $messageIds = $Value.PSObject.Properties | Where-Object { $_.Name -ceq 'messageIds' } | Select-Object -First 1
+    if ($null -ne $messageIds) {
+        if ($messageIds.Value -isnot [System.Array] -or @($messageIds.Value).Count -gt 128) {
+            return $false
+        }
+        foreach ($messageId in @($messageIds.Value)) {
+            if ($messageId -isnot [string] -or $messageId -cnotmatch '\A[0-9]{17,20}\z') {
+                return $false
+            }
         }
     }
     foreach ($name in @('projectId', 'projectName', 'lastMessageId', 'rolloutFingerprint', 'terminalEventId')) {

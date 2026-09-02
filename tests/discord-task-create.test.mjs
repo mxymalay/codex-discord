@@ -886,7 +886,7 @@ test('successful new task atomically persists its exact Discord origin before re
     source: 'new-task',
     createdAt: '2026-09-01T20:55:55.000Z',
     projectId: 'p1', projectName: 'POS',
-    rolloutCursor: 0, deliveredEventIds: [], deliveryState: 'pending',
+    rolloutCursor: 0, deliveredEventIds: [], messageIds: [], deliveryState: 'pending',
   });
   const createdRecord = snapshots.at(-1).createdTasksByInteraction['1544329941024374935'];
   assert.equal(createdRecord.status, 'started');

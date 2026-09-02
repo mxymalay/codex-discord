@@ -15,6 +15,7 @@ import { createInteractionRouter } from '../discord-interactions.mjs';
 
 import {
   AppServerClient,
+  advanceDiscordTurnOrigin,
   buildCodexAppServerMessages,
   cancelContinuation,
   cancelContinuationPersisted,
@@ -1178,6 +1179,56 @@ test('accepts arbitrary text only when replying to a mapped task message', () =>
   assert.equal(result.mapping.threadId, '11111111-1111-4111-8111-111111111111');
 });
 
+test('accepts a reply to any persisted Discord-origin progress message in its exact source channel', () => {
+  const state = createEmptyInboxState();
+  state.discordTurnOrigins['22222222-2222-4222-8222-222222222222'] = {
+    threadId: '11111111-1111-4111-8111-111111111111',
+    guildId: config.discordGuildId,
+    channelId: '888888888888888888',
+    source: 'slash',
+    createdAt: '2026-09-01T00:00:00.000Z',
+    rolloutCursor: 10,
+    deliveredEventIds: [],
+    deliveryState: 'pending',
+    messageIds: ['888888888888888901', '888888888888888902'],
+  };
+  const message = makeMessage({
+    channel_id: '888888888888888888',
+    message_reference: {
+      guild_id: config.discordGuildId,
+      channel_id: '888888888888888888',
+      message_id: '888888888888888901',
+    },
+  });
+
+  const result = classifyReply(message, config, { version: 1, messages: {} }, state);
+
+  assert.equal(result.accepted, true);
+  assert.equal(result.mapping.threadId, '11111111-1111-4111-8111-111111111111');
+  assert.equal(result.mapping.channelId, '888888888888888888');
+});
+
+test('classifies unreferenced text in a known task channel as guidance instead of silently ignoring it', () => {
+  const state = createEmptyInboxState();
+  state.discordTurnOrigins['22222222-2222-4222-8222-222222222222'] = {
+    threadId: '11111111-1111-4111-8111-111111111111',
+    guildId: config.discordGuildId,
+    channelId: '888888888888888888',
+    source: 'new-task',
+    createdAt: '2026-09-01T00:00:00.000Z',
+    rolloutCursor: 0,
+    deliveredEventIds: [],
+    deliveryState: 'pending',
+  };
+  const message = makeMessage({ channel_id: '888888888888888888', message_reference: null });
+
+  const result = classifyReply(message, config, { version: 1, messages: {} }, state);
+
+  assert.equal(result.accepted, false);
+  assert.equal(result.guidance, true);
+  assert.equal(result.reason, 'not-a-reply');
+});
+
 test('accepts REST-fetched replies when Discord omits the optional guild id', () => {
   const message = makeMessage();
   delete message.guild_id;
@@ -1419,6 +1470,106 @@ test('first run baselines channels while later runs preserve cursors for offline
       throw new Error('existing cursors must not be replaced');
     },
   });
+});
+
+test('reply polling covers fixed notification channels and every persisted Discord-origin channel exactly once', () => {
+  const state = createEmptyInboxState();
+  state.discordTurnOrigins['turn-a'] = {
+    threadId: 'root-a', guildId: config.discordGuildId, channelId: '777777777777777771',
+    source: 'slash', createdAt: '2026-09-01T00:00:00.000Z', rolloutCursor: 0,
+    deliveredEventIds: [], deliveryState: 'pending',
+  };
+  state.discordTurnOrigins['turn-b'] = {
+    threadId: 'root-b', guildId: config.discordGuildId, channelId: '777777777777777771',
+    source: 'new-task', createdAt: '2026-09-01T00:00:00.000Z', rolloutCursor: 0,
+    deliveredEventIds: [], deliveryState: 'terminal-delivered',
+  };
+
+  assert.deepEqual(bridgeLib.discordReplyChannelIds(config, state), [
+    config.discordTaskChannelId,
+    config.discordConfirmationChannelId,
+    '777777777777777771',
+  ]);
+});
+
+test('a successful source-channel progress send binds the message to the task and baselines replies after it', async () => {
+  const state = createEmptyInboxState();
+  const turnId = '22222222-2222-4222-8222-222222222222';
+  const channelId = '888888888888888888';
+  state.discordTurnOrigins[turnId] = {
+    threadId: '11111111-1111-4111-8111-111111111111', guildId: config.discordGuildId, channelId,
+    source: 'slash', createdAt: '2026-09-01T00:00:00.000Z', rolloutCursor: 0,
+    deliveredEventIds: [], deliveryState: 'pending',
+  };
+
+  await advanceDiscordTurnOrigin({
+    state,
+    persistState: async () => {},
+    turnId,
+    rolloutCursor: 120,
+    eventId: 'a'.repeat(64),
+    lastMessageId: '888888888888888901',
+  });
+
+  assert.deepEqual(state.discordTurnOrigins[turnId].messageIds, ['888888888888888901']);
+  assert.equal(state.cursors[channelId], '888888888888888901');
+});
+
+test('a later progress send never jumps an existing reply cursor past unseen user messages', async () => {
+  const state = createEmptyInboxState();
+  const turnId = '22222222-2222-4222-8222-222222222222';
+  const channelId = '888888888888888888';
+  state.cursors[channelId] = '888888888888888850';
+  state.discordTurnOrigins[turnId] = {
+    threadId: '11111111-1111-4111-8111-111111111111', guildId: config.discordGuildId, channelId,
+    source: 'slash', createdAt: '2026-09-01T00:00:00.000Z', rolloutCursor: 0,
+    deliveredEventIds: [], deliveryState: 'pending',
+  };
+
+  await advanceDiscordTurnOrigin({
+    state,
+    persistState: async () => {},
+    turnId,
+    rolloutCursor: 120,
+    eventId: 'a'.repeat(64),
+    lastMessageId: '888888888888888901',
+  });
+
+  assert.equal(state.cursors[channelId], '888888888888888850');
+  assert.deepEqual(state.discordTurnOrigins[turnId].messageIds, ['888888888888888901']);
+});
+
+test('an unreferenced message receives one actionable guidance reply and never starts a task', async () => {
+  const state = createEmptyInboxState();
+  const channelId = '888888888888888888';
+  state.cursors[channelId] = '888888888888888800';
+  state.discordTurnOrigins['22222222-2222-4222-8222-222222222222'] = {
+    threadId: '11111111-1111-4111-8111-111111111111', guildId: config.discordGuildId, channelId,
+    source: 'slash', createdAt: '2026-09-01T00:00:00.000Z', rolloutCursor: 0,
+    deliveredEventIds: [], deliveryState: 'pending',
+  };
+  const message = makeMessage({
+    id: '888888888888888801', channel_id: channelId, message_reference: null,
+    content: '这个 Hyper-V 是干嘛的？',
+  });
+  const guidance = [];
+  let continuations = 0;
+
+  await pollChannel({
+    token: 'test-token', config, state, channelId,
+    getMessages: async () => [message],
+    readMapping: async () => ({ version: 1, messages: {} }),
+    continueRequest: async () => { continuations += 1; },
+    sendGuidance: async (payload) => { guidance.push(payload); return { id: '888888888888888802' }; },
+    persistState: async () => {},
+    writeLog: async () => {},
+  });
+
+  assert.equal(continuations, 0);
+  assert.equal(guidance.length, 1);
+  assert.equal(guidance[0].replyToMessageId, message.id);
+  assert.equal(guidance[0].content, '这条消息尚未发送到 Codex。请长按回复一条任务消息，或使用 `/继续任务` 选择任务。');
+  assert.deepEqual(state.processedMessageIds, [message.id]);
 });
 
 test('records processed messages and advances channel cursor monotonically', () => {
@@ -1678,6 +1829,7 @@ test('persists bounded Discord turn origins and resolves only an exact trusted b
     projectName: '项目 @everyone **unsafe**',
     rolloutCursor: 0,
     deliveredEventIds: [],
+    messageIds: [],
     deliveryState: 'pending',
   });
   assert.equal(JSON.stringify(snapshots).includes('interaction-token'), false);
@@ -1754,6 +1906,26 @@ test('origin migration bounds terminal history and per-turn dedupe without delet
   assert.equal(Object.hasOwn(state.discordTurnOrigins, 'turn-live'), true);
   assert.equal(Object.hasOwn(state.discordTurnOrigins, 'turn-old-0'), false);
   assert.equal(state.discordTurnOrigins['turn-old-2004'].deliveredEventIds.length, 128);
+});
+
+test('origin migration drops numeric Discord message IDs instead of persisting lossy Snowflakes', () => {
+  const state = migrateInboxState({
+    discordTurnOrigins: {
+      'turn-numeric-message': {
+        threadId: '11111111-1111-4111-8111-111111111111',
+        guildId: '222222222222222222',
+        channelId: '777777777777777777',
+        source: 'slash',
+        createdAt: '2026-09-01T00:00:00.000Z',
+        rolloutCursor: 0,
+        deliveredEventIds: [],
+        messageIds: [888888888888888901],
+        deliveryState: 'pending',
+      },
+    },
+  });
+
+  assert.deepEqual(state.discordTurnOrigins['turn-numeric-message'].messageIds, []);
 });
 
 test('a successful slash continuation commits its origin before returning started', async () => {

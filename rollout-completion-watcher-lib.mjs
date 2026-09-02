@@ -190,6 +190,58 @@ function discordNonce(eventId) {
   return BigInt(`0x${String(eventId).slice(0, 16)}`).toString(10).slice(0, 25);
 }
 
+function safeHeading(value, fallback) {
+  const text = String(value ?? '')
+    .replace(/[\r\n\t]+/gu, ' ')
+    .replace(/@/gu, '＠')
+    .replace(/[*_`#>|~[\]{}()\\]/gu, '')
+    .replace(/\s+/gu, ' ')
+    .trim();
+  return (text || fallback).slice(0, 180);
+}
+
+function workspaceLeaf(value) {
+  const candidate = String(value ?? '').trim();
+  if (!candidate) return '';
+  return candidate.includes('\\') ? path.win32.basename(candidate) : path.posix.basename(candidate);
+}
+
+function elapsedText(milliseconds) {
+  const totalSeconds = Math.max(0, Math.floor(Number(milliseconds) / 1000));
+  if (totalSeconds < 60) return `${totalSeconds} 秒`;
+  const totalMinutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  if (totalMinutes < 60) return `${totalMinutes} 分 ${seconds} 秒`;
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  return `${hours} 小时 ${minutes} 分`;
+}
+
+function progressContent({ detail, origin, metadata, taskIndex, startedAtMs, nowMs }) {
+  const task = (taskIndex?.tasks ?? []).find((candidate) =>
+    String(candidate?.threadId ?? '').toLocaleLowerCase() === String(origin.threadId).toLocaleLowerCase());
+  const explicitProject = [origin?.projectName, task?.projectName]
+    .map((value) => String(value ?? '').trim())
+    .find((value) => value && value !== '无项目');
+  const projectName = safeHeading(explicitProject || workspaceLeaf(metadata?.payload?.cwd), '无项目');
+  const taskName = safeHeading(task?.taskName, '未命名任务');
+  const clock = Number.isFinite(Number(nowMs)) ? Number(nowMs) : Date.now();
+  const elapsed = Number.isFinite(startedAtMs) ? clock - startedAtMs : 0;
+  return [
+    '## 任务进行中…',
+    '',
+    `### ${projectName} · ${taskName}`,
+    '',
+    '### 任务进度',
+    '',
+    String(detail),
+    '',
+    '### **运行时间**',
+    '',
+    `已运行 ${elapsedText(elapsed)}`,
+  ].join('\n');
+}
+
 function toolKind(payload) {
   const name = String(payload?.name ?? payload?.namespace ?? '').toLocaleLowerCase();
   if (name.includes('exec') || name.includes('command')) return '命令';
@@ -216,15 +268,17 @@ function coalesceProgressBursts(events) {
       const marker = '…较早进度已合并…\n';
       previous.semantic = `${marker}${event.semantic.slice(-(maxProgressChars - marker.length))}`;
     }
-    previous.content = `### 任务进度\n${previous.semantic}`;
+    previous.content = previous.semantic;
   }
   return coalesced;
 }
 
-function extractOriginProgress(lines, origin, fingerprint) {
+function extractOriginProgress(lines, origin, fingerprint, { taskIndex, nowMs } = {}) {
   const events = [];
   let activeTurnId = '';
   let terminalSeen = false;
+  let startedAtMs = Number.NaN;
+  const metadata = lines.find(({ entry }) => rootSessionMeta(entry, origin.threadId))?.entry;
   for (const item of lines) {
     const { entry, start, end } = item;
     if (entry?.type === 'event_msg') {
@@ -232,8 +286,11 @@ function extractOriginProgress(lines, origin, fingerprint) {
       if (payload.type === 'task_started') {
         activeTurnId = String(payload.turn_id ?? '');
         terminalSeen = false;
+        if (activeTurnId === origin.turnId) {
+          startedAtMs = Date.parse(String(entry.timestamp ?? ''));
+        }
         if (activeTurnId === origin.turnId && end > origin.rolloutCursor) {
-          events.push({ kind: 'started', content: '## 任务已开始\n已开始处理本轮任务。', start, end });
+          events.push({ kind: 'started', content: '正在处理本轮任务。', start, end });
         }
         continue;
       }
@@ -245,7 +302,7 @@ function extractOriginProgress(lines, origin, fingerprint) {
       if (terminalSeen || activeTurnId !== origin.turnId || end <= origin.rolloutCursor) continue;
       if (payload.type === 'agent_message' && payload.phase === 'commentary' && typeof payload.message === 'string') {
         const text = sanitizeProgressText(payload.message);
-        if (text) events.push({ kind: 'commentary', content: `### 任务进度\n${text}`, start, end, semantic: text });
+        if (text) events.push({ kind: 'commentary', content: text, start, end, semantic: text });
       } else if (payload.type === 'patch_apply_end' && String(payload.turn_id ?? '') === origin.turnId && String(payload.call_id ?? '').trim()) {
         const failed = payload.success === false || String(payload.status ?? '').toLocaleLowerCase() === 'failed';
         events.push({ kind: failed ? 'tool-failed' : 'tool-complete', content: failed ? '🔧 文件修改失败' : '🔧 文件修改已完成', start, end, semantic: String(payload.call_id) });
@@ -265,7 +322,7 @@ function extractOriginProgress(lines, origin, fingerprint) {
     if (!exactMetadataTurn(payload, origin.turnId)) continue;
     if (payload.type === 'message' && payload.role === 'assistant' && payload.phase === 'commentary') {
       const text = sanitizeProgressText(outputText(payload));
-      if (text) events.push({ kind: 'commentary', content: `### 任务进度\n${text}`, start, end, semantic: text });
+      if (text) events.push({ kind: 'commentary', content: text, start, end, semantic: text });
       continue;
     }
     const callId = String(payload.call_id ?? '').trim();
@@ -281,8 +338,25 @@ function extractOriginProgress(lines, origin, fingerprint) {
       fingerprint, turnId: origin.turnId, kind: event.kind,
       lineStart: event.identityStart ?? event.start, lineEnd: event.identityEnd ?? event.end,
     });
-    return { ...event, eventId, nonce: discordNonce(eventId) };
+    return {
+      ...event,
+      content: progressContent({ detail: event.content, origin, metadata, taskIndex, startedAtMs, nowMs }),
+      eventId,
+      nonce: discordNonce(eventId),
+    };
   });
+}
+
+function exactTurnCompleteEnd(lines, turnId) {
+  let activeTurnId = '';
+  for (const { entry, end } of lines) {
+    if (entry?.type !== 'event_msg') continue;
+    if (entry.payload?.type === 'task_started') activeTurnId = String(entry.payload?.turn_id ?? '');
+    if (entry.payload?.type !== 'task_complete') continue;
+    const completedTurnId = String(entry.payload?.turn_id ?? activeTurnId);
+    if (completedTurnId === String(turnId)) return end;
+  }
+  return 0;
 }
 
 async function exactOriginRollout(sessionsRoot, origin) {
@@ -303,7 +377,9 @@ async function exactOriginRollout(sessionsRoot, origin) {
   return candidates.length === 1 ? candidates[0] : null;
 }
 
-async function pollDiscordOriginEventsUnlocked({ sessionsRoot, inboxState, persistInboxState, dispatchMessage }) {
+async function pollDiscordOriginEventsUnlocked({
+  sessionsRoot, inboxState, persistInboxState, dispatchMessage, taskIndex, nowMs = Date.now(),
+}) {
   if (typeof persistInboxState !== 'function' || typeof dispatchMessage !== 'function') {
     throw new TypeError('Discord origin progress requires persistence and dispatch adapters');
   }
@@ -315,11 +391,23 @@ async function pollDiscordOriginEventsUnlocked({ sessionsRoot, inboxState, persi
       const rollout = await exactOriginRollout(sessionsRoot, origin);
       if (!rollout || (origin.rolloutFingerprint && origin.rolloutFingerprint !== rollout.fingerprint) ||
           Number(origin.rolloutCursor ?? 0) > rollout.bytes.length) continue;
+      const completeEnd = exactTurnCompleteEnd(rollout.parsed.entries, turnId);
+      if (completeEnd > Number(origin.rolloutCursor ?? 0)) {
+        await advanceDiscordTurnOrigin({
+          state: inboxState,
+          persistState: persistInboxState,
+          turnId,
+          rolloutCursor: completeEnd,
+          rolloutFingerprint: rollout.fingerprint,
+          discardPendingProgress: true,
+        });
+        continue;
+      }
       const pendingDispatch = storedOrigin.progressDispatch;
       if (pendingDispatch) {
         if (pendingDispatch.rolloutFingerprint !== rollout.fingerprint || pendingDispatch.end > rollout.parsed.completeEnd) continue;
         const boundedEntries = rollout.parsed.entries.filter((item) => item.end <= pendingDispatch.end);
-        const pendingEvent = extractOriginProgress(boundedEntries, origin, rollout.fingerprint)
+        const pendingEvent = extractOriginProgress(boundedEntries, origin, rollout.fingerprint, { taskIndex, nowMs })
           .find((event) => event.eventId === pendingDispatch.eventId && event.end === pendingDispatch.end);
         if (!pendingEvent) continue;
         const response = await dispatchMessage({
@@ -337,7 +425,7 @@ async function pollDiscordOriginEventsUnlocked({ sessionsRoot, inboxState, persi
         origin.rolloutCursor = pendingDispatch.end;
         delete origin.progressDispatch;
       }
-      const events = extractOriginProgress(rollout.parsed.entries, origin, rollout.fingerprint);
+      const events = extractOriginProgress(rollout.parsed.entries, origin, rollout.fingerprint, { taskIndex, nowMs });
       for (const event of events) {
         const current = inboxState.discordTurnOrigins[turnId];
         if (current.deliveredEventIds.includes(event.eventId)) continue;

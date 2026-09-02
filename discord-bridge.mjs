@@ -13,6 +13,7 @@ import {
   createEmptyInboxState,
   decryptPendingReplyText,
   discordRequest,
+  discordReplyChannelIds,
   encryptPendingReplyText,
   dispatchContinuation,
   getDiscordMessagesAfter,
@@ -518,6 +519,7 @@ const persistentLogCategories = new Set([
   'bridge-event', 'bridge-started', 'bridge-fatal', 'continuation-state-corrupt',
   'completion-watcher-started', 'rollout-poll-failed', 'rollout-state-save-failed',
   'queue-retry-failed', 'channel-poll-failed', 'index-refresh-failed', 'message-ignored',
+  'message-guidance-sent',
   'bridge-health-write-failed',
   'turn-completed', 'turn-failed', 'turn-cancelled', 'turn-finished',
   'turn-completion-connection-lost', 'continuation-started', 'continuation-queued',
@@ -828,6 +830,7 @@ export async function pollChannel({
   getMessages = getDiscordMessagesAfter,
   readMapping = () => readJsonFile(mappingPath, { version: 1, messages: {} }),
   continueRequest = startContinuation,
+  sendGuidance = (payload) => sendDiscordReply({ token, ...payload }),
   persistState = saveState,
   writeLog = log,
 }) {
@@ -854,6 +857,16 @@ export async function pollChannel({
         if (outcome?.stopChannelScan) {
           return { status: 'stopped', requestId: request.requestId, reason: outcome.reason };
         }
+      } else if (accepted.guidance) {
+        await sendGuidance({
+          channelId,
+          replyToMessageId: String(message.id),
+          content: '这条消息尚未发送到 Codex。请长按回复一条任务消息，或使用 `/继续任务` 选择任务。',
+          nonce: String(message.id),
+          enforceNonce: true,
+        });
+        await recordInboxMessageDurably(state, channelId, String(message.id), true, persistState);
+        await writeLog('message-guidance-sent', { messageId: message.id, channelId });
       } else {
         await recordInboxMessageDurably(state, channelId, String(message.id), false, persistState);
         await writeLog('message-ignored', { messageId: message.id, channelId });
@@ -1170,8 +1183,8 @@ export function createProductionBridgeDependencies({
       const config = context.config;
       const token = context.token;
       const state = context.inboxState;
-      const trackedReply = (payload) => context.trackDiscordRest(() => sendDiscordReply({ token, ...payload }));
-      const channelIds = [String(config.discordTaskChannelId), String(config.discordConfirmationChannelId)];
+      const trackedReply = (payload) => context.trackDiscordRest(() => sendDiscordReplyImpl({ token, ...payload }));
+      let channelIds = discordReplyChannelIds(config, state);
       const rolloutState = await readRolloutWatcherStateImpl(rolloutWatcherStatePath, { sessionsRoot });
       context.rolloutState = rolloutState;
       if (!context.inboxReadOnly) {
@@ -1203,6 +1216,8 @@ export function createProductionBridgeDependencies({
                 await pollDiscordOriginEvents({
                   sessionsRoot,
                   inboxState: state,
+                  taskIndex: context.taskIndex,
+                  nowMs: Date.now(),
                   persistInboxState: persistInboxStateImpl,
                   dispatchMessage: trackedReply,
                 });
@@ -1251,6 +1266,16 @@ export function createProductionBridgeDependencies({
               context.setLatestErrorCategory('queue-retry-failed');
               await log('queue-retry-failed');
             }
+            channelIds = discordReplyChannelIds(config, state);
+            const missingCursor = channelIds.some((channelId) => !Object.hasOwn(state.cursors, channelId));
+            if (missingCursor) {
+              await initializeInboxCursors({
+                state,
+                channelIds,
+                getLatest: (channelId) => context.trackDiscordRest(() => getLatestDiscordMessageId({ token, channelId })),
+              });
+              await commitInboxState({ state, persistState: persistInboxStateImpl, fields: ['initialized', 'cursors'] });
+            }
             for (const channelId of channelIds) {
               if (stopping) break;
               try {
@@ -1260,17 +1285,18 @@ export function createProductionBridgeDependencies({
                   state,
                   channelId,
                   getMessages: (options) => context.trackDiscordRest(() => getDiscordMessagesAfter(options)),
-                continueRequest: async (payload) => {
-                  try {
-                    return await startContinuation({
-                      ...payload,
-                      trackActiveResource: context.trackActiveResource,
-                      sendReply: trackedReply,
-                    });
-                  } finally {
-                    context.publishHealth?.();
-                  }
-                },
+                  continueRequest: async (payload) => {
+                    try {
+                      return await startContinuation({
+                        ...payload,
+                        trackActiveResource: context.trackActiveResource,
+                        sendReply: trackedReply,
+                      });
+                    } finally {
+                      context.publishHealth?.();
+                    }
+                  },
+                  sendGuidance: trackedReply,
                 });
               } catch {
                 context.setLatestErrorCategory('channel-poll-failed');
