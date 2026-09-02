@@ -21,6 +21,7 @@ import {
   getLatestDiscordMessageId,
   initializeInboxCursors,
   interruptCodexThread,
+  listActiveCodexThreads,
   listContinuations,
   loadDiscordToken,
   migrateLegacyPendingReplies,
@@ -931,6 +932,7 @@ function replaceIndex(target, source) {
 export function createProductionBridgeDependencies({
   runOnce = false,
   buildTaskIndexImpl = buildTaskIndex,
+  listActiveCodexThreadsImpl = listActiveCodexThreads,
   writeTaskIndexAtomicImpl = writeTaskIndexAtomic,
   runCodexControlActionImpl = runCodexControlAction,
   createInteractionRestClientImpl = createInteractionRestClient,
@@ -957,6 +959,15 @@ export function createProductionBridgeDependencies({
     installShared = true,
     recordActivity = true,
   } = {}) => enqueueTaskIndexOperation(async () => {
+    const contextThreadId = previousIndex?.tasks?.[0]?.threadId ?? context.taskIndex?.tasks?.[0]?.threadId;
+    let activeThreadIds;
+    if (contextThreadId) {
+      try {
+        activeThreadIds = await listActiveCodexThreadsImpl({ threadId: contextThreadId });
+      } catch {
+        // Desktop tools are optional while the bridge runs headlessly; keep rollout-derived state on failure.
+      }
+    }
     const rebuilt = await buildTaskIndexImpl({
       sessionsRoot,
       sessionIndexPath,
@@ -965,6 +976,7 @@ export function createProductionBridgeDependencies({
       discordWorktreeRoot: context.config.discordWorktreeRoot,
       projects: context.projectCatalog?.snapshot?.() ?? [],
       createdTasksByInteraction: context.inboxState?.createdTasksByInteraction ?? {},
+      activeThreadIds,
       nowMs,
     });
     const stableSnapshot = structuredClone(rebuilt);

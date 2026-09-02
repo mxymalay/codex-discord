@@ -88,8 +88,9 @@ test('production interaction wiring refreshes the shared index and uses only bou
   const rebuilt = { version: 1, generatedAt: '2026-09-01T08:00:00.000Z', tasks: [{ threadId: 'fresh-root' }] };
   const production = bridgeModule.createProductionBridgeDependencies({
     runOnce: true,
+    listActiveCodexThreadsImpl: async () => new Set(['fresh-root']),
     buildTaskIndexImpl: async (options) => {
-      events.push(['build', options.previousIndex, options.projects, options.createdTasksByInteraction]);
+      events.push(['build', options.previousIndex, options.projects, options.createdTasksByInteraction, options.activeThreadIds]);
       return rebuilt;
     },
     writeTaskIndexAtomicImpl: async (_targetPath, index) => { events.push(['write', structuredClone(index)]); },
@@ -105,7 +106,11 @@ test('production interaction wiring refreshes the shared index and uses only bou
       return { handle: async () => {} };
     },
   });
-  const originalIndex = { version: 1, generatedAt: '2026-09-01T07:00:00.000Z', tasks: [] };
+  const originalIndex = {
+    version: 1,
+    generatedAt: '2026-09-01T07:00:00.000Z',
+    tasks: [{ threadId: 'root-context' }],
+  };
   const context = {
     config: {
       ...config,
@@ -136,6 +141,7 @@ test('production interaction wiring refreshes the shared index and uses only bou
   assert.equal(events[0][1], originalIndex);
   assert.deepEqual(events[0][2], [{ id: 'project-1', name: 'POS', roots: ['C:\\saved\\POS'] }]);
   assert.strictEqual(events[0][3], context.inboxState.createdTasksByInteraction);
+  assert.deepEqual([...events[0][4]], ['fresh-root']);
 
   assert.deepEqual(await interactionDependencies.getCodexControlStatus(), { ok: true, desktop: { running: true } });
   assert.deepEqual(await interactionDependencies.stopCodexDesktop(), { ok: true, stoppedProcessCount: 1 });
@@ -145,6 +151,34 @@ test('production interaction wiring refreshes the shared index and uses only bou
     assert.match(call.controlPath, /codex-control\.ps1$/u);
     assert.deepEqual(Object.keys(call).sort(), ['action', 'controlPath', 'powershellPath']);
   }
+});
+
+test('desktop task status snapshot returns only active Codex roots', async () => {
+  assert.equal(typeof bridgeLib.listActiveCodexThreads, 'function');
+  const active = await bridgeLib.listActiveCodexThreads({
+    threadId: 'root-context',
+    appToolCall: async ({ tool, args, threadId }) => {
+      assert.equal(tool, 'list_threads');
+      assert.deepEqual(args, { limit: 50 });
+      assert.equal(threadId, 'root-context');
+      return {
+        contentItems: [{
+          type: 'inputText',
+          text: JSON.stringify({
+            pinnedThreads: [
+              { id: 'root-active-pinned', kind: 'codex', status: 'active' },
+              { id: 'chat-active', kind: 'chatgpt', status: 'active' },
+            ],
+            threads: [
+              { id: 'root-idle', kind: 'codex', status: 'notLoaded' },
+              { id: 'root-active-recent', kind: 'codex', status: 'active' },
+            ],
+          }),
+        }],
+      };
+    },
+  });
+  assert.deepEqual([...active].sort(), ['root-active-pinned', 'root-active-recent']);
 });
 
 test('production legacy watcher initialization receives the validated inbox origins', async () => {
@@ -420,6 +454,7 @@ test('production index refreshes serialize an older scan before a fresh takeover
   const fresh = { version: 1, generatedAt: '2026-09-01T08:00:00.000Z', tasks: [taskA, taskB] };
   const production = bridgeModule.createProductionBridgeDependencies({
     runOnce: true,
+    listActiveCodexThreadsImpl: async () => new Set(['root-a']),
     buildTaskIndexImpl: async () => {
       buildCalls += 1;
       if (buildCalls === 1) return structuredClone(initial);
@@ -467,6 +502,7 @@ test('production index refreshes serialize an older scan before a fresh takeover
 
   assert.equal(typeof production.refreshTaskIndex, 'function');
   const olderRefresh = production.refreshTaskIndex(context, { nowMs: Date.parse(older.generatedAt) });
+  await Promise.resolve();
   await Promise.resolve();
   assert.equal(buildCalls, 2);
   const confirmation = handle({

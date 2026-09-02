@@ -847,7 +847,14 @@ test('started continuation adds a live status button and running status uses a g
     taskIndex: { tasks: [running] },
     dispatchContinuation: async () => ({ status: 'started', turnId: 'turn-status' }),
     refreshTaskIndex: async () => ({ tasks: [current] }),
-    readTaskDetail: async (record) => ({ ...record, contentAvailable: true, taskText: '继续检查显卡驱动', resultText: '请确认下一步' }),
+    readTaskDetail: async (record) => ({
+      ...record,
+      contentAvailable: true,
+      taskText: '继续检查显卡驱动',
+      resultText: '请确认下一步',
+      model: 'gpt-5.6-sol',
+      reasoningEffort: 'ultra',
+    }),
   });
   const router = createInteractionRouter(dependencies);
   await router.handle(commandInteraction('继续任务', { 任务: 'root-1' }));
@@ -866,6 +873,7 @@ test('started continuation adds a live status button and running status uses a g
   assert.equal(statusCard.color, 9807270);
   assert.deepEqual(statusCard.fields.map((field) => field.name), ['项目名', '任务名', '任务']);
   assert.equal(statusCard.fields[2].value, '继续检查显卡驱动');
+  assert.equal(statusCard.footer.text, '由 5.6 Sol Ultra 支持');
 
   current = { ...running, status: 'confirmation-required' };
   await router.handle(componentInteraction(statusButton.custom_id, { id: 'status-confirmation' }));
@@ -874,6 +882,7 @@ test('started continuation adds a live status button and running status uses a g
   assert.equal(confirmationCard.title, 'Codex 任务待确认');
   assert.equal(confirmationCard.color, 15965202);
   assert.equal(confirmationCard.fields.at(-1).name, '待确认');
+  assert.equal(confirmationCard.footer.text, '由 5.6 Sol Ultra 支持');
 
   current = { ...running, status: 'completed' };
   await router.handle(componentInteraction(statusButton.custom_id, { id: 'status-completed' }));
@@ -882,6 +891,7 @@ test('started continuation adds a live status button and running status uses a g
   assert.equal(completedCard.title, 'Codex 任务已完成');
   assert.equal(completedCard.color, 3066993);
   assert.equal(completedCard.fields.at(-1).name, '结果');
+  assert.equal(completedCard.footer.text, '由 5.6 Sol Ultra 支持');
 });
 
 test('continue command and modal reject unknown roots and blank text without dispatching', async () => {
@@ -1117,6 +1127,7 @@ test('confirmed takeover is tenant and message bound, interrupts only its task, 
   assert.match(edits.at(-1).content, /已开始继续执行/);
   assert.match(edits.at(-1).content, /…12345678/);
   assert.equal(edits.at(-1).content.includes('turn-private'), false);
+  assert.equal(edits.at(-1).components[0].components[0].label, '查看当前运行状态');
   assert.equal([...uiState.values()].some((state) => state.kind === 'takeover-continue'), false);
 });
 
@@ -1152,6 +1163,7 @@ test('failed exact interruption keeps the queue and offers whole-Codex exit only
   await router.handle(componentInteraction(globalExit.custom_id, { id: 'global-fallback-confirmed' }));
   assert.equal(desktopStops, 1);
   assert.match(edits.at(-1).content, /整个 Codex 已退出.*已开始继续执行/);
+  assert.equal(edits.at(-1).components[0].components[0].label, '查看当前运行状态');
 });
 
 test('an unverified task owner stays queued without offering whole-Codex exit', async () => {
@@ -1369,7 +1381,7 @@ test('exact task takeover does not depend on global desktop inspection and never
       assert.equal(stopCalls, 0);
       assert.equal(retryCalls, 1);
       assert.match(edits.at(-1).content, /已开始继续执行/);
-      assert.equal(edits.at(-1).components.length, 0);
+      assert.equal(edits.at(-1).components[0].components[0].label, '查看当前运行状态');
       assert.equal(JSON.stringify(edits.at(-1)).includes('private'), false);
     });
   }
@@ -1441,7 +1453,7 @@ test('a new unrelated active task does not block exact target interruption', asy
   assert.equal(retryCalls, 1);
   assert.equal(responses[0].type, 6);
   assert.match(edits.at(-1).content, /已开始继续执行/);
-  assert.equal(edits.at(-1).components.length, 0);
+  assert.equal(edits.at(-1).components[0].components[0].label, '查看当前运行状态');
   assert.equal([...uiState.values()].some((state) => state.kind === 'takeover-continue'), false);
 });
 

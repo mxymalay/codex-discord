@@ -286,6 +286,21 @@ function Get-TaskNotificationEligibility {
     return [pscustomobject]@{ Allowed = $true; Reason = 'user-visible sidebar root task' }
 }
 
+function Read-SharedUtf8Lines {
+    param([string]$Path)
+
+    $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+    $reader = [System.IO.StreamReader]::new($stream, [System.Text.Encoding]::UTF8, $true)
+    try {
+        while (-not $reader.EndOfStream) {
+            Write-Output -NoEnumerate $reader.ReadLine()
+        }
+    }
+    finally {
+        $reader.Dispose()
+    }
+}
+
 function Add-NotificationTurnSupport {
     param([object]$Notification)
 
@@ -315,7 +330,7 @@ function Add-NotificationTurnSupport {
         }
 
         $matchingContext = $null
-        foreach ($line in [System.IO.File]::ReadLines($candidates[0].FullName, [System.Text.Encoding]::UTF8)) {
+        foreach ($line in (Read-SharedUtf8Lines -Path $candidates[0].FullName)) {
             if ([string]::IsNullOrWhiteSpace($line)) {
                 continue
             }
@@ -378,7 +393,7 @@ function Get-ExactDiscordRootTurnEligibility {
             }
             $matchingMetadata = @()
             $hasExactTurn = $false
-            foreach ($line in [System.IO.File]::ReadLines($candidate.FullName, [System.Text.Encoding]::UTF8)) {
+            foreach ($line in (Read-SharedUtf8Lines -Path $candidate.FullName)) {
                 if ([string]::IsNullOrWhiteSpace($line)) {
                     continue
                 }
@@ -531,7 +546,7 @@ function ConvertTo-DiscordMarkdownBody {
     if ([string]::IsNullOrEmpty($Value)) {
         return $Value
     }
-    $lines = $Value -split '\r?\n', -1
+    $lines = $Value -split '\r?\n'
     $escaped = foreach ($line in $lines) {
         $labelMatch = [regex]::Match($line, '\A([^：\r\n]{1,24})：(.*)\z')
         if ($labelMatch.Success) {
@@ -1924,10 +1939,10 @@ function New-QuotaUsageChangeText {
     return @(
         "额度：$oldText% → $newText%",
         "距上次变化：$elapsedText",
-        $trendText,
+        "使用速度：$trendText",
         "距下次更新还有：$untilResetText",
-        "如果以当前速度连续，$currentEstimate",
-        "如果以重置至今平均速度，$averageEstimate"
+        "按当前速度：$currentEstimate",
+        "按重置至今平均速度：$averageEstimate"
     ) -join "`n"
 }
 

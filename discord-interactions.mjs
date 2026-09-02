@@ -5,6 +5,7 @@ import { COMMAND_NAMES, authorizeInteraction, ephemeral, validNewTaskModelEffort
 import { cancelContinuationPersisted as cancelPersistedContinuation, createContinuationRequest } from './discord-bridge-lib.mjs';
 import { renderHealthReport, runFullHealthChecks, runQuickHealthChecks } from './discord-health-lib.mjs';
 import { NO_PROJECT, resolveProjectSelection } from './discord-task-create-lib.mjs';
+import { supportText } from './rollout-completion-watcher-lib.mjs';
 import {
   buildTakeoverSnapshot,
   createTakeoverUiState,
@@ -553,7 +554,13 @@ function taskStatusCard(detail) {
   if (resultLabel) {
     fields.push({ name: resultLabel, value: markdownBodyValue(detail?.resultText, '（暂无结果）', 1_024), inline: false });
   }
-  return { title: presentation[0], color: presentation[1], fields };
+  const footer = supportText({ model: detail?.model, effort: detail?.reasoningEffort });
+  return {
+    title: presentation[0],
+    color: presentation[1],
+    fields,
+    ...(footer ? { footer: { text: footer } } : {}),
+  };
 }
 
 export function renderSearchResults(results, keyword) {
@@ -1576,9 +1583,14 @@ async function confirmContinuationTakeover(dependencies, routerState, interactio
     } catch {
       result = { status: 'failed' };
     }
+    const components = result?.status === 'started' ? [createTaskStatusRow(dependencies, {
+      threadId: state.targetThreadId,
+      userId: userId(interaction),
+      guildId: guildId(interaction),
+    })] : [];
     return editOriginal(dependencies, interaction, {
       content: continuationTakeoverResult(result),
-      components: [],
+      components,
     });
   } finally {
     routerState.takeoverInProgress = false;
@@ -1658,9 +1670,14 @@ async function confirmContinuationGlobalFallback(dependencies, routerState, inte
     } catch {
       result = { status: 'failed' };
     }
+    const components = result?.status === 'started' ? [createTaskStatusRow(dependencies, {
+      threadId: state.targetThreadId,
+      userId: userId(interaction),
+      guildId: guildId(interaction),
+    })] : [];
     return editOriginal(dependencies, interaction, {
       content: continuationTakeoverResult(result, '整个 Codex 已退出'),
-      components: [],
+      components,
     });
   } finally {
     routerState.takeoverInProgress = false;

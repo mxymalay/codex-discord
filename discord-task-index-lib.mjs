@@ -125,9 +125,10 @@ function cleanPageText(value) {
   return String(value ?? '').replaceAll('\u0000', '').replace(/\r\n?/g, '\n').trim();
 }
 
-function isUserAuthoredResponseMessage(payload) {
+function isUserAuthoredMessage(payload, candidate) {
   const kinds = payload?.internal_chat_message_metadata_passthrough?.content_item_kinds;
-  return !Array.isArray(kinds) || kinds.includes('user.text');
+  if (Array.isArray(kinds)) return kinds.includes('user.text');
+  return !/^\s*<(?:recommended_plugins|environment_context|codex_internal_context|heartbeat)(?:\s|>)/iu.test(candidate);
 }
 
 function normalizeSearch(value) {
@@ -414,7 +415,7 @@ function buildRecord({ entries, middleSkipped, rolloutPath, offset, expectedThre
     statusChangedMs = timestampMs ?? statusChangedMs;
   }
 
-  if (activeTurnId) {
+  if (activeTurnId && status === 'running') {
     const activeStartedMs = turns.get(activeTurnId);
     if (activeStartedMs == null || !Number.isFinite(nowMs) || nowMs < activeStartedMs) runtimeComplete = false;
     else runtimeMs += nowMs - activeStartedMs;
@@ -444,11 +445,18 @@ function buildRecord({ entries, middleSkipped, rolloutPath, offset, expectedThre
     ...explicitProject,
   }, projects);
   const project = Array.isArray(projects) && projects.length > 0 ? inferredProject : explicitProject;
+  const explicitlyProjectless = explicitProject.projectId == null && explicitProject.projectName === '无项目';
+  const workspacePath = stringOrNull(meta?.cwd ?? createdRecord?.workspace?.cwd);
+  const workspaceName = workspacePath ? stringOrNull(path.win32.basename(workspacePath.replaceAll('/', '\\'))) : null;
+  const displayProject = project.projectName ? project : {
+    projectId: null,
+    projectName: explicitlyProjectless ? '无项目' : workspaceName,
+  };
   const worktree = worktreeMetadata(meta, worktreeRoot);
   return {
     threadId: String(meta.id),
-    projectId: project.projectId,
-    projectName: project.projectName,
+    projectId: displayProject.projectId,
+    projectName: displayProject.projectName,
     taskName: stringOrNull(sidebarEntry?.thread_name ?? sidebarEntry?.threadName ?? sidebarEntry?.name) ??
       stringOrNull(createdRecord?.taskName) ?? previous?.taskName ?? '未命名任务',
     status,
@@ -504,6 +512,7 @@ export async function buildTaskIndex({
   discordWorktreeRoot,
   projects = [],
   createdTasksByInteraction = {},
+  activeThreadIds,
   readLimits,
   fileSystem = fs,
 }) {
@@ -601,6 +610,19 @@ export async function buildTaskIndex({
     recordsById.set(key, retained);
   }
 
+  if (activeThreadIds != null) {
+    const activeKeys = new Set([...activeThreadIds].map(identityKey));
+    for (const [key, record] of recordsById) {
+      if (activeKeys.has(key)) {
+        record.status = 'running';
+        record.completedAt = null;
+      } else if (record.status === 'running') {
+        record.status = 'pending';
+        record.runtimeMs = null;
+      }
+    }
+  }
+
   const tasks = [...recordsById.values()].sort((left, right) =>
     (validTime(right.lastActivityAt) ?? 0) - (validTime(left.lastActivityAt) ?? 0) || left.threadId.localeCompare(right.threadId));
   return { version: indexVersion, generatedAt: new Date(Number(nowMs)).toISOString(), tasks };
@@ -636,11 +658,19 @@ export async function readTaskDetail(record, options = {}) {
   let taskText = '';
   let resultText = '';
   let latestAgentText = '';
+  let model = '';
+  let reasoningEffort = '';
   for (const entry of entries) {
     const payload = entry.payload ?? {};
+    if (entry?.type === 'turn_context') {
+      model = stringOrNull(payload.model) ?? model;
+      reasoningEffort = stringOrNull(payload.effort ?? payload.reasoning_effort) ?? reasoningEffort;
+      continue;
+    }
     if (entry?.type === 'event_msg') {
       if (payload.type === 'user_message' && !taskText) {
-        taskText = cleanPageText(textValue(payload.message ?? payload.content));
+        const candidate = cleanPageText(textValue(payload.message ?? payload.content));
+        if (candidate && isUserAuthoredMessage(payload, candidate)) taskText = candidate;
         continue;
       }
       if (payload.type === 'agent_message') {
@@ -657,7 +687,7 @@ export async function readTaskDetail(record, options = {}) {
     if (entry?.type === 'response_item' && payload.type === 'message') {
       const role = String(payload.role ?? '').toLocaleLowerCase();
       const candidate = cleanPageText(textValue(payload.content));
-      if (role === 'user' && !taskText && candidate && isUserAuthoredResponseMessage(payload)) taskText = candidate;
+      if (role === 'user' && !taskText && candidate && isUserAuthoredMessage(payload, candidate)) taskText = candidate;
       if (role === 'assistant' && candidate && (!payload.phase || payload.phase === 'final_answer')) resultText = candidate;
     }
   }
@@ -669,7 +699,7 @@ export async function readTaskDetail(record, options = {}) {
     '## 最新结果',
     resultText || '（暂无结果）',
   ].join('\n');
-  return { ...record, contentAvailable: true, taskText, resultText, markdown };
+  return { ...record, contentAvailable: true, taskText, resultText, model, reasoningEffort, markdown };
 }
 
 function taskSummary(record, matchScore) {

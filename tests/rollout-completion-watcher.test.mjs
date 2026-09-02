@@ -737,6 +737,79 @@ test('keeps a failed fallback pending and retries it later', async () => {
   }
 });
 
+test('reconstructs a huge pending rollout without a whole-file read', { concurrency: false }, async () => {
+  const paths = await fixture();
+  const largeThreadId = '33333333-3333-4333-8333-333333333333';
+  const largeTurnId = '44444444-4444-4444-8444-444444444444';
+  const largeRollout = path.join(paths.root, 'rollout-large.jsonl');
+  const originalReadFile = fs.readFile;
+  try {
+    const largeMeta = { ...sessionMeta(), payload: { ...sessionMeta().payload, id: largeThreadId } };
+    const largeStart = { ...taskStarted(), payload: { ...taskStarted().payload, turn_id: largeTurnId } };
+    const largeInput = { ...userMessage('超大任务也要完成通知'), payload: { ...userMessage('超大任务也要完成通知').payload } };
+    const largeComplete = { ...taskComplete('超大任务已完成'), payload: { ...taskComplete('超大任务已完成').payload, turn_id: largeTurnId } };
+    await fs.writeFile(largeRollout, [largeMeta, largeStart, largeInput].map(jsonLine).join(''), 'utf8');
+    await fs.truncate(largeRollout, 20 * 1024 * 1024);
+    await fs.appendFile(largeRollout, `\n${jsonLine(largeComplete)}`, 'utf8');
+    await fs.writeFile(paths.rolloutPath, [sessionMeta(), taskStarted(), userMessage(), taskComplete()].map(jsonLine).join(''), 'utf8');
+
+    const state = createEmptyRolloutWatcherState();
+    state.initialized = true;
+    state.pending[largeTurnId] = {
+      completedAtMs: 0, lastAttemptAtMs: 0, rolloutPath: largeRollout,
+      threadId: largeThreadId, cwd: 'C:\\workspace\\large',
+    };
+    fs.readFile = async (target, ...args) => {
+      if (path.resolve(String(target)) === path.resolve(largeRollout)) {
+        throw Object.assign(new Error('whole-file read unavailable for large rollout'), { code: 'ERR_FS_FILE_TOO_LARGE' });
+      }
+      return originalReadFile(target, ...args);
+    };
+
+    const dispatched = [];
+    await pollRolloutCompletions({
+      sessionsRoot: paths.sessionsRoot, state,
+      nowMs: Date.parse('2026-09-01T00:00:20.000Z'), graceMs: 0, retryMs: 0,
+      dispatchNotification: async (notification) => dispatched.push(notification),
+    });
+
+    assert.deepEqual(dispatched.map((item) => item['turn-id']), [largeTurnId, turnId]);
+    assert.equal(dispatched[0]['last-assistant-message'], '超大任务已完成');
+    assert.deepEqual(state.pending, {});
+  } finally {
+    fs.readFile = originalReadFile;
+    await fs.rm(paths.root, { recursive: true, force: true });
+  }
+});
+
+test('an unreconstructable pending rollout does not block a later completion', async () => {
+  const paths = await fixture();
+  const brokenTurnId = '44444444-4444-4444-8444-444444444444';
+  try {
+    await fs.writeFile(paths.rolloutPath, [sessionMeta(), taskStarted(), userMessage(), taskComplete()].map(jsonLine).join(''), 'utf8');
+    const state = createEmptyRolloutWatcherState();
+    state.initialized = true;
+    state.pending[brokenTurnId] = {
+      completedAtMs: 0, lastAttemptAtMs: 0,
+      rolloutPath: path.join(paths.root, 'missing-rollout.jsonl'),
+      threadId: '33333333-3333-4333-8333-333333333333', cwd: '',
+    };
+    const dispatched = [];
+
+    await pollRolloutCompletions({
+      sessionsRoot: paths.sessionsRoot, state,
+      nowMs: Date.parse('2026-09-01T00:00:20.000Z'), graceMs: 0, retryMs: 0,
+      dispatchNotification: async (notification) => dispatched.push(notification),
+    });
+
+    assert.deepEqual(dispatched.map((item) => item['turn-id']), [turnId]);
+    assert.equal(Object.hasOwn(state.pending, brokenTurnId), true);
+    assert.equal(Object.hasOwn(state.pending, turnId), false);
+  } finally {
+    await fs.rm(paths.root, { recursive: true, force: true });
+  }
+});
+
 test('terminal fallback discards unsent progress and still delivers the final result', async () => {
   const paths = await fixture();
   const inboxState = createEmptyInboxState();
@@ -878,13 +951,13 @@ test('keeps only a sanitized locator when the canonical rollout is unavailable',
       dispatchNotification: async () => { throw new Error('dispatch must wait for grace period'); },
     });
     await fs.rm(paths.rolloutPath);
-    await assert.rejects(() => pollRolloutCompletions({
+    await pollRolloutCompletions({
       sessionsRoot: paths.sessionsRoot,
       state,
       nowMs: Date.parse('2026-09-01T00:00:20.000Z'),
       graceMs: 5_000,
       dispatchNotification: async () => {},
-    }), /Rollout content is unavailable/);
+    });
     assert.equal(Object.keys(state.pending).length, 1);
     assert.equal(JSON.stringify(state.pending).includes('请检查 Discord 通知为什么漏发'), false);
     assert.equal(JSON.stringify(state.pending).includes('已经完成修复。'), false);

@@ -41,7 +41,18 @@ function Invoke-TaskCase {
     }
     Add-Content -LiteralPath $script:sessionPath -Value ($turnContext | ConvertTo-Json -Depth 8 -Compress) -Encoding UTF8
     $raw = $notification | ConvertTo-Json -Depth 8 -Compress
-    $output = @(& $script:testDispatcher $raw -MobileOnly -DryRun)
+    $writer = [System.IO.File]::Open(
+        $script:sessionPath,
+        [System.IO.FileMode]::Open,
+        [System.IO.FileAccess]::Write,
+        [System.IO.FileShare]::ReadWrite
+    )
+    try {
+        $output = @(& $script:testDispatcher $raw -MobileOnly -DryRun)
+    }
+    finally {
+        $writer.Dispose()
+    }
     return ((($output | ForEach-Object { [string]$_ }) -join "`n").Trim() | ConvertFrom-Json)
 }
 

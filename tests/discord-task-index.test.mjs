@@ -163,6 +163,31 @@ test('Discord managed worktree project provenance wins over generated path match
   }, projects), { projectId: 'example-project', projectName: 'example-project' });
 });
 
+test('index project display falls back to the workspace name but preserves explicit no-project tasks', async () => {
+  const paths = await fixture();
+  try {
+    await writeJsonl(paths.sessionIndexPath, [
+      { id: 'workspace-fallback', thread_name: '工作目录任务' },
+      { id: 'explicit-projectless', thread_name: '明确无项目任务' },
+    ]);
+    await writeJsonl(paths.rollout('workspace-fallback'), [
+      meta('workspace-fallback', { cwd: 'C:\\Users\\operator\\Documents\\Codex\\new-chat' }),
+    ]);
+    await writeJsonl(paths.rollout('explicit-projectless'), [
+      meta('explicit-projectless', { cwd: 'C:\\Discord Tasks\\operation', project_name: '无项目' }),
+    ]);
+
+    const index = await buildTaskIndex({
+      ...paths,
+      projects: [{ id: 'saved', name: 'Saved', roots: ['C:\\saved'] }],
+    });
+    assert.equal(index.tasks.find((item) => item.threadId === 'workspace-fallback').projectName, 'new-chat');
+    assert.equal(index.tasks.find((item) => item.threadId === 'explicit-projectless').projectName, '无项目');
+  } finally {
+    await fs.rm(paths.root, { recursive: true, force: true });
+  }
+});
+
 test('indexes a persisted Discord-created root absent from sidebar but never promotes its child rollout', async () => {
   const paths = await fixture();
   const rootId = '01a05d0a-5a8f-71f2-b5e1-96fe962224b5';
@@ -306,6 +331,42 @@ test('keeps the first tail entry when its read window starts exactly at a JSONL 
         tailBytes: Buffer.byteLength(tail),
       },
     })).resultText, '边界结果');
+  } finally {
+    await fs.rm(paths.root, { recursive: true, force: true });
+  }
+});
+
+test('a newer bounded terminal event does not revive an unmatched old head turn', async () => {
+  const paths = await fixture();
+  const threadId = '019cdef0-2222-7890-abcd-1234567890ab';
+  const rolloutPath = paths.rollout(`2026-09-01T00-00-00-${threadId}`);
+  try {
+    await writeJsonl(paths.sessionIndexPath, [{ id: threadId, thread_name: '有界生命周期任务' }]);
+    const head = [
+      meta(threadId),
+      event('2026-09-01T00:01:00.000Z', 'task_started', { turn_id: 'old-turn' }),
+    ].map(line).join('');
+    const middle = [
+      event('2026-09-01T00:02:00.000Z', 'task_complete', { turn_id: 'old-turn' }),
+      event('2026-09-01T00:03:00.000Z', 'agent_message', { message: 'x'.repeat(2_000) }),
+    ].map(line).join('');
+    const tail = line(event('2026-09-01T00:04:00.000Z', 'task_complete', {
+      turn_id: 'newer-turn', last_agent_message: '最终完成',
+    }));
+    await fs.mkdir(path.dirname(rolloutPath), { recursive: true });
+    await fs.writeFile(rolloutPath, `${head}${middle}${tail}`, 'utf8');
+
+    const index = await buildTaskIndex({
+      ...paths,
+      readLimits: {
+        wholeFileBytes: Buffer.byteLength(head),
+        headBytes: Buffer.byteLength(head),
+        tailBytes: Buffer.byteLength(tail),
+        sidebarChunkBytes: 17,
+      },
+      nowMs: Date.parse('2026-09-01T00:05:00.000Z'),
+    });
+    assert.equal(index.tasks[0].status, 'completed');
   } finally {
     await fs.rm(paths.root, { recursive: true, force: true });
   }
@@ -1016,6 +1077,102 @@ test('task detail skips app-injected user context and keeps the first real user 
 
     assert.equal(detail.taskText, '我的命令行怎么找不到 Codex');
     assert.equal(detail.markdown.includes('recommended_plugins'), false);
+  } finally {
+    await fs.rm(paths.root, { recursive: true, force: true });
+  }
+});
+
+test('task detail prefers the real user event when unlabelled app context appears first', async () => {
+  const paths = await fixture();
+  try {
+    const rolloutPath = paths.rollout('unlabelled-injected-context-detail');
+    await writeJsonl(rolloutPath, [
+      meta('unlabelled-injected-context-detail'),
+      responseMessage(
+        '2026-09-01T00:01:00.000Z',
+        'user',
+        '<recommended_plugins>\n- Airtable\n</recommended_plugins>\n<environment_context>private app context</environment_context>',
+      ),
+      event('2026-09-01T00:01:00.500Z', 'user_message', {
+        message: '<environment_context>another injected app context</environment_context>',
+      }),
+      responseMessage('2026-09-01T00:01:01.000Z', 'user', '修复 Discord 卡片原始任务'),
+      event('2026-09-01T00:01:01.000Z', 'user_message', { message: '修复 Discord 卡片原始任务' }),
+      {
+        timestamp: '2026-09-01T00:01:02.000Z',
+        type: 'turn_context',
+        payload: { turn_id: 'turn-real', model: 'gpt-5.6-sol', effort: 'ultra' },
+      },
+    ]);
+
+    const detail = await readTaskDetail({
+      threadId: 'unlabelled-injected-context-detail', rolloutPath, offset: (await fs.stat(rolloutPath)).size,
+    });
+
+    assert.equal(detail.taskText, '修复 Discord 卡片原始任务');
+    assert.equal(detail.taskText.includes('recommended_plugins'), false);
+    assert.equal(detail.model, 'gpt-5.6-sol');
+    assert.equal(detail.reasoningEffort, 'ultra');
+  } finally {
+    await fs.rm(paths.root, { recursive: true, force: true });
+  }
+});
+
+test('live desktop activity overrides incomplete rollout running markers', async () => {
+  const paths = await fixture();
+  try {
+    const staleId = 'stale-running-root';
+    const liveId = 'live-running-root';
+    await writeJsonl(paths.sessionIndexPath, [
+      { id: staleId, thread_name: '旧运行标记' },
+      { id: liveId, thread_name: '实时运行任务' },
+    ]);
+    await writeJsonl(paths.rollout(staleId), [
+      meta(staleId),
+      event('2026-09-01T00:01:00.000Z', 'task_started', { turn_id: 'stale-turn' }),
+    ]);
+    await writeJsonl(paths.rollout(liveId), [
+      meta(liveId),
+      event('2026-09-01T00:01:00.000Z', 'task_started', { turn_id: 'finished-turn' }),
+      event('2026-09-01T00:02:00.000Z', 'task_complete', { turn_id: 'finished-turn' }),
+    ]);
+
+    const index = await buildTaskIndex({
+      ...paths,
+      nowMs: Date.parse('2026-09-01T00:10:00.000Z'),
+      activeThreadIds: new Set([liveId]),
+    });
+
+    assert.equal(index.tasks.find((item) => item.threadId === staleId).status, 'pending');
+    assert.equal(index.tasks.find((item) => item.threadId === liveId).status, 'running');
+  } finally {
+    await fs.rm(paths.root, { recursive: true, force: true });
+  }
+});
+
+test('live desktop activity also corrects an unchanged cached running record', async () => {
+  const paths = await fixture();
+  try {
+    const threadId = 'cached-stale-running-root';
+    const rolloutPath = paths.rollout(threadId);
+    await writeJsonl(paths.sessionIndexPath, [{ id: threadId, thread_name: '缓存中的旧运行标记' }]);
+    await writeJsonl(rolloutPath, [
+      meta(threadId),
+      event('2026-09-01T00:01:00.000Z', 'task_started', { turn_id: 'stale-turn' }),
+    ]);
+    const stale = await buildTaskIndex({
+      ...paths,
+      nowMs: Date.parse('2026-09-01T00:02:00.000Z'),
+    });
+    assert.equal(stale.tasks[0].status, 'running');
+
+    const corrected = await buildTaskIndex({
+      ...paths,
+      previousIndex: stale,
+      activeThreadIds: new Set(),
+      nowMs: Date.parse('2026-09-01T00:03:00.000Z'),
+    });
+    assert.equal(corrected.tasks[0].status, 'pending');
   } finally {
     await fs.rm(paths.root, { recursive: true, force: true });
   }

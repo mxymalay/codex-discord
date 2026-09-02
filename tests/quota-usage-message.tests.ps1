@@ -160,6 +160,10 @@ function Invoke-QuotaCase {
     if ([int]$message.payload.embeds[0].color -ne 3447003) {
         throw "[$Name] expected blue Discord embed 3447003, got $($message.payload.embeds[0].color)"
     }
+    $description = [string]$message.payload.embeds[0].description
+    foreach ($label in @('额度', '距上次变化', '使用速度', '距下次更新还有', '按当前速度', '按重置至今平均速度')) {
+        Assert-ContainsText -CaseName $Name -Body $description -Expected "**$label：**"
+    }
     foreach ($expected in $ExpectedTexts) {
         Assert-ContainsText -CaseName $Name -Body ([string]$message.body) -Expected $expected
     }
@@ -202,8 +206,8 @@ try {
             (From-Base64Utf8 '6Led5LiK5qyh5Y+Y5YyW77yaMuWwj+aXtg=='),
             (From-Base64Utf8 '6L+Z5qyh5q+U5LiK5qyh55So5b6X5pu05b+r77yB'),
             (From-Base64Utf8 '6Led5LiL5qyh5pu05paw6L+Y5pyJ77yaNOWkqTEy5bCP5pe2'),
-            (From-Base64Utf8 '5aaC5p6c5Lul5b2T5YmN6YCf5bqm6L+e57ut77yM5bCG5LqOM+WkqTE25bCP5pe25ZCO55So5a6M44CC'),
-            (From-Base64Utf8 '5aaC5p6c5Lul6YeN572u6Iez5LuK5bmz5Z2H6YCf5bqm77yM5bCG5LqOMTjlpKk45bCP5pe25ZCO55So5a6M44CC'),
+            (From-Base64Utf8 '5oyJ5b2T5YmN6YCf5bqm77ya5bCG5LqOM+WkqTE25bCP5pe25ZCO55So5a6M44CC'),
+            (From-Base64Utf8 '5oyJ6YeN572u6Iez5LuK5bmz5Z2H6YCf5bqm77ya5bCG5LqOMTjlpKk45bCP5pe25ZCO55So5a6M44CC'),
             (From-Base64Utf8 '6K+l5pe26Ze05pma5LqO5LiL5qyh5pu05paw77yM5pys5ZGo5pyf6aKE6K6h55So5LiN5a6M44CC')
         )
 
@@ -228,7 +232,7 @@ try {
         -ConfirmedIncrease `
         -ExpectedTexts @(
             (From-Base64Utf8 '5pys5qyh6aKd5bqm5aKe5Yqg77yM5L2/55So6YCf5bqm6YeN5paw6YeH5qC377yB'),
-            (From-Base64Utf8 '5aaC5p6c5Lul5b2T5YmN6YCf5bqm6L+e57ut77yM5pqC5pe25peg5rOV5Lyw566X5L2V5pe255So5a6M44CC')
+            (From-Base64Utf8 '5oyJ5b2T5YmN6YCf5bqm77ya5pqC5pe25peg5rOV5Lyw566X5L2V5pe255So5a6M44CC')
         )
 
     Invoke-QuotaCase -Name 'window switch restarts sampling' `
@@ -236,15 +240,15 @@ try {
         -CurrentObservedAt $observedAt -PreviousResetAt '2026-09-04T00:00:00Z' -CurrentResetAt $resetAt `
         -ExpectedTexts @(
             (From-Base64Utf8 '5pys5qyh6aKd5bqm5ZGo5pyf5bey5pu05paw77yM5L2/55So6YCf5bqm6YeN5paw6YeH5qC377yB'),
-            (From-Base64Utf8 '5aaC5p6c5Lul6YeN572u6Iez5LuK5bmz5Z2H6YCf5bqm77yM5pqC5pe25peg5rOV5Lyw566X5L2V5pe255So5a6M44CC')
+            (From-Base64Utf8 '5oyJ6YeN572u6Iez5LuK5bmz5Z2H6YCf5bqm77ya5pqC5pe25peg5rOV5Lyw566X5L2V5pe255So5a6M44CC')
         )
 
     Invoke-QuotaCase -Name 'depleted quota is explicit' `
         -PreviousRemaining 1 -CurrentUsed 100 -PreviousChangeAt '2026-08-31T10:00:00Z' -PreviousRate 1.0 `
         -CurrentObservedAt $observedAt -PreviousResetAt $previousResetAt -CurrentResetAt $resetAt `
         -ExpectedTexts @(
-            (From-Base64Utf8 '5aaC5p6c5Lul5b2T5YmN6YCf5bqm6L+e57ut77yM6aKd5bqm5bey57uP55So5a6M44CC'),
-            (From-Base64Utf8 '5aaC5p6c5Lul6YeN572u6Iez5LuK5bmz5Z2H6YCf5bqm77yM6aKd5bqm5bey57uP55So5a6M44CC')
+            (From-Base64Utf8 '5oyJ5b2T5YmN6YCf5bqm77ya6aKd5bqm5bey57uP55So5a6M44CC'),
+            (From-Base64Utf8 '5oyJ6YeN572u6Iez5LuK5bmz5Z2H6YCf5bqm77ya6aKd5bqm5bey57uP55So5a6M44CC')
         )
 
     Invoke-QuotaCase -Name 'unknown reset time is explicit' `
@@ -252,7 +256,7 @@ try {
         -CurrentObservedAt $observedAt -PreviousResetAt '1970-01-01T00:00:00Z' -CurrentResetAt '1970-01-01T00:00:00Z' `
         -ExpectedTexts @(
             (From-Base64Utf8 '6Led5LiL5qyh5pu05paw6L+Y5pyJ77ya5pyq55+l'),
-            (From-Base64Utf8 '5aaC5p6c5Lul6YeN572u6Iez5LuK5bmz5Z2H6YCf5bqm77yM5pqC5pe25peg5rOV5Lyw566X5L2V5pe255So5a6M44CC')
+            (From-Base64Utf8 '5oyJ6YeN572u6Iez5LuK5bmz5Z2H6YCf5bqm77ya5pqC5pe25peg5rOV5Lyw566X5L2V5pe255So5a6M44CC')
         )
 
     Invoke-QuotaCase -Name 'expired reset time is explicit' `
@@ -260,7 +264,7 @@ try {
         -CurrentObservedAt $observedAt -PreviousResetAt '2026-08-31T11:00:00Z' -CurrentResetAt '2026-08-31T11:00:00Z' `
         -ExpectedTexts @(
             (From-Base64Utf8 '6Led5LiL5qyh5pu05paw6L+Y5pyJ77ya5LiN6LazMeWIhumSnw=='),
-            (From-Base64Utf8 '5aaC5p6c5Lul6YeN572u6Iez5LuK5bmz5Z2H6YCf5bqm77yM5pqC5pe25peg5rOV5Lyw566X5L2V5pe255So5a6M44CC')
+            (From-Base64Utf8 '5oyJ6YeN572u6Iez5LuK5bmz5Z2H6YCf5bqm77ya5pqC5pe25peg5rOV5Lyw566X5L2V5pe255So5a6M44CC')
         )
 
     Invoke-QuotaCase -Name 'first speed compares with cycle average' `

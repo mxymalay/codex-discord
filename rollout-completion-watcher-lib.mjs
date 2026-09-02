@@ -18,6 +18,7 @@ const metadataReadBytes = 512 * 1024;
 const recentTailBytes = 8 * 1024 * 1024;
 const recentContextWindowMs = 24 * 60 * 60 * 1000;
 const maxProgressLineBytes = 256 * 1024;
+const maxNotificationLineBytes = 8 * 1024 * 1024;
 const maxProgressChars = 1_400;
 const originPollQueues = new WeakMap();
 
@@ -131,6 +132,57 @@ function parseLinesWithOffsets(buffer) {
   return { entries, completeEnd: start };
 }
 
+async function scanJsonLines(filePath, visit, { maxLineBytes = maxNotificationLineBytes } = {}) {
+  const handle = await fs.open(filePath, 'r');
+  const buffer = Buffer.allocUnsafe(256 * 1024);
+  let fileOffset = 0;
+  let pending = Buffer.alloc(0);
+  let pendingStart = 0;
+  let dropping = false;
+  try {
+    for (;;) {
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
+      if (bytesRead === 0) break;
+      const chunk = buffer.subarray(0, bytesRead);
+      let segmentStart = 0;
+      for (;;) {
+        const newline = chunk.indexOf(0x0a, segmentStart);
+        if (newline < 0) break;
+        const end = fileOffset + newline + 1;
+        if (dropping) {
+          dropping = false;
+        } else {
+          const segment = chunk.subarray(segmentStart, newline);
+          const raw = pending.length ? Buffer.concat([pending, segment]) : segment;
+          if (raw.length > 0 && raw.length <= maxLineBytes) {
+            const line = raw[raw.length - 1] === 0x0d ? raw.subarray(0, -1) : raw;
+            try {
+              if (visit(JSON.parse(line.toString('utf8')), { start: pendingStart, end }) === false) return;
+            } catch (error) {
+              if (!(error instanceof SyntaxError)) throw error;
+            }
+          }
+        }
+        pending = Buffer.alloc(0);
+        segmentStart = newline + 1;
+        pendingStart = end;
+      }
+      if (!dropping && segmentStart < chunk.length) {
+        const remainder = chunk.subarray(segmentStart);
+        if (pending.length + remainder.length > maxLineBytes) {
+          pending = Buffer.alloc(0);
+          dropping = true;
+        } else {
+          pending = pending.length ? Buffer.concat([pending, remainder]) : Buffer.from(remainder);
+        }
+      }
+      fileOffset += bytesRead;
+    }
+  } finally {
+    await handle.close();
+  }
+}
+
 function rootSessionMeta(entry, threadId) {
   if (entry?.type !== 'session_meta' || String(entry.payload?.id ?? '') !== String(threadId)) return false;
   const payload = entry.payload ?? {};
@@ -229,7 +281,7 @@ function turnSupport(entries, turnId) {
   return { model, effort };
 }
 
-function supportText({ model, effort } = {}) {
+export function supportText({ model, effort } = {}) {
   if (!model || !effort) return '';
   const modelName = model.replace(/^gpt-/iu, '').split('-')
     .map((part) => /^\d/u.test(part) ? part : `${part.slice(0, 1).toLocaleUpperCase()}${part.slice(1)}`)
@@ -681,7 +733,12 @@ export async function pollRolloutCompletions({
     .sort((left, right) => Number(left[1].completedAtMs) - Number(right[1].completedAtMs));
   for (const [turnId, item] of ready) {
     item.lastAttemptAtMs = nowMs;
-    const notification = await reconstructNotification(item, turnId);
+    let notification;
+    try {
+      notification = await reconstructNotification(item, turnId);
+    } catch {
+      continue;
+    }
     const enrichedNotification = enrichDiscordOriginNotification(notification, inboxState);
     const origin = enrichedNotification ? resolveDiscordOrigin(enrichedNotification, inboxState) : null;
     if (origin?.deliveryState === 'terminal-delivered') {
@@ -729,56 +786,71 @@ export async function pollRolloutCompletions({
 }
 
 async function exactTerminalBoundary(item, turnId) {
-  let bytes;
-  try { bytes = await fs.readFile(String(item.rolloutPath ?? '')); } catch { return null; }
-  const parsed = parseLinesWithOffsets(bytes);
-  const metas = parsed.entries.filter(({ entry }) => entry?.type === 'session_meta');
-  if (metas.length !== 1 || !rootSessionMeta(metas[0].entry, item.threadId)) return null;
-  const started = parsed.entries.some(({ entry }) => entry?.type === 'event_msg' &&
-    entry.payload?.type === 'task_started' && String(entry.payload?.turn_id ?? '') === String(turnId));
-  if (!started) return null;
-  const completion = parsed.entries.find(({ entry }) => entry?.type === 'event_msg' &&
-    entry.payload?.type === 'task_complete' && String(entry.payload?.turn_id ?? '') === String(turnId));
-  return completion?.end ?? null;
+  let rootEligible = false;
+  let started = false;
+  let boundary = null;
+  try {
+    await scanJsonLines(String(item.rolloutPath ?? ''), (entry, { end }) => {
+      if (entry?.type === 'session_meta') rootEligible = rootSessionMeta(entry, item.threadId);
+      if (entry?.type !== 'event_msg') return undefined;
+      if (entry.payload?.type === 'task_started' && String(entry.payload?.turn_id ?? '') === String(turnId)) started = true;
+      if (rootEligible && started && entry.payload?.type === 'task_complete' &&
+          String(entry.payload?.turn_id ?? '') === String(turnId)) {
+        boundary = end;
+        return false;
+      }
+      return undefined;
+    });
+  } catch {
+    return null;
+  }
+  return boundary;
 }
 
 async function reconstructNotification(item, turnId) {
-  let content;
+  let activeTurnId = '';
+  let inputMessages = [];
+  let model = '';
+  let effort = '';
+  let notification = null;
   try {
-    content = await fs.readFile(String(item.rolloutPath ?? ''), 'utf8');
+    await scanJsonLines(String(item.rolloutPath ?? ''), (entry) => {
+      if (entry?.type === 'turn_context' && String(entry.payload?.turn_id ?? '') === String(turnId)) {
+        model = String(entry.payload?.model ?? model).trim();
+        effort = String(entry.payload?.effort ?? entry.payload?.reasoning_effort ?? effort).trim();
+        return undefined;
+      }
+      if (entry?.type !== 'event_msg') return undefined;
+      const payload = entry.payload ?? {};
+      if (payload.type === 'task_started') {
+        activeTurnId = String(payload.turn_id ?? '');
+        inputMessages = [];
+        return undefined;
+      }
+      if (payload.type === 'user_message' && activeTurnId === String(turnId)) {
+        const message = boundedText(payload.message);
+        if (message.trim()) inputMessages = [...inputMessages, message].slice(-maxInputMessages);
+        return undefined;
+      }
+      if (payload.type === 'task_complete' && String(payload.turn_id ?? activeTurnId ?? '') === String(turnId)) {
+        notification = {
+          type: 'agent-turn-complete',
+          'thread-id': String(item.threadId ?? ''),
+          'turn-id': String(turnId),
+          cwd: String(item.cwd ?? ''),
+          'input-messages': inputMessages,
+          'last-assistant-message': boundedText(payload.last_agent_message),
+          ...(model ? { model } : {}),
+          ...(effort ? { 'reasoning-effort': effort } : {}),
+        };
+        return false;
+      }
+      return undefined;
+    });
   } catch {
     throw new Error('Rollout content is unavailable; fallback notification will retry');
   }
-  let activeTurnId = '';
-  let inputMessages = [];
-  const entries = parseLines(Buffer.from(content, 'utf8'));
-  const support = turnSupport(entries, turnId);
-  for (const entry of entries) {
-    if (entry?.type !== 'event_msg') continue;
-    const payload = entry.payload ?? {};
-    if (payload.type === 'task_started') {
-      activeTurnId = String(payload.turn_id ?? '');
-      inputMessages = [];
-      continue;
-    }
-    if (payload.type === 'user_message' && activeTurnId === String(turnId)) {
-      const message = boundedText(payload.message);
-      if (message.trim()) inputMessages = [...inputMessages, message].slice(-maxInputMessages);
-      continue;
-    }
-    if (payload.type === 'task_complete' && String(payload.turn_id ?? activeTurnId ?? '') === String(turnId)) {
-      return {
-        type: 'agent-turn-complete',
-        'thread-id': String(item.threadId ?? ''),
-        'turn-id': String(turnId),
-        cwd: String(item.cwd ?? ''),
-        'input-messages': inputMessages,
-        'last-assistant-message': boundedText(payload.last_agent_message),
-        ...(support.model ? { model: support.model } : {}),
-        ...(support.effort ? { 'reasoning-effort': support.effort } : {}),
-      };
-    }
-  }
+  if (notification) return notification;
   throw new Error('Rollout completion content is unavailable; fallback notification will retry');
 }
 

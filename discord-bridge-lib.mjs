@@ -159,6 +159,7 @@ export async function callCodexDesktopTool({
   tool,
   args,
   threadId,
+  timeoutMs,
   onSubmitted,
   listPipes,
   requestPipe = requestFramedJsonPipe,
@@ -169,6 +170,7 @@ export async function callCodexDesktopTool({
     response = await requestPipe({
       pipeName,
       onSubmitted,
+      timeoutMs,
       payload: {
         jsonrpc: '2.0',
         id: randomUUID(),
@@ -204,6 +206,31 @@ function desktopTurns(result) {
   } catch {
     return [];
   }
+}
+
+export async function listActiveCodexThreads({
+  threadId,
+  appToolCall = callCodexDesktopTool,
+} = {}) {
+  const result = await appToolCall({
+    tool: 'list_threads',
+    args: { limit: 50 },
+    threadId,
+    timeoutMs: 10_000,
+  });
+  const text = result?.contentItems?.find((item) => item?.type === 'inputText' && typeof item?.text === 'string')?.text;
+  if (!text) return new Set();
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return new Set();
+  }
+  return new Set([...(parsed?.pinnedThreads ?? []), ...(parsed?.threads ?? [])]
+    .filter((item) => String(item?.kind ?? '').toLocaleLowerCase() === 'codex' &&
+      String(item?.status ?? '').toLocaleLowerCase() === 'active')
+    .map((item) => String(item?.id ?? item?.threadId ?? '').trim())
+    .filter(Boolean));
 }
 
 export async function steerCodexThread({
