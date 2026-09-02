@@ -30,8 +30,8 @@ if ([string]$definition.TaskName -ne 'Codex Discord Bridge') {
 if ([string]$definition.Execute -ne 'C:\Program Files\PowerShell\7\pwsh.exe') {
     throw 'Discord bridge scheduled task executable is incorrect'
 }
-if ([string]$definition.Arguments -notmatch '(?i)-NoProfile\s+-File\s+"G:\\tools\\mobile-notify\\start-discord-bridge\.ps1"') {
-    throw 'Discord bridge scheduled task does not launch only the dynamic startup guard'
+if ([string]$definition.Arguments -cne '-NoProfile -WindowStyle Hidden -File "G:\tools\mobile-notify\start-discord-bridge.ps1"') {
+    throw 'Discord bridge scheduled task does not launch its startup guard in a genuinely hidden PowerShell window'
 }
 if ([string]$definition.Arguments -match 'discord-bridge\.mjs|node\.exe|codex\.exe') {
     throw 'Discord bridge scheduled task pins a runtime executable or bypasses the startup guard'

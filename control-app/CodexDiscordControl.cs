@@ -535,6 +535,10 @@ namespace CodexDiscordControl
         internal ControlForm()
         {
             Text = "Codex Discord 控制台";
+            using (Icon executableIcon = Icon.ExtractAssociatedIcon(Application.ExecutablePath))
+            {
+                if (executableIcon != null) { Icon = (Icon)executableIcon.Clone(); }
+            }
             StartPosition = FormStartPosition.CenterScreen;
             MinimumSize = new Size(620, 430);
             Size = new Size(680, 470);

@@ -8,6 +8,8 @@ $sourceRoot = Split-Path -Parent $PSScriptRoot
 $buildScript = Join-Path $sourceRoot 'build-control-app.ps1'
 $installScript = Join-Path $sourceRoot 'install-control-app.ps1'
 $controlSource = Join-Path $sourceRoot 'control-app\CodexDiscordControl.cs'
+$sourceIconImage = Join-Path $sourceRoot 'assets\codex-discord-control.png'
+$applicationIcon = Join-Path $sourceRoot 'assets\codex-discord-control.ico'
 $testRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('codex control app ' + [guid]::NewGuid().ToString('N'))
 
 function Assert-True {
@@ -46,6 +48,50 @@ function Assert-TestProcessExited {
     throw $Message
 }
 
+function Get-IcoImageSizes {
+    param([Parameter(Mandatory)][string]$Path)
+
+    [byte[]]$bytes = [System.IO.File]::ReadAllBytes($Path)
+    if ($bytes.Length -lt 6 -or [BitConverter]::ToUInt16($bytes, 0) -ne 0 -or [BitConverter]::ToUInt16($bytes, 2) -ne 1) {
+        throw 'committed controller icon is not a valid ICO container'
+    }
+    $count = [int][BitConverter]::ToUInt16($bytes, 4)
+    if ($count -lt 1 -or $bytes.Length -lt (6 + (16 * $count))) { throw 'committed controller icon has an invalid image directory' }
+    $sizes = [System.Collections.Generic.List[int]]::new()
+    for ($index = 0; $index -lt $count; $index++) {
+        $offset = 6 + (16 * $index)
+        $width = if ($bytes[$offset] -eq 0) { 256 } else { [int]$bytes[$offset] }
+        $height = if ($bytes[$offset + 1] -eq 0) { 256 } else { [int]$bytes[$offset + 1] }
+        if ($width -ne $height) { throw 'committed controller icon contains a non-square image' }
+        $sizes.Add($width)
+    }
+    return @($sizes | Sort-Object -Unique)
+}
+
+function Get-IconBitmapHash {
+    param([Parameter(Mandatory)][System.Drawing.Icon]$Icon)
+
+    $bitmap = $Icon.ToBitmap()
+    $stream = [System.IO.MemoryStream]::new()
+    $writer = [System.IO.BinaryWriter]::new($stream)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $writer.Write([int]$bitmap.Width)
+        $writer.Write([int]$bitmap.Height)
+        for ($y = 0; $y -lt $bitmap.Height; $y++) {
+            for ($x = 0; $x -lt $bitmap.Width; $x++) { $writer.Write([int]$bitmap.GetPixel($x, $y).ToArgb()) }
+        }
+        $writer.Flush()
+        return ([BitConverter]::ToString($sha.ComputeHash($stream.ToArray()))).Replace('-', '')
+    }
+    finally {
+        $sha.Dispose()
+        $writer.Dispose()
+        $stream.Dispose()
+        $bitmap.Dispose()
+    }
+}
+
 try {
     New-Item -ItemType Directory -Path $testRoot -Force | Out-Null
     $buildRoot = Join-Path $testRoot 'build output with spaces'
@@ -54,12 +100,31 @@ try {
     Assert-True (Test-Path -LiteralPath $controlSource -PathType Leaf) 'committed C# source is missing'
     Assert-True (Test-Path -LiteralPath $buildScript -PathType Leaf) 'build script is missing'
     Assert-True (Test-Path -LiteralPath $installScript -PathType Leaf) 'installer is missing'
+    Assert-True (Test-Path -LiteralPath $sourceIconImage -PathType Leaf) 'repository is missing the user-provided controller icon source image'
+    Assert-True (Test-Path -LiteralPath $applicationIcon -PathType Leaf) 'repository is missing the rebuildable multi-size controller ICO'
+    $sourceImage = [System.Drawing.Image]::FromFile($sourceIconImage)
+    try {
+        Assert-True ($sourceImage.Width -eq $sourceImage.Height -and $sourceImage.Width -ge 256) 'controller icon source is not a usable square high-resolution image'
+    }
+    finally { $sourceImage.Dispose() }
+    $icoSizes = @(Get-IcoImageSizes -Path $applicationIcon)
+    Assert-True (($icoSizes -join ',') -ceq '16,24,32,48,64,128,256') 'controller ICO does not contain every required Windows icon size'
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $sourceRoot 'CodexDiscordControl.exe'))) 'repository contains a prebuilt control executable'
 
     & $buildScript -OutputDirectory $buildRoot | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'control app build failed' }
     $exe = Join-Path $buildRoot 'CodexDiscordControl.exe'
     Assert-True (Test-Path -LiteralPath $exe -PathType Leaf) 'control app executable missing'
+    $embeddedIcon = [System.Drawing.Icon]::ExtractAssociatedIcon($exe)
+    Assert-True ($null -ne $embeddedIcon) 'control app executable has no associated icon'
+    $expectedIcon = [System.Drawing.Icon]::new($applicationIcon, $embeddedIcon.Width, $embeddedIcon.Height)
+    try {
+        Assert-True ((Get-IconBitmapHash -Icon $embeddedIcon) -ceq (Get-IconBitmapHash -Icon $expectedIcon)) 'control app executable did not embed the committed controller icon'
+    }
+    finally {
+        $expectedIcon.Dispose()
+        $embeddedIcon.Dispose()
+    }
 
     $markerPath = Join-Path $testRoot 'fake backend calls.txt'
     $markerLiteral = $markerPath.Replace("'", "''")
@@ -161,6 +226,8 @@ exit 0
     $harnessText = @'
 using System;
 using System.Collections.Generic;
+using System.Drawing;
+using System.Reflection;
 using System.Web.Script.Serialization;
 
 namespace CodexDiscordControl
@@ -205,6 +272,21 @@ namespace CodexDiscordControl
                 }));
                 return 0;
             }
+            if (args[0] == "form-icon") {
+                using (ControlForm form = new ControlForm())
+                using (Icon executableIcon = Icon.ExtractAssociatedIcon(Assembly.GetExecutingAssembly().Location))
+                using (Bitmap formBitmap = form.Icon.ToBitmap())
+                using (Bitmap executableBitmap = executableIcon.ToBitmap()) {
+                    bool equal = formBitmap.Width == executableBitmap.Width && formBitmap.Height == executableBitmap.Height;
+                    for (int y = 0; equal && y < formBitmap.Height; y++) {
+                        for (int x = 0; x < formBitmap.Width; x++) {
+                            if (formBitmap.GetPixel(x, y).ToArgb() != executableBitmap.GetPixel(x, y).ToArgb()) { equal = false; break; }
+                        }
+                    }
+                    Console.WriteLine(equal ? "true" : "false");
+                    return equal ? 0 : 1;
+                }
+            }
             return 2;
         }
     }
@@ -218,11 +300,14 @@ namespace CodexDiscordControl
     $savedPreference = $ErrorActionPreference
     try {
         $ErrorActionPreference = 'Continue'
-        & $compiler /nologo /target:exe /optimize+ /warnaserror+ /reference:System.dll /reference:System.Core.dll /reference:System.Drawing.dll /reference:System.Web.Extensions.dll /reference:System.Windows.Forms.dll "/main:CodexDiscordControl.TestHarness" "/out:$harnessExe" $controlSource $harnessSource
+        & $compiler /nologo /target:exe /optimize+ /warnaserror+ /reference:System.dll /reference:System.Core.dll /reference:System.Drawing.dll /reference:System.Web.Extensions.dll /reference:System.Windows.Forms.dll "/win32icon:$applicationIcon" "/main:CodexDiscordControl.TestHarness" "/out:$harnessExe" $controlSource $harnessSource
         $harnessCompileExit = $LASTEXITCODE
     }
     finally { $ErrorActionPreference = $savedPreference }
     Assert-True ($harnessCompileExit -eq 0 -and (Test-Path -LiteralPath $harnessExe -PathType Leaf)) 'testable status renderer/backend seam did not compile'
+
+    $formIconResult = @(& $harnessExe form-icon)
+    Assert-True ($LASTEXITCODE -eq 0 -and ($formIconResult -join '') -ceq 'true') 'WinForms window does not use the executable controller icon'
 
     $knownRows = (& $harnessExe known | ConvertFrom-Json)
     Assert-True ($knownRows.bridge -eq '模式：临时运行 · 状态：运行中') 'bridge row did not combine known mode and running state'
@@ -261,11 +346,22 @@ namespace CodexDiscordControl
     $badSourceRoot = Join-Path $testRoot 'bad compiler source'
     $badBuildRoot = Join-Path $testRoot 'bad compiler output'
     New-Item -ItemType Directory -Path (Join-Path $badSourceRoot 'control-app') -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $badSourceRoot 'assets') -Force | Out-Null
     Copy-Item -LiteralPath $buildScript -Destination (Join-Path $badSourceRoot 'build-control-app.ps1')
+    Copy-Item -LiteralPath $applicationIcon -Destination (Join-Path $badSourceRoot 'assets\codex-discord-control.ico')
     Set-Content -LiteralPath (Join-Path $badSourceRoot 'control-app\CodexDiscordControl.cs') -Value 'this is not C sharp' -Encoding UTF8
     $badBuild = Invoke-ChildPowerShell -Arguments @('-NoProfile','-File',(Join-Path $badSourceRoot 'build-control-app.ps1'),'-OutputDirectory',$badBuildRoot)
     Assert-True ($badBuild.ExitCode -ne 0) 'compiler failure returned a successful exit code'
     Assert-True (-not (Test-Path -LiteralPath (Join-Path $badBuildRoot 'CodexDiscordControl.exe'))) 'compiler failure left a usable-looking executable'
+
+    $missingIconSource = Join-Path $testRoot 'missing icon source'
+    $missingIconOutput = Join-Path $testRoot 'missing icon output'
+    New-Item -ItemType Directory -Path (Join-Path $missingIconSource 'control-app') -Force | Out-Null
+    Copy-Item -LiteralPath $buildScript -Destination (Join-Path $missingIconSource 'build-control-app.ps1')
+    Copy-Item -LiteralPath $controlSource -Destination (Join-Path $missingIconSource 'control-app\CodexDiscordControl.cs')
+    $missingIconBuild = Invoke-ChildPowerShell -Arguments @('-NoProfile','-File',(Join-Path $missingIconSource 'build-control-app.ps1'),'-OutputDirectory',$missingIconOutput)
+    Assert-True ($missingIconBuild.ExitCode -ne 0) 'control app build succeeded without its committed icon asset'
+    Assert-True (-not (Test-Path -LiteralPath (Join-Path $missingIconOutput 'CodexDiscordControl.exe'))) 'missing icon build left a usable-looking executable'
 
     $stagedSource = Join-Path $testRoot 'recovery source with spaces'
     $stagedControl = Join-Path $stagedSource 'control-app'
@@ -275,6 +371,9 @@ namespace CodexDiscordControl
     Copy-Item -LiteralPath $installScript -Destination (Join-Path $stagedSource 'install-control-app.ps1')
     Copy-Item -LiteralPath (Join-Path $sourceRoot 'codex-control.ps1') -Destination (Join-Path $stagedSource 'codex-control.ps1')
     Copy-Item -LiteralPath (Join-Path $sourceRoot 'codex-control-lib.ps1') -Destination (Join-Path $stagedSource 'codex-control-lib.ps1')
+    New-Item -ItemType Directory -Path (Join-Path $stagedSource 'assets') -Force | Out-Null
+    Copy-Item -LiteralPath $sourceIconImage -Destination (Join-Path $stagedSource 'assets\codex-discord-control.png')
+    Copy-Item -LiteralPath $applicationIcon -Destination (Join-Path $stagedSource 'assets\codex-discord-control.ico')
 
     $installRoot = Join-Path $testRoot 'installed tool with spaces'
     $desktopRoot = Join-Path $testRoot 'temporary Desktop with spaces'
@@ -344,6 +443,7 @@ namespace CodexDiscordControl
     Assert-FullPathEqual $shortcut.TargetPath $installedExe 'shortcut target is stale'
     Assert-FullPathEqual $shortcut.WorkingDirectory $installRoot 'shortcut working directory is stale'
     Assert-True ([string]::IsNullOrWhiteSpace($shortcut.Arguments)) 'shortcut injects unexpected arguments'
+    Assert-True ([string]$shortcut.IconLocation -ceq ($installedExe + ',0')) 'shortcut does not use the embedded controller icon'
 
     $verifiedBundleHashes = @{
         exe = (Get-FileHash -LiteralPath $installedExe).Hash
@@ -365,6 +465,16 @@ namespace CodexDiscordControl
     $restoredShortcut = $shell.CreateShortcut($shortcutPath)
     Assert-FullPathEqual $restoredShortcut.TargetPath $installedExe 'restored shortcut target is stale'
     Assert-FullPathEqual $restoredShortcut.WorkingDirectory $installRoot 'restored shortcut working directory is stale'
+    Assert-True ([string]$restoredShortcut.IconLocation -ceq ($installedExe + ',0')) 'restored shortcut lost the embedded controller icon'
+    $restoredEmbeddedIcon = [System.Drawing.Icon]::ExtractAssociatedIcon($installedExe)
+    $restoredExpectedIcon = [System.Drawing.Icon]::new($applicationIcon, $restoredEmbeddedIcon.Width, $restoredEmbeddedIcon.Height)
+    try {
+        Assert-True ((Get-IconBitmapHash -Icon $restoredEmbeddedIcon) -ceq (Get-IconBitmapHash -Icon $restoredExpectedIcon)) 'repository-only rebuild lost the controller icon'
+    }
+    finally {
+        $restoredExpectedIcon.Dispose()
+        $restoredEmbeddedIcon.Dispose()
+    }
 
     $staleShortcut = $shell.CreateShortcut($shortcutPath)
     $staleShortcut.TargetPath = Join-Path $env:WINDIR 'System32\cmd.exe'

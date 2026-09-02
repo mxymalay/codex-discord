@@ -50,7 +50,9 @@ $script:DeployFileAllowlist = @(
     'install-discord-bridge-task.ps1',
     'build-control-app.ps1',
     'install-control-app.ps1',
-    'control-app\CodexDiscordControl.cs'
+    'control-app\CodexDiscordControl.cs',
+    'assets\codex-discord-control.png',
+    'assets\codex-discord-control.ico'
 )
 $script:GeneratedDeployFiles = @('CodexDiscordControl.exe')
 $script:ForbiddenDeployNames = @(

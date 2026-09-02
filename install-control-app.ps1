@@ -76,6 +76,7 @@ $requiredSources = if ($ShortcutOnly) {
 else {
     @(
         (Join-Path $source 'control-app\CodexDiscordControl.cs'),
+        (Join-Path $source 'assets\codex-discord-control.ico'),
         (Join-Path $source 'build-control-app.ps1'),
         (Join-Path $source 'codex-control.ps1'),
         (Join-Path $source 'codex-control-lib.ps1')

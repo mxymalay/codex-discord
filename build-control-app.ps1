@@ -10,8 +10,12 @@ $ErrorActionPreference = 'Stop'
 
 $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $sourcePath = Join-Path $scriptRoot 'control-app\CodexDiscordControl.cs'
+$iconPath = Join-Path $scriptRoot 'assets\codex-discord-control.ico'
 if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
     throw 'Control app source is unavailable'
+}
+if (-not (Test-Path -LiteralPath $iconPath -PathType Leaf)) {
+    throw 'Control app icon is unavailable'
 }
 
 try { $outputRoot = [System.IO.Path]::GetFullPath($OutputDirectory) }
@@ -48,6 +52,7 @@ try {
         '/reference:System.Drawing.dll',
         '/reference:System.Web.Extensions.dll',
         '/reference:System.Windows.Forms.dll',
+        ('/win32icon:' + $iconPath),
         ('/out:' + $temporaryPath),
         $sourcePath
     )

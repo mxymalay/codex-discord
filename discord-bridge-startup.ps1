@@ -231,7 +231,7 @@ function Get-DiscordBridgeTaskDefinition {
     return [pscustomobject][ordered]@{
         TaskName = 'Codex Discord Bridge'
         Execute = [System.IO.Path]::GetFullPath($PowerShellPath)
-        Arguments = '-NoProfile -File ' + (ConvertTo-ScheduledTaskArgument -Value $startupPath)
+        Arguments = '-NoProfile -WindowStyle Hidden -File ' + (ConvertTo-ScheduledTaskArgument -Value $startupPath)
         WorkingDirectory = $fullToolDir
     }
 }

@@ -262,6 +262,46 @@ $disableLongTerm = Invoke-CodexBridgeServiceAction -Action 'disable-long-term' -
 if (-not $disableLongTerm.ok) { throw "long-term disable failed: $($disableLongTerm.errorCategory)" }
 if ($bridgeState.running -or $bridgeState.enabled) { throw 'long-term disable did not persist' }
 
+$temporaryLaunchCapture = $null
+$previousTestStartMode = $env:CODEX_DISCORD_START_MODE
+function Get-Command {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Name)
+    if ($Name -notin @('pwsh','pwsh.exe')) { throw 'temporary launch resolved an unexpected executable' }
+    [pscustomobject]@{ Source='C:\Program Files\PowerShell\7\pwsh.exe' }
+}
+function Start-Process {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [Parameter(Mandatory)][object[]]$ArgumentList,
+        [Parameter(Mandatory)][System.Diagnostics.ProcessWindowStyle]$WindowStyle
+    )
+    $script:temporaryLaunchCapture = [pscustomobject]@{
+        FilePath=$FilePath
+        Arguments=@($ArgumentList)
+        WindowStyle=$WindowStyle
+        Mode=$env:CODEX_DISCORD_START_MODE
+    }
+}
+try {
+    $temporaryOperations = New-CodexControlOperations
+    & $temporaryOperations.StartDetached 'G:\tools\mobile-notify\start-discord-bridge.ps1' temporary
+}
+finally {
+    Remove-Item Function:Get-Command -Force
+    Remove-Item Function:Start-Process -Force
+    if ($null -eq $previousTestStartMode) { Remove-Item Env:CODEX_DISCORD_START_MODE -ErrorAction SilentlyContinue }
+    else { $env:CODEX_DISCORD_START_MODE = $previousTestStartMode }
+}
+if ($null -eq $temporaryLaunchCapture -or
+    $temporaryLaunchCapture.FilePath -cne 'C:\Program Files\PowerShell\7\pwsh.exe' -or
+    [string]$temporaryLaunchCapture.WindowStyle -cne 'Hidden' -or
+    $temporaryLaunchCapture.Mode -cne 'temporary' -or
+    ($temporaryLaunchCapture.Arguments -join '|') -cne '-NoProfile|-File|G:\tools\mobile-notify\start-discord-bridge.ps1') {
+    throw 'temporary bridge start can expose a persistent PowerShell window or changed its fixed startup contract'
+}
+
 function Get-ScheduledTask {
     param([string]$TaskPath, [string]$TaskName, [object]$ErrorAction)
     [pscustomobject]@{

@@ -17,6 +17,8 @@ $sourceFiles = @(
     'codex-control.ps1',
     'codex-takeover-lib.mjs',
     'control-app\CodexDiscordControl.cs',
+    'assets\codex-discord-control.png',
+    'assets\codex-discord-control.ico',
     'discord-bridge-lib.mjs',
     'discord-bridge-startup.ps1',
     'discord-bridge.mjs',
