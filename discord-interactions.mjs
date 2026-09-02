@@ -413,19 +413,33 @@ export function renderTakeoverPreview(snapshot, {
   };
 }
 
+function taskListValues(tasks, { status = '全部' } = {}) {
+  const desired = String(status ?? '全部');
+  return (Array.isArray(tasks) ? tasks : [])
+    .filter((item) => desired === '全部' || statusLabel(item?.status) === desired)
+    .sort((left, right) => Number(right?.status === 'running') - Number(left?.status === 'running'))
+    .slice(0, 10);
+}
+
+function taskListLines(values) {
+  return values.map((item, index) => [
+    `${index + 1}. **项目：** ${metadataText(item?.projectName, '无项目')}`,
+    `   **任务：** ${metadataText(item?.taskName, '未命名任务')}`,
+    `   **状态：** ${metadataText(statusLabel(item?.status))}｜**最后活动：** ${formatTimestamp(item?.lastActivityAt)}｜**运行时间：** ${formatDuration(item?.runtimeMs)}`,
+  ].join('\n'));
+}
+
 export function renderTaskList(tasks, { status = '全部' } = {}) {
   const desired = String(status ?? '全部');
-  const values = (Array.isArray(tasks) ? tasks : [])
-    .filter((item) => desired === '全部' || statusLabel(item?.status) === desired)
-    .slice(0, 10);
-  if (!values.length) return `## 最近任务\n没有符合“${metadataText(desired, '全部')}”条件的主任务。`;
+  const values = taskListValues(tasks, { status: desired });
+  const running = values.filter((item) => item?.status === 'running');
+  const recent = values.filter((item) => item?.status !== 'running');
   return [
-    `## 最近任务（${metadataText(desired, '全部')}）`,
-    ...values.map((item, index) => [
-      `${index + 1}. **项目：** ${metadataText(item?.projectName, '无项目')}`,
-      `   **任务：** ${metadataText(item?.taskName, '未命名任务')}`,
-      `   **状态：** ${metadataText(statusLabel(item?.status))}｜**最后活动：** ${formatTimestamp(item?.lastActivityAt)}｜**运行时间：** ${formatDuration(item?.runtimeMs)}`,
-    ].join('\n')),
+    '## 进行中的任务',
+    ...(running.length ? taskListLines(running) : ['当前没有进行中的任务。']),
+    '',
+    desired === '全部' ? '## 最近任务' : `## 最近任务（${metadataText(desired, '全部')}）`,
+    ...(recent.length ? taskListLines(recent) : [`没有符合“${metadataText(desired, '全部')}”条件的最近主任务。`]),
   ].join('\n');
 }
 
@@ -520,6 +534,26 @@ export function renderTaskDetail(detail) {
     '## 最新结果',
     resultText,
   ].join('\n');
+}
+
+function taskStatusCard(detail) {
+  const status = String(detail?.status ?? '');
+  const presentation = ({
+    running: ['Codex 任务进行中…', 9807270],
+    'confirmation-required': ['Codex 任务待确认', 15965202],
+    completed: ['Codex 任务已完成', 3066993],
+    failed: ['Codex 任务失败', 15158332],
+  })[status] ?? ['Codex 任务等待中', 9807270];
+  const fields = [
+    { name: '项目名', value: metadataText(detail?.projectName, '无项目', 1_024), inline: true },
+    { name: '任务名', value: metadataText(detail?.taskName, '未命名任务', 1_024), inline: true },
+    { name: '任务', value: markdownBodyValue(detail?.taskText, '（无可用内容）', 1_024), inline: false },
+  ];
+  const resultLabel = status === 'confirmation-required' ? '待确认' : ['completed', 'failed'].includes(status) ? '结果' : '';
+  if (resultLabel) {
+    fields.push({ name: resultLabel, value: markdownBodyValue(detail?.resultText, '（暂无结果）', 1_024), inline: false });
+  }
+  return { title: presentation[0], color: presentation[1], fields };
 }
 
 export function renderSearchResults(results, keyword) {
@@ -646,8 +680,8 @@ export function renderSystemStatus(status = {}) {
 
 export function renderHelp() {
   const descriptions = {
-    任务列表: '查看最近主任务，可按状态筛选；运行中的任务可停止当前一轮。',
-    任务详情: '选择主任务并查看完整任务与最新结果。',
+    任务列表: '查看进行中与最近主任务；进行中的任务始终置顶。',
+    任务详情: '选择主任务并查看完整任务与最新结果；运行中可停止当前一轮。',
     任务搜索: '按关键词搜索项目、标题和任务正文。',
     新建任务: '从已保存项目或“无项目”创建持久任务，并可首次选择模型与推理强度；Git 项目使用隔离工作树。',
     继续任务: '选择主任务并发送新的多行指令，优先转向指定任务。',
@@ -662,11 +696,12 @@ export function renderHelp() {
     '# Codex Discord 命令帮助',
     ...COMMAND_NAMES.map((name) => `- **/${name}** — ${descriptions[name]}`),
     '',
-    '### 远程接管与任务进度',
+    '### 远程接管',
     '- 长按回复与 `/继续任务` 共用同一流程：先转向指定任务；遇到写入者占用时安全排队，并可停止该任务当前一轮后立即继续。',
+    '- 续接成功回执带“查看当前运行状态”按钮，可实时查看进行中、待确认或已完成卡片。',
     '- 精确停止失败时才会显示退出整个 Codex 的最终兜底；不会自动退出，也不会停止其他任务。',
     '- `/退出codex` 会先列出可能中断的主任务，只有你再次确认后才退出 Codex 桌面端；风险清单变化时必须重新确认。',
-    '- 从 Discord 新建或继续的任务都会回到发起任务的原频道，包括 commentary、脱敏工具进度、待确认和最终结果。',
+    '- 从 Discord 新建或继续的任务，其待确认和最终结果会回到发起任务的原频道；不转发 commentary、工具调用或其他过程信息。',
     '',
     '### 本机服务',
     '- Codex 桌面端可以关闭，但电脑必须保持 Windows 用户已登录、处于唤醒状态并已联网；关机、休眠或 Bot 离线时命令不可执行。',
@@ -707,6 +742,21 @@ function makeStateId(dependencies) {
   if (!Buffer.isBuffer(bytes) && !(bytes instanceof Uint8Array)) throw new TypeError('Random byte source must return bytes');
   if (bytes.length !== 12) throw new Error('UI state IDs require 96 random bits');
   return Buffer.from(bytes).toString('base64url');
+}
+
+export function createTaskStatusRow(dependencies, { threadId, userId: ownerUserId, guildId: ownerGuildId }) {
+  const stateId = makeStateId(dependencies);
+  dependencies.uiState.set(stateId, {
+    kind: 'task-status',
+    userId: String(ownerUserId),
+    guildId: String(ownerGuildId),
+    threadId: String(threadId),
+    expiresAt: nowValue(dependencies) + UI_TTL_MS,
+  });
+  return {
+    type: 1,
+    components: [{ type: 2, style: 2, label: '查看当前运行状态', custom_id: `task-status:${stateId}` }],
+  };
 }
 
 function projectRoots(project) {
@@ -857,8 +907,6 @@ function detailButtons(dependencies, tasks, interaction) {
         expiresAt: nowValue(dependencies) + UI_TTL_MS,
       });
       buttons.push({ type: 2, style: 2, label: `查看：${plainLabel(task.taskName, '未命名任务', 77)}`, custom_id: `detail:${stateId}` });
-      const stopButton = createStopCurrentButton(dependencies, interaction, task);
-      if (stopButton) buttons.push(stopButton);
     }
     rows.push({ type: 1, components: buttons });
   }
@@ -1662,11 +1710,30 @@ async function renderDetailInteraction(dependencies, interaction, record) {
   }
 }
 
+async function renderTaskStatusInteraction(dependencies, interaction, stateId) {
+  const state = dependencies.uiState.get(stateId);
+  const invalid = componentStateError(dependencies, interaction, state);
+  if (invalid || state?.kind !== 'task-status') {
+    return respond(dependencies, interaction, privateResponse(invalid ?? '状态按钮已失效，请重新继续任务。'));
+  }
+  await defer(dependencies, interaction);
+  try {
+    const refreshed = await dependencies.refreshTaskIndex();
+    const record = (refreshed?.tasks ?? dependencies.taskIndex?.tasks ?? [])
+      .find((item) => String(item?.threadId ?? '').toLocaleLowerCase() === String(state.threadId).toLocaleLowerCase());
+    if (!record) return editOriginal(dependencies, interaction, { content: '任务已不在当前主任务列表中。' });
+    const detail = await dependencies.readTaskDetail(record);
+    return editOriginal(dependencies, interaction, { embeds: [taskStatusCard(detail)] });
+  } catch {
+    return editOriginal(dependencies, interaction, { content: '当前运行状态暂不可用，请稍后重试。' });
+  }
+}
+
 async function handleCommand(dependencies, interaction) {
   const name = String(interaction?.data?.name ?? '');
   if (name === '任务列表') {
     const status = String(optionValue(interaction, '状态') ?? '全部');
-    const matching = (dependencies.taskIndex?.tasks ?? []).filter((item) => status === '全部' || statusLabel(item?.status) === status).slice(0, 10);
+    const matching = taskListValues(dependencies.taskIndex?.tasks, { status });
     return respond(dependencies, interaction, privateResponse({
       embeds: [{ description: renderTaskList(matching, { status }) }],
       components: detailButtons(dependencies, matching, interaction),
@@ -1855,9 +1922,14 @@ async function handleContinueModal(dependencies, submissions, interaction, state
       } catch {
         result = { status: 'failed' };
       }
+      const components = result?.status === 'started' ? [createTaskStatusRow(dependencies, {
+        threadId: record.threadId,
+        userId: userId(interaction),
+        guildId: guildId(interaction),
+      })] : [];
       return {
         result,
-        payload: { content: continuationReceipt(result) },
+        payload: { content: continuationReceipt(result), components },
         targetThreadId: String(record.threadId),
       };
     })();
@@ -2020,6 +2092,8 @@ async function handleComponent(dependencies, interaction, routerState) {
     }
     return editOriginal(dependencies, interaction, continuationQueuePayload(dependencies, interaction));
   }
+  const taskStatus = customId.match(/^task-status:([A-Za-z0-9_-]{16})$/u);
+  if (taskStatus) return renderTaskStatusInteraction(dependencies, interaction, taskStatus[1]);
   const stopCurrent = customId.match(/^stop-current:([A-Za-z0-9_-]{16})$/u);
   if (stopCurrent) return stopCurrentTask(dependencies, interaction, stopCurrent[1]);
   const continueMatch = customId.match(/^continue-open:([A-Za-z0-9_-]{16})$/u);

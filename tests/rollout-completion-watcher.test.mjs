@@ -737,7 +737,7 @@ test('keeps a failed fallback pending and retries it later', async () => {
   }
 });
 
-test('terminal fallback enriches an exact persisted origin and marks delivery only after success', async () => {
+test('terminal fallback discards unsent progress and still delivers the final result', async () => {
   const paths = await fixture();
   const inboxState = createEmptyInboxState();
   inboxState.discordTurnOrigins[turnId] = {
@@ -749,7 +749,10 @@ test('terminal fallback enriches an exact persisted origin and marks delivery on
   try {
     const beforeComplete = [sessionMeta(), taskStarted(), userMessage()].map(jsonLine).join('');
     await fs.writeFile(paths.rolloutPath, `${beforeComplete}${jsonLine(taskComplete())}`, 'utf8');
-    inboxState.discordTurnOrigins[turnId].rolloutCursor = (await fs.stat(paths.rolloutPath)).size;
+    inboxState.discordTurnOrigins[turnId].progressDispatch = {
+      eventId: 'a'.repeat(64), nonce: '123', start: 0, end: 1,
+      kind: 'commentary', rolloutFingerprint: 'b'.repeat(64),
+    };
     const state = createEmptyRolloutWatcherState();
     await initializeRolloutWatcherState({ sessionsRoot: paths.sessionsRoot, state });
     state.files[path.resolve(paths.rolloutPath)].offset = Buffer.byteLength(beforeComplete);
@@ -766,6 +769,8 @@ test('terminal fallback enriches an exact persisted origin and marks delivery on
     assert.equal(dispatched[0]['discord-origin-channel-id'], '777777777777777777');
     assert.equal(dispatched[0]['discord-guild-id'], '222222222222222222');
     assert.equal(inboxState.discordTurnOrigins[turnId].deliveryState, 'terminal-delivered');
+    assert.equal(inboxState.discordTurnOrigins[turnId].progressDispatch, undefined);
+    assert.equal(inboxState.discordTurnOrigins[turnId].rolloutCursor, (await fs.stat(paths.rolloutPath)).size);
     assert.equal(inboxState.discordTurnOrigins[turnId].terminalEventId.length, 64);
     assert.equal(Object.keys(state.pending).length, 0);
     assert.equal(snapshots.some((snapshot) => snapshot.discordTurnOrigins[turnId].deliveryState === 'terminal-dispatching'), true);

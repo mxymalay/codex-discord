@@ -1164,7 +1164,7 @@ try {
     Assert-True ($readme -match '/退出codex[\s\S]{0,500}(?:风险|中断)[\s\S]{0,500}(?:二次|确认)') 'README does not explain the exit risk preview and confirmation'
     Assert-True ($readme -match 'active-writer|写入者占用') 'README does not explain active-writer takeover'
     Assert-True ($readme -match '临时开启[\s\S]{0,1000}临时停止[\s\S]{0,1000}长期开启[\s\S]{0,1000}长期停用') 'README does not explain the four control modes'
-    Assert-True ($readme -match '原频道[\s\S]{0,500}(?:commentary|工具进度|进度)') 'README does not document Discord-origin progress routing'
+    Assert-True ($readme -match '原频道[\s\S]{0,500}(?:待确认|最终结果)[\s\S]{0,500}不(?:会|再)转发[\s\S]{0,100}(?:commentary|工具调用|过程)') 'README does not document final-only Discord-origin routing'
     Assert-True ($readme -match '登录[\s\S]{0,300}(?:唤醒|休眠)[\s\S]{0,300}(?:联网|网络)') 'README does not document the logged-in, awake, networked PC boundary'
     Assert-True ($readme -match 'deploy\.ps1[\s\S]{0,500}(?:恢复|重建|重新部署)') 'README does not provide one-command repository recovery'
     Assert-True ($readme -match 'Token|secret|私密[\s\S]{0,300}(?:不进入 Git|不提交)') 'README does not state the source/runtime secret boundary'

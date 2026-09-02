@@ -180,6 +180,137 @@ test('production legacy watcher initialization receives the validated inbox orig
   assert.equal(context.rolloutState.pending['turn-existing-complete'].threadId, 'thread-existing-complete');
 });
 
+test('Discord reply polling runs while a slow rollout scan is still pending', async () => {
+  const slowRollout = deferred();
+  const channelPolls = [];
+  let originProgressPolls = 0;
+  const inboxState = createEmptyInboxState();
+  inboxState.initialized = true;
+  inboxState.cursors[config.discordTaskChannelId] = '1';
+  inboxState.cursors[config.discordConfirmationChannelId] = '1';
+  const rolloutState = { version: 2, initialized: true, files: {}, pending: {} };
+  const production = bridgeModule.createProductionBridgeDependencies({
+    runOnce: true,
+    persistInboxStateImpl: async () => {},
+    readRolloutWatcherStateImpl: async () => rolloutState,
+    initializeRolloutWatcherStateImpl: async () => {},
+    writeRolloutWatcherStateImpl: async () => {},
+    pollDiscordOriginEventsImpl: async () => { originProgressPolls += 1; },
+    pollRolloutCompletionsImpl: async () => slowRollout.promise,
+    pollChannelImpl: async ({ channelId }) => { channelPolls.push(channelId); },
+    logImpl: async () => {},
+  });
+  const context = {
+    config, token: 'test-token', inboxState, inboxReadOnly: false,
+    taskIndex: { version: 1, generatedAt: null, tasks: [] },
+    trackDiscordRest: (operation) => operation(),
+    trackActiveResource: (resource) => resource,
+    executables: { powershellPath: 'pwsh.exe' },
+    setLatestErrorCategory: () => {}, recordActivity: () => {}, timestamps: {}, publishHealth: () => {},
+  };
+
+  const pollers = await production.startLegacyPollers(context);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(channelPolls, [config.discordTaskChannelId, config.discordConfirmationChannelId]);
+  slowRollout.resolve();
+  await pollers.completion;
+  assert.equal(originProgressPolls, 0, 'intermediate task progress must never be forwarded');
+});
+
+test('legacy poller stop waits for the surviving loop after its sibling fails', async () => {
+  const slowMaintenance = deferred();
+  const inboxState = createEmptyInboxState();
+  inboxState.initialized = true;
+  inboxState.cursors[config.discordTaskChannelId] = '1';
+  inboxState.cursors[config.discordConfirmationChannelId] = '1';
+  const production = bridgeModule.createProductionBridgeDependencies({
+    persistInboxStateImpl: async () => {},
+    readRolloutWatcherStateImpl: async () => ({ version: 2, initialized: true, files: {}, pending: {} }),
+    initializeRolloutWatcherStateImpl: async () => {},
+    writeRolloutWatcherStateImpl: async () => {},
+    pollRolloutCompletionsImpl: async () => slowMaintenance.promise,
+    pollChannelImpl: async () => { throw new Error('poll failed'); },
+    logImpl: async (event) => { if (event === 'channel-poll-failed') throw new Error('log failed'); },
+  });
+  const context = {
+    config, token: 'test-token', inboxState, inboxReadOnly: false,
+    taskIndex: { version: 1, generatedAt: null, tasks: [] },
+    trackDiscordRest: (operation) => operation(), trackActiveResource: (resource) => resource,
+    executables: { powershellPath: 'pwsh.exe' }, setLatestErrorCategory: () => {},
+    recordActivity: () => {}, timestamps: {}, publishHealth: () => {},
+  };
+  const pollers = await production.startLegacyPollers(context);
+  const observedCompletion = pollers.completion.catch(() => {});
+  await new Promise((resolve) => setImmediate(resolve));
+  let stopSettled = false;
+  const stopping = pollers.stop().then(
+    () => { stopSettled = true; return null; },
+    (error) => { stopSettled = true; return error; },
+  );
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(stopSettled, false);
+  slowMaintenance.resolve();
+  const error = await stopping;
+  assert.match(error.message, /log failed/u);
+  await observedCompletion;
+});
+
+test('reply cursor initialization survives a concurrent maintenance rollback', async () => {
+  const dynamicChannelId = '777777777777777777';
+  const latestLookup = deferred();
+  const maintenancePersisting = deferred();
+  const releaseRollback = deferred();
+  let observedCursor;
+  const inboxState = createEmptyInboxState();
+  inboxState.initialized = true;
+  inboxState.cursors[config.discordTaskChannelId] = '1';
+  inboxState.cursors[config.discordConfirmationChannelId] = '1';
+  const production = bridgeModule.createProductionBridgeDependencies({
+    runOnce: true,
+    persistInboxStateImpl: async () => {},
+    readRolloutWatcherStateImpl: async () => ({ version: 2, initialized: true, files: {}, pending: {} }),
+    initializeRolloutWatcherStateImpl: async () => {}, writeRolloutWatcherStateImpl: async () => {},
+    pollRolloutCompletionsImpl: async ({ inboxState: shared }) => {
+      await commitInboxState({
+        state: shared,
+        fields: ['cursors'],
+        mutate: () => { shared.cursors[dynamicChannelId] = '888888888888888888'; },
+        persistState: async () => {
+          maintenancePersisting.resolve();
+          await releaseRollback.promise;
+          throw new Error('maintenance persist failed');
+        },
+      });
+    },
+    pollChannelImpl: async ({ state, channelId }) => {
+      if (channelId === dynamicChannelId) observedCursor = state.cursors[dynamicChannelId] ?? null;
+    },
+    logImpl: async (event) => {
+      if (event === 'completion-watcher-started') {
+        inboxState.discordTurnOrigins.turn = { guildId: config.discordGuildId, channelId: dynamicChannelId };
+      }
+    },
+  });
+  const context = {
+    config, token: 'test-token', inboxState, inboxReadOnly: false,
+    taskIndex: { version: 1, generatedAt: null, tasks: [] },
+    trackDiscordRest: () => latestLookup.promise,
+    trackActiveResource: (resource) => resource, executables: { powershellPath: 'pwsh.exe' },
+    setLatestErrorCategory: () => {}, recordActivity: () => {}, timestamps: {}, publishHealth: () => {},
+  };
+  const pollers = await production.startLegacyPollers(context);
+  await maintenancePersisting.promise;
+  latestLookup.resolve('999999999999999999');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(inboxState.cursors[dynamicChannelId], '888888888888888888');
+  releaseRollback.resolve();
+  await pollers.completion;
+  assert.equal(observedCursor, '999999999999999999');
+  assert.equal(inboxState.cursors[dynamicChannelId], '999999999999999999');
+});
+
 test('production takeover retry reloads only the exact queued record through tracked resources and replies', async () => {
   let interactionDependencies;
   const starts = [];
@@ -2755,11 +2886,16 @@ test('an immediate reply acknowledgement never claims it came from the retry que
     encryptText: async () => 'opaque-ciphertext',
     persistState: async () => {},
     resumeCodexThread: async () => ({ turnId: 'turn-immediate', completion: Promise.resolve({ turn: { status: 'completed' } }) }),
-    sendReply: async (payload) => { acknowledgements.push(payload.content); },
+    buildAcknowledgement: (_request, content) => ({
+      content,
+      components: [{ type: 1, components: [{ type: 2, label: '查看当前运行状态' }] }],
+    }),
+    sendReply: async (payload) => { acknowledgements.push(payload); },
   });
   assert.equal(result.status, 'started');
-  assert.match(acknowledgements[0], /^✅ 已送达/u);
-  assert.equal(acknowledgements[0].includes('排队回复'), false);
+  assert.match(acknowledgements[0].content, /^✅ 已送达/u);
+  assert.equal(acknowledgements[0].content.includes('排队回复'), false);
+  assert.equal(acknowledgements[0].components[0].components[0].label, '查看当前运行状态');
 });
 
 test('a reply remains confirmed-start when no acknowledgement transport is available', async () => {

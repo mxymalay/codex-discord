@@ -1324,15 +1324,27 @@ export function markContinuationDelivered(state, queueId, now = new Date().toISO
   return item;
 }
 
-export async function initializeInboxCursors({ state, channelIds, getLatest }) {
+export async function initializeInboxCursors({ state, channelIds, getLatest, persistState }) {
   migrateInboxState(state);
+  const latestByChannel = new Map();
   for (const channelId of channelIds.map(String)) {
-    if (!state.cursors[channelId]) {
-      state.cursors[channelId] = String(await getLatest(channelId));
-    }
+    if (!Object.hasOwn(state.cursors, channelId)) latestByChannel.set(channelId, String(await getLatest(channelId)));
   }
-  state.initialized = true;
-  return state;
+  const mutate = () => {
+    for (const [channelId, latest] of latestByChannel) {
+      if (!Object.hasOwn(state.cursors, channelId)) state.cursors[channelId] = latest;
+    }
+    state.initialized = true;
+    return state;
+  };
+  if (typeof persistState !== 'function') return mutate();
+  return commitInboxState({
+    state,
+    persistState,
+    fields: ['initialized', 'cursors'],
+    mutate,
+    errorMessage: 'Discord inbox cursor persistence failed',
+  });
 }
 
 export function isActiveWriterError(error) {
@@ -1341,10 +1353,13 @@ export function isActiveWriterError(error) {
 
 async function acknowledgeContinuation(dependencies, request, content) {
   if (request.source !== 'reply' || typeof dependencies.sendReply !== 'function') return false;
+  const payload = typeof dependencies.buildAcknowledgement === 'function'
+    ? dependencies.buildAcknowledgement(request, content)
+    : { content };
   await dependencies.sendReply({
     channelId: request.channelId,
     replyToMessageId: request.replyToMessageId ?? request.requestId,
-    content,
+    ...payload,
   });
   return true;
 }

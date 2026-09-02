@@ -690,7 +690,14 @@ export async function pollRolloutCompletions({
     }
     if (origin) {
       const boundary = await exactTerminalBoundary(item, turnId);
-      if (origin.progressDispatch || boundary === null || Number(origin.rolloutCursor ?? 0) < boundary) continue;
+      if (boundary === null) continue;
+      await advanceDiscordTurnOrigin({
+        state: inboxState,
+        persistState: persistInboxState,
+        turnId,
+        rolloutCursor: boundary,
+        discardPendingProgress: true,
+      });
     }
     let terminalEventId = null;
     if (origin) {

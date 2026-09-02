@@ -40,6 +40,7 @@ import { createGatewayClient } from './discord-gateway-lib.mjs';
 import {
   createInteractionRestClient,
   createInteractionRouter,
+  createTaskStatusRow,
   inspectQueuedTakeover,
   publishContinuationTakeoverMessage,
 } from './discord-interactions.mjs';
@@ -61,7 +62,6 @@ import { probeTemporaryAtomicWrite } from './discord-health-lib.mjs';
 import {
   dispatchNotificationViaPowerShell,
   initializeRolloutWatcherState,
-  pollDiscordOriginEvents,
   pollRolloutCompletions,
   readRolloutWatcherState,
   writeRolloutWatcherState,
@@ -778,6 +778,17 @@ export async function finalizeContinuationOutcome({
   return { ...result, durable, stopChannelScan: !durable };
 }
 
+function taskStatusAcknowledgement(context, request, content) {
+  return {
+    content,
+    components: [createTaskStatusRow(context, {
+      threadId: request.threadId,
+      userId: context.config.discordAllowedUserId,
+      guildId: request.guildId ?? context.config.discordGuildId,
+    })],
+  };
+}
+
 async function startContinuation({
   token,
   config,
@@ -787,6 +798,7 @@ async function startContinuation({
   takeoverClaimId,
   persistState = saveState,
   sendReply = (payload) => sendDiscordReply({ token, ...payload }),
+  buildAcknowledgement,
   onActiveWriterQueued,
 }) {
   const mappedCwd = await existingDirectory(String(request.cwd ?? ''));
@@ -800,6 +812,7 @@ async function startContinuation({
     persistState,
     takeoverClaimId,
     sendReply,
+    buildAcknowledgement,
     steerCodexThread,
     trackCompletion: (started, normalized) => trackContinuationCompletion(
       started, normalized, token, trackActiveResource, sendReply,
@@ -823,12 +836,12 @@ async function startContinuation({
   return outcome;
 }
 
-async function retryPendingTurns({ token, config, state, onRetry = () => {}, trackActiveResource, sendReply }) {
+async function retryPendingTurns({ token, config, state, onRetry = () => {}, trackActiveResource, sendReply, buildAcknowledgement }) {
   const now = Date.now();
   for (const pending of listRetryableContinuations(state)) {
     const lastAttempt = Date.parse(String(pending.lastAttemptAt ?? ''));
     if (Number.isFinite(lastAttempt) && now - lastAttempt < pendingRetryIntervalMs) continue;
-    await startContinuation({ token, config, state, request: pending, trackActiveResource, sendReply });
+    await startContinuation({ token, config, state, request: pending, trackActiveResource, sendReply, buildAcknowledgement });
     onRetry();
   }
 }
@@ -929,6 +942,7 @@ export function createProductionBridgeDependencies({
   initializeRolloutWatcherStateImpl = initializeRolloutWatcherState,
   writeRolloutWatcherStateImpl = writeRolloutWatcherState,
   pollRolloutCompletionsImpl = pollRolloutCompletions,
+  pollChannelImpl = pollChannel,
   logImpl = log,
 } = {}) {
   let taskIndexCommitTail = Promise.resolve();
@@ -1052,6 +1066,7 @@ export function createProductionBridgeDependencies({
         persistState: persistInboxStateImpl,
         trackActiveResource: context.trackActiveResource,
         sendReply: trackedReply,
+        buildAcknowledgement: (request, content) => taskStatusAcknowledgement(context, request, content),
       });
       const healthDependencies = {
         config: context.config,
@@ -1207,8 +1222,8 @@ export function createProductionBridgeDependencies({
           state,
           channelIds,
           getLatest: (channelId) => context.trackDiscordRest(() => getLatestDiscordMessageId({ token, channelId })),
+          persistState: persistInboxStateImpl,
         });
-        await commitInboxState({ state, persistState: persistInboxStateImpl });
       }
       await initializeRolloutWatcherStateImpl({ sessionsRoot, state: rolloutState, inboxState: state });
       await writeRolloutWatcherStateImpl(rolloutWatcherStatePath, rolloutState);
@@ -1216,31 +1231,97 @@ export function createProductionBridgeDependencies({
       await logImpl('completion-watcher-started');
 
       let stopping = false;
-      let wake = null;
+      const wakes = new Set();
       let lastIndexRefresh = Date.now();
       const waitForNextPoll = () => new Promise((resolve) => {
-        const timer = setTimeout(() => { wake = null; resolve(); }, pollIntervalMs);
-        wake = () => { clearTimeout(timer); wake = null; resolve(); };
+        const finish = () => {
+          clearTimeout(timer);
+          wakes.delete(finish);
+          resolve();
+        };
+        const timer = setTimeout(finish, pollIntervalMs);
+        wakes.add(finish);
       });
-      const completion = (async () => {
+      const continueRequest = async (payload) => {
+        try {
+          return await startContinuation({
+            ...payload,
+            trackActiveResource: context.trackActiveResource,
+            sendReply: trackedReply,
+            buildAcknowledgement: (request, content) => taskStatusAcknowledgement(context, request, content),
+            onActiveWriterQueued: async ({ request, result }) => {
+              const inspection = await inspectQueuedTakeover({
+                refreshTaskIndex: () => refreshTaskIndex(context),
+                getCodexControlStatus: () => runCodexControlActionImpl({
+                  action: 'status',
+                  powershellPath: context.executables.powershellPath,
+                  controlPath,
+                }),
+              }, request.threadId);
+              if (!inspection.available) {
+                await trackedReply({
+                  channelId: request.channelId,
+                  replyToMessageId: request.replyToMessageId,
+                  ...inspection.payload,
+                });
+                return;
+              }
+              await publishContinuationTakeoverMessage({
+                uiState: context.uiState,
+                sendMessage: trackedReply,
+              }, {
+                queueId: result.queueId,
+                targetThreadId: request.threadId,
+                snapshot: inspection.snapshot,
+                userId: context.config.discordAllowedUserId,
+                guildId: context.config.discordGuildId,
+                channelId: request.channelId,
+                replyToMessageId: request.replyToMessageId,
+              });
+            },
+          });
+        } finally {
+          context.publishHealth?.();
+        }
+      };
+      const replyCompletion = (async () => {
+        do {
+          if (!context.inboxReadOnly) {
+            channelIds = discordReplyChannelIds(config, state);
+            const missingCursor = channelIds.some((channelId) => !Object.hasOwn(state.cursors, channelId));
+            if (missingCursor) {
+              await initializeInboxCursors({
+                state,
+                channelIds,
+                getLatest: (channelId) => context.trackDiscordRest(() => getLatestDiscordMessageId({ token, channelId })),
+                persistState: persistInboxStateImpl,
+              });
+            }
+            for (const channelId of channelIds) {
+              if (stopping) break;
+              try {
+                await pollChannelImpl({
+                  token,
+                  config,
+                  state,
+                  channelId,
+                  getMessages: (options) => context.trackDiscordRest(() => getDiscordMessagesAfter(options)),
+                  continueRequest,
+                  sendGuidance: trackedReply,
+                });
+              } catch {
+                context.setLatestErrorCategory('channel-poll-failed');
+                await logImpl('channel-poll-failed', { channelId });
+              }
+            }
+          }
+          if (!runOnce && !stopping) await waitForNextPoll();
+        } while (!runOnce && !stopping);
+      })();
+      const maintenanceCompletion = (async () => {
         do {
           const progressBefore = rolloutProgressFingerprint(rolloutState);
           try {
-            if (!context.inboxReadOnly) {
-              try {
-                await pollDiscordOriginEvents({
-                  sessionsRoot,
-                  inboxState: state,
-                  taskIndex: context.taskIndex,
-                  nowMs: Date.now(),
-                  persistInboxState: persistInboxStateImpl,
-                  dispatchMessage: trackedReply,
-                });
-              } catch {
-                context.setLatestErrorCategory('origin-progress-failed');
-                await log('origin-progress-failed');
-              }
-            }
             await pollRolloutCompletionsImpl({
               sessionsRoot,
               state: rolloutState,
@@ -1276,77 +1357,11 @@ export function createProductionBridgeDependencies({
                 onRetry: () => context.recordActivity('lastQueueRetryAt'),
                 trackActiveResource: context.trackActiveResource,
                 sendReply: trackedReply,
+                buildAcknowledgement: (request, content) => taskStatusAcknowledgement(context, request, content),
               });
             } catch {
               context.setLatestErrorCategory('queue-retry-failed');
               await log('queue-retry-failed');
-            }
-            channelIds = discordReplyChannelIds(config, state);
-            const missingCursor = channelIds.some((channelId) => !Object.hasOwn(state.cursors, channelId));
-            if (missingCursor) {
-              await initializeInboxCursors({
-                state,
-                channelIds,
-                getLatest: (channelId) => context.trackDiscordRest(() => getLatestDiscordMessageId({ token, channelId })),
-              });
-              await commitInboxState({ state, persistState: persistInboxStateImpl, fields: ['initialized', 'cursors'] });
-            }
-            for (const channelId of channelIds) {
-              if (stopping) break;
-              try {
-                await pollChannel({
-                  token,
-                  config,
-                  state,
-                  channelId,
-                  getMessages: (options) => context.trackDiscordRest(() => getDiscordMessagesAfter(options)),
-                  continueRequest: async (payload) => {
-                    try {
-                      return await startContinuation({
-                        ...payload,
-                        trackActiveResource: context.trackActiveResource,
-                        sendReply: trackedReply,
-                        onActiveWriterQueued: async ({ request, result }) => {
-                          const inspection = await inspectQueuedTakeover({
-                            refreshTaskIndex: () => refreshTaskIndex(context),
-                            getCodexControlStatus: () => runCodexControlActionImpl({
-                              action: 'status',
-                              powershellPath: context.executables.powershellPath,
-                              controlPath,
-                            }),
-                          }, request.threadId);
-                          if (!inspection.available) {
-                            await trackedReply({
-                              channelId: request.channelId,
-                              replyToMessageId: request.replyToMessageId,
-                              ...inspection.payload,
-                            });
-                            return;
-                          }
-                          await publishContinuationTakeoverMessage({
-                            uiState: context.uiState,
-                            sendMessage: trackedReply,
-                          }, {
-                            queueId: result.queueId,
-                            targetThreadId: request.threadId,
-                            snapshot: inspection.snapshot,
-                            userId: context.config.discordAllowedUserId,
-                            guildId: context.config.discordGuildId,
-                            channelId: request.channelId,
-                            replyToMessageId: request.replyToMessageId,
-                          });
-                        },
-                      });
-                    } finally {
-                      context.publishHealth?.();
-                    }
-                  },
-                  sendGuidance: trackedReply,
-                });
-              } catch {
-                context.setLatestErrorCategory('channel-poll-failed');
-                await log('channel-poll-failed', { channelId });
-              }
             }
           }
           const now = Date.now();
@@ -1362,12 +1377,16 @@ export function createProductionBridgeDependencies({
           if (!runOnce && !stopping) await waitForNextPoll();
         } while (!runOnce && !stopping);
       })();
+      const completions = [replyCompletion, maintenanceCompletion];
+      const completion = Promise.all(completions);
       return {
         completion,
         async stop() {
           stopping = true;
-          wake?.();
-          await completion;
+          for (const wake of [...wakes]) wake();
+          const settled = await Promise.allSettled(completions);
+          const failure = settled.find((item) => item.status === 'rejected');
+          if (failure) throw failure.reason;
         },
       };
     },

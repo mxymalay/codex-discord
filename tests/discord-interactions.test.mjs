@@ -373,6 +373,21 @@ test('task list uses an embed-safe body even when indexed display names are over
   assert.equal(responses[0].data.embeds[0].description.length <= 3_800, true);
 });
 
+test('task list separates running tasks first and keeps recent tasks below them', () => {
+  const rendered = renderTaskList([
+    task(1, { status: 'completed', taskName: '较新的已完成任务' }),
+    task(2, { status: 'running', taskName: '运行任务 A' }),
+    task(3, { status: 'confirmation-required', taskName: '待确认任务' }),
+    task(4, { status: 'running', taskName: '运行任务 B' }),
+  ]);
+
+  assert.match(rendered, /^## 进行中的任务/mu);
+  assert.match(rendered, /^## 最近任务/mu);
+  assert.equal(rendered.indexOf('运行任务 A') < rendered.indexOf('运行任务 B'), true);
+  assert.equal(rendered.indexOf('运行任务 B') < rendered.indexOf('较新的已完成任务'), true);
+  assert.equal(rendered.indexOf('较新的已完成任务') < rendered.indexOf('待确认任务'), true);
+});
+
 test('search result renderer bounds untrusted query and display names for an embed', () => {
   const huge = '超长'.repeat(5_000);
   const rendered = renderSearchResults(
@@ -821,6 +836,52 @@ test('continue modal defers, revalidates the root task, and duplicate delivery d
   assert.equal(Object.hasOwn(requests[0], 'interactionToken'), false);
   assert.match(edits[0].content, /已排队/);
   assert.match(edits[0].content, /12345678/);
+});
+
+test('started continuation adds a live status button and running status uses a gray task card', async () => {
+  const running = task(1, { status: 'running', taskName: '诊断电脑故障' });
+  let current = running;
+  const uiState = new Map();
+  const { dependencies, responses, edits } = makeDependencies({
+    uiState,
+    taskIndex: { tasks: [running] },
+    dispatchContinuation: async () => ({ status: 'started', turnId: 'turn-status' }),
+    refreshTaskIndex: async () => ({ tasks: [current] }),
+    readTaskDetail: async (record) => ({ ...record, contentAvailable: true, taskText: '继续检查显卡驱动', resultText: '请确认下一步' }),
+  });
+  const router = createInteractionRouter(dependencies);
+  await router.handle(commandInteraction('继续任务', { 任务: 'root-1' }));
+  const modalId = responses.shift().data.custom_id;
+  await router.handle(modalSubmit(modalId, '再检查一次', { fieldId: '继续内容', id: 'status-submit' }));
+  assert.equal(responses.shift().type, 5);
+  const receipt = edits.shift();
+  const statusButton = receipt.components.flatMap((row) => row.components)
+    .find((button) => button.label === '查看当前运行状态');
+  assert.match(statusButton.custom_id, /^task-status:[A-Za-z0-9_-]{16}$/u);
+
+  await router.handle(componentInteraction(statusButton.custom_id, { id: 'status-click' }));
+  assert.equal(responses.shift().type, 5);
+  const statusCard = edits.shift().embeds[0];
+  assert.equal(statusCard.title, 'Codex 任务进行中…');
+  assert.equal(statusCard.color, 9807270);
+  assert.deepEqual(statusCard.fields.map((field) => field.name), ['项目名', '任务名', '任务']);
+  assert.equal(statusCard.fields[2].value, '继续检查显卡驱动');
+
+  current = { ...running, status: 'confirmation-required' };
+  await router.handle(componentInteraction(statusButton.custom_id, { id: 'status-confirmation' }));
+  assert.equal(responses.shift().type, 5);
+  const confirmationCard = edits.shift().embeds[0];
+  assert.equal(confirmationCard.title, 'Codex 任务待确认');
+  assert.equal(confirmationCard.color, 15965202);
+  assert.equal(confirmationCard.fields.at(-1).name, '待确认');
+
+  current = { ...running, status: 'completed' };
+  await router.handle(componentInteraction(statusButton.custom_id, { id: 'status-completed' }));
+  assert.equal(responses.shift().type, 5);
+  const completedCard = edits.shift().embeds[0];
+  assert.equal(completedCard.title, 'Codex 任务已完成');
+  assert.equal(completedCard.color, 3066993);
+  assert.equal(completedCard.fields.at(-1).name, '结果');
 });
 
 test('continue command and modal reject unknown roots and blank text without dispatching', async () => {
@@ -1966,7 +2027,7 @@ test('task detail continue button is protected and opens the shared continuation
   assert.equal(requests[0].projectName, 'POS');
 });
 
-test('running task list and detail show stop-current beside their existing action, while idle tasks do not', async () => {
+test('only a running task detail shows stop-current; task lists and idle details do not', async () => {
   const uiState = new Map();
   const interrupted = [];
   const { dependencies, responses, edits } = makeDependencies({
@@ -1982,17 +2043,7 @@ test('running task list and detail show stop-current beside their existing actio
 
   await router.handle(commandInteraction('任务列表'));
   const listButtons = responses.shift().data.components.flatMap((row) => row.components);
-  const stopButtons = listButtons.filter((button) => button.label === '停止当前运行');
-  assert.equal(stopButtons.length, 1);
-  assert.equal(stopButtons[0].style, 4);
-  assert.match(stopButtons[0].custom_id, /^stop-current:[A-Za-z0-9_-]{16}$/u);
-  assert.equal(uiState.get(stopButtons[0].custom_id.split(':')[1]).threadId, 'root-1');
-  assert.equal(listButtons.findIndex((button) => button.label === '停止当前运行'), 1);
-
-  await router.handle(componentInteraction(stopButtons[0].custom_id, { id: 'stop-current-running' }));
-  assert.deepEqual(interrupted, ['root-1']);
-  assert.equal(responses.shift().type, 6);
-  assert.match(edits.shift().content, /已停止.*当前运行/);
+  assert.equal(listButtons.some((button) => button.label === '停止当前运行'), false);
 
   await router.handle(commandInteraction('任务详情', { 任务: 'root-1' }));
   assert.equal(responses.shift().type, 5);
@@ -2001,6 +2052,14 @@ test('running task list and detail show stop-current beside their existing actio
     ['继续任务', 1],
     ['停止当前运行', 4],
   ]);
+  const stopButton = runningDetailButtons.find((button) => button.label === '停止当前运行');
+  assert.match(stopButton.custom_id, /^stop-current:[A-Za-z0-9_-]{16}$/u);
+  assert.equal(uiState.get(stopButton.custom_id.split(':')[1]).threadId, 'root-1');
+
+  await router.handle(componentInteraction(stopButton.custom_id, { id: 'stop-current-running' }));
+  assert.deepEqual(interrupted, ['root-1']);
+  assert.equal(responses.shift().type, 6);
+  assert.match(edits.shift().content, /已停止.*当前运行/);
 
   await router.handle(commandInteraction('任务详情', { 任务: 'root-2' }));
   assert.equal(responses.shift().type, 5);
@@ -2396,7 +2455,8 @@ test('help names all eleven commands and explains takeover, routing, control mod
   assert.match(help, /active-writer|写入者占用/);
   assert.match(help, /临时开启[\s\S]{0,500}临时停止[\s\S]{0,500}长期开启[\s\S]{0,500}长期停用/);
   assert.match(help, /临时(?:开启|停止)[\s\S]{0,300}不改变[\s\S]{0,300}长期/);
-  assert.match(help, /Discord[\s\S]{0,300}(?:新建|继续)[\s\S]{0,300}原频道[\s\S]{0,300}(?:commentary|工具进度|进度)/i);
+  assert.match(help, /从 Discord 新建或继续[\s\S]{0,200}(?:待确认|最终结果)[\s\S]{0,200}原频道/i);
+  assert.match(help, /不转发[\s\S]{0,100}(?:commentary|工具调用|过程)/i);
   assert.match(help, /登录[\s\S]{0,200}(?:唤醒|休眠)[\s\S]{0,200}(?:联网|网络)/);
   assert.match(help, /Codex 桌面端[\s\S]{0,200}(?:关闭|退出)/);
 });
