@@ -1077,13 +1077,35 @@ test('registration-only lifecycle verifies exactly eleven commands without start
   assert.deepEqual(events, ['commands-registered']);
 });
 
-test('registration verification fails closed when Discord returns a different command set', async () => {
-  const events = [];
-  const app = createBridgeApplication(makeBridgeDependencies(events, {
-    async fetchRegisteredCommands() { return [{ name: '帮助' }]; },
+test('registration verification accepts reordered exact names and rejects duplicate, missing, or extra names', async () => {
+  const serverOrder = [
+    '帮助', '退出codex', '系统测试', '系统状态', '额度',
+    '继续队列', '继续任务', '新建任务', '任务搜索', '任务详情', '任务列表',
+  ];
+  const app = createBridgeApplication(makeBridgeDependencies([], {
+    async fetchRegisteredCommands() { return serverOrder.map((name) => ({ name })); },
   }));
 
-  await assert.rejects(() => app.registerCommandsOnce(), /Guild command verification failed/);
+  const result = await app.registerCommandsOnce();
+
+  assert.deepEqual(result.commandNames, serverOrder);
+  const exactNames = [
+    '任务列表', '任务详情', '任务搜索', '新建任务', '继续任务',
+    '继续队列', '额度', '系统状态', '系统测试', '退出codex', '帮助',
+  ];
+  const invalidSets = {
+    duplicate: [...exactNames.slice(0, -1), '退出codex'],
+    missing: exactNames.slice(0, -1),
+    extra: [...exactNames, '额外命令'],
+  };
+
+  for (const commandNames of Object.values(invalidSets)) {
+    const invalidApp = createBridgeApplication(makeBridgeDependencies([], {
+      async fetchRegisteredCommands() { return commandNames.map((commandName) => ({ name: commandName })); },
+    }));
+
+    await assert.rejects(() => invalidApp.registerCommandsOnce(), /Guild command verification failed/);
+  }
 });
 
 test('quick health resolves the current Bot identity before reading its Guild member', async () => {

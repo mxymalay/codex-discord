@@ -102,7 +102,10 @@ function latestTimestamp(timestamps) {
 
 function exactCommandNames(commands) {
   const names = (Array.isArray(commands) ? commands : []).map((item) => String(item?.name ?? ''));
-  if (names.length !== COMMAND_NAMES.length || names.some((name, index) => name !== COMMAND_NAMES[index])) {
+  const uniqueNames = new Set(names);
+  if (names.length !== COMMAND_NAMES.length
+    || uniqueNames.size !== COMMAND_NAMES.length
+    || COMMAND_NAMES.some((name) => !uniqueNames.has(name))) {
     throw new Error('Guild command verification failed');
   }
   return names;
