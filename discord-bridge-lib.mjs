@@ -235,16 +235,25 @@ export async function steerCodexThread({
   } catch (error) {
     throw desktopUnavailable(error);
   }
-  let after = [];
-  try {
-    after = desktopTurns(await read());
-  } catch {
-    // The message is already accepted; the pre-send active turn remains an exact binding when present.
-  }
   const beforeIds = new Set(before.map((turn) => String(turn?.id ?? '')).filter(Boolean));
-  const newlyObserved = after.find((turn) => String(turn?.id ?? '') && !beforeIds.has(String(turn.id)));
-  const active = [...after, ...before].find((turn) => String(turn?.status ?? '').toLowerCase() === 'inprogress');
-  return { turnId: String(newlyObserved?.id ?? active?.id ?? '') || undefined };
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, attempt * 50));
+    let after;
+    try {
+      after = desktopTurns(await read());
+    } catch {
+      continue;
+    }
+    const newlyObserved = after.find((turn) => String(turn?.id ?? '') && !beforeIds.has(String(turn.id)));
+    const active = after.find((turn) => String(turn?.status ?? '').toLowerCase() === 'inprogress');
+    const turnId = String(newlyObserved?.id ?? active?.id ?? '');
+    if (turnId) return { turnId };
+  }
+  const preexistingActive = before.find((turn) => String(turn?.status ?? '').toLowerCase() === 'inprogress');
+  if (preexistingActive?.id) return { turnId: String(preexistingActive.id) };
+  const error = desktopUnavailable(new Error('Codex desktop accepted the message but its turn is not observable'));
+  error.submissionStage = 'post-submit';
+  throw error;
 }
 
 function createCodexRouterSession({
@@ -1644,6 +1653,11 @@ export async function dispatchContinuation(request, dependencies = {}) {
     if (typeof steer === 'function') {
       try {
         started = await steer(options);
+        if (!started?.turnId) {
+          const error = new Error('Codex desktop accepted the message but its turn is not observable');
+          error.submissionStage = 'post-submit';
+          throw error;
+        }
       } catch (error) {
         if (error?.submissionStage !== 'pre-submit' || !error?.desktopUnavailable) throw error;
       }

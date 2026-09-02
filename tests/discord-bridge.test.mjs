@@ -2128,6 +2128,43 @@ test('desktop continuation binds a newly completed fast turn instead of losing i
   assert.equal(result.turnId, 'turn-fast');
 });
 
+test('desktop continuation briefly retries a delayed turn id and fails closed when it stays invisible', async () => {
+  let reads = 0;
+  const delayed = await steerCodexThread({
+    threadId: 'root-delayed',
+    text: '继续',
+    appToolCall: async ({ tool, onSubmitted }) => {
+      if (tool === 'send_message_to_thread') {
+        await onSubmitted?.();
+        return { success: true, contentItems: [] };
+      }
+      reads += 1;
+      if (reads === 2) throw new Error('temporary read failure');
+      const turns = reads < 4
+        ? [{ id: 'turn-old', status: 'completed' }]
+        : [{ id: 'turn-delayed', status: 'inProgress' }, { id: 'turn-old', status: 'completed' }];
+      return { success: true, contentItems: [{ type: 'inputText', text: JSON.stringify({ turns }) }] };
+    },
+  });
+  assert.equal(delayed.turnId, 'turn-delayed');
+  assert.equal(reads, 4);
+
+  await assert.rejects(
+    steerCodexThread({
+      threadId: 'root-invisible',
+      text: '继续',
+      appToolCall: async ({ tool, onSubmitted }) => {
+        if (tool === 'send_message_to_thread') {
+          await onSubmitted?.();
+          return { success: true, contentItems: [] };
+        }
+        return { success: true, contentItems: [{ type: 'inputText', text: '{"turns":[]}' }] };
+      },
+    }),
+    (error) => error?.submissionStage === 'post-submit',
+  );
+});
+
 test('task interruption discovers the exact owner and confirms the exact active turn', async () => {
   const requests = [];
   const session = {
@@ -2235,6 +2272,16 @@ test('dispatch prefers desktop steering, falls back only before submission, and 
     resumeCodexThread: async () => { resumeCount += 1; throw new Error('must not retry'); },
   });
   assert.equal(uncertain.status, 'uncertain');
+  assert.equal(resumeCount, 1);
+
+  const missingTurn = await dispatchContinuation(makeRequest('steer-missing-turn'), {
+    state: createEmptyInboxState(),
+    encryptText: async () => 'cipher',
+    persistState: async () => {},
+    steerCodexThread: async () => ({}),
+    resumeCodexThread: async () => { resumeCount += 1; throw new Error('must not retry'); },
+  });
+  assert.equal(missingTurn.status, 'uncertain');
   assert.equal(resumeCount, 1);
 });
 
