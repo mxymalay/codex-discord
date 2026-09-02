@@ -19,13 +19,16 @@ export function createEmptyInboxState() {
     pendingContinuations: {},
     processedInteractions: [],
     createdTasksByInteraction: {},
+    discordTurnOrigins: {},
   };
 }
 
 const MAX_PROCESSED_INTERACTIONS = 2_000;
 const MAX_CREATED_TASK_RECORDS = 2_000;
+const MAX_DISCORD_TURN_ORIGINS = 2_000;
+const MAX_ORIGIN_EVENT_IDS = 128;
 const MAX_TERMINAL_CONTINUATIONS = 200;
-const CONTINUATION_STATUSES = new Set(['queued', 'resuming', 'submitting', 'attempting', 'start-submitted', 'start-uncertain', 'confirmed-start', 'acknowledging', 'delivered', 'cancelled', 'failed']);
+const CONTINUATION_STATUSES = new Set(['queued', 'takeover-claimed', 'resuming', 'submitting', 'attempting', 'start-submitted', 'start-uncertain', 'confirmed-start', 'acknowledging', 'delivered', 'cancelled', 'failed']);
 const TERMINAL_CONTINUATION_STATUSES = new Set(['delivered', 'cancelled', 'failed']);
 const TERMINAL_CREATION_STATUSES = new Set(['started', 'first-turn-failed', 'failed-before-thread', 'recovered-failed']);
 const inboxStateCommitQueues = new WeakMap();
@@ -35,6 +38,9 @@ const TASK_CREATION_STATUSES = new Set([
   'first-turn-failed', 'failed-before-thread', 'recovering', 'cleanup-proven',
   'worktree-removed', 'recovered-failed',
 ]);
+const DISCORD_ORIGIN_SOURCES = new Set(['new-task', 'slash', 'reply']);
+const DISCORD_ORIGIN_DELIVERY_STATES = new Set(['pending', 'terminal-dispatching', 'terminal-delivered']);
+const CREATION_RECEIPT_STATUSES = new Set(['original-edited', 'followup-sent', 'failed']);
 
 function isRecord(value) {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -72,13 +78,14 @@ function validContinuationEntry(key, value, { allowLegacyPlaintext = false } = {
     'channelId', 'replyToMessageId', 'referencedMessageId', 'mapping', 'createdAt',
     'queuedAt', 'lastAttemptAt', 'attempts', 'status', 'submittingAt', 'submittedAt',
     'uncertainAt', 'confirmedAt', 'ackClaimedAt', 'deliveredAt', 'cancelledAt',
-    'failedAt', 'failureReason', 'turnId',
+    'failedAt', 'failureReason', 'blockedReason', 'turnId', 'takeoverClaimId',
+    'takeoverClaimedAt', 'guildId', 'projectId', 'projectName',
   ]);
   if (allowLegacyPlaintext) allowed.add('text');
   const timestamps = [
     value.createdAt, value.queuedAt, value.lastAttemptAt, value.submittingAt,
     value.submittedAt, value.uncertainAt, value.confirmedAt, value.ackClaimedAt,
-    value.deliveredAt, value.cancelledAt, value.failedAt,
+    value.deliveredAt, value.cancelledAt, value.failedAt, value.takeoverClaimedAt,
   ];
   return hasOnlyKeys(value, allowed) && value.queueId === key &&
     ['reply', 'slash'].includes(value.source) && isNonEmptyString(value.requestId) &&
@@ -86,8 +93,13 @@ function validContinuationEntry(key, value, { allowLegacyPlaintext = false } = {
     Number.isInteger(value.attempts) && value.attempts >= 0 &&
     Number.isFinite(Date.parse(value.createdAt)) && Number.isFinite(Date.parse(value.queuedAt)) &&
     timestamps.slice(2).every(isOptionalTimestamp) &&
-    ['cwd', 'encryptedText', 'summary', 'channelId', 'replyToMessageId',
-      'referencedMessageId', 'failureReason', 'turnId'].every((field) => isOptionalString(value[field])) &&
+    ['cwd', 'encryptedText', 'summary', 'channelId', 'guildId', 'projectId', 'projectName',
+      'replyToMessageId', 'referencedMessageId', 'failureReason', 'turnId'].every((field) => isOptionalString(value[field])) &&
+    (value.blockedReason === undefined ||
+      (value.status === 'queued' && value.blockedReason === 'active-writer')) &&
+    (value.status === 'takeover-claimed'
+      ? isNonEmptyString(value.takeoverClaimId) && Number.isFinite(Date.parse(value.takeoverClaimedAt))
+      : value.takeoverClaimId === undefined && value.takeoverClaimedAt === undefined) &&
     (!allowLegacyPlaintext || isOptionalString(value.text)) && validMapping(value.mapping);
 }
 
@@ -118,16 +130,64 @@ function validCleanupProof(value) {
   return isRecord(value) && hasOnlyKeys(value, new Set(fields)) && fields.every((field) => isNonEmptyString(value[field]));
 }
 
+function validCreationOriginIntent(value) {
+  if (value === undefined) return true;
+  const allowed = new Set(['guildId', 'channelId', 'source', 'projectId', 'projectName', 'createdAt']);
+  return isRecord(value) && hasOnlyKeys(value, allowed) &&
+    /^[0-9]{17,20}$/u.test(value.guildId) && /^[0-9]{17,20}$/u.test(value.channelId) &&
+    value.source === 'new-task' && isOptionalString(value.projectId) &&
+    isOptionalString(value.projectName) && Number.isFinite(Date.parse(value.createdAt));
+}
+
+function validProgressDispatch(value) {
+  if (value === undefined) return true;
+  const allowed = new Set(['eventId', 'nonce', 'start', 'end', 'kind', 'rolloutFingerprint']);
+  return isRecord(value) && hasOnlyKeys(value, allowed) && /^[a-f0-9]{64}$/u.test(value.eventId) &&
+    /^\d{1,25}$/u.test(value.nonce) && Number.isInteger(value.start) && value.start >= 0 &&
+    Number.isInteger(value.end) && value.end > value.start &&
+    ['started', 'commentary', 'tool-start', 'tool-complete', 'tool-failed'].includes(value.kind) &&
+    /^[a-f0-9]{64}$/u.test(value.rolloutFingerprint);
+}
+
 function validTaskCreationRecord(value) {
   if (!isRecord(value)) return false;
   const allowed = new Set([
     'status', 'threadId', 'turnId', 'taskName', 'workspace', 'errorCategory',
-    'recoveryStartedAt', 'recoveredAt', 'cleanupProof',
+    'recoveryStartedAt', 'recoveredAt', 'cleanupProof', 'projectId', 'projectName',
+    'receiptStatus', 'receiptUpdatedAt', 'receiptErrorCategory', 'receiptMessageId',
+    'originIntent',
   ]);
   return hasOnlyKeys(value, allowed) && TASK_CREATION_STATUSES.has(value.status) &&
-    ['threadId', 'turnId', 'taskName', 'errorCategory'].every((field) => isOptionalString(value[field])) &&
+    ['threadId', 'turnId', 'taskName', 'errorCategory', 'projectId', 'projectName',
+      'receiptErrorCategory', 'receiptMessageId']
+      .every((field) => isOptionalString(value[field])) &&
+    (value.receiptStatus === undefined || CREATION_RECEIPT_STATUSES.has(value.receiptStatus)) &&
+    isOptionalTimestamp(value.receiptUpdatedAt) &&
     isOptionalTimestamp(value.recoveryStartedAt) && isOptionalTimestamp(value.recoveredAt) &&
-    validWorkspace(value.workspace) && validCleanupProof(value.cleanupProof);
+    validWorkspace(value.workspace) && validCleanupProof(value.cleanupProof) &&
+    validCreationOriginIntent(value.originIntent);
+}
+
+function validDiscordTurnOrigin(_turnId, value) {
+  if (!isRecord(value)) return false;
+  const allowed = new Set([
+    'threadId', 'guildId', 'channelId', 'source', 'createdAt', 'projectId', 'projectName',
+    'rolloutCursor', 'deliveredEventIds', 'deliveryState', 'deliveredAt', 'lastMessageId',
+    'rolloutFingerprint',
+    'terminalEventId',
+    'progressDispatch',
+  ]);
+  return hasOnlyKeys(value, allowed) && isNonEmptyString(value.threadId) &&
+    /^\d{17,20}$/u.test(String(value.guildId ?? '')) && /^\d{17,20}$/u.test(String(value.channelId ?? '')) &&
+    DISCORD_ORIGIN_SOURCES.has(String(value.source ?? '')) && Number.isFinite(Date.parse(value.createdAt)) &&
+    ['projectId', 'projectName', 'lastMessageId', 'rolloutFingerprint', 'terminalEventId'].every((field) => isOptionalString(value[field])) &&
+    (value.rolloutFingerprint === undefined || /^[a-f0-9]{64}$/u.test(value.rolloutFingerprint)) &&
+    (value.terminalEventId === undefined || /^[a-f0-9]{64}$/u.test(value.terminalEventId)) &&
+    Number.isInteger(value.rolloutCursor) && value.rolloutCursor >= 0 &&
+    Array.isArray(value.deliveredEventIds) && value.deliveredEventIds.length <= MAX_ORIGIN_EVENT_IDS &&
+    value.deliveredEventIds.every(isNonEmptyString) &&
+    DISCORD_ORIGIN_DELIVERY_STATES.has(String(value.deliveryState ?? '')) &&
+    isOptionalTimestamp(value.deliveredAt) && validProgressDispatch(value.progressDispatch);
 }
 
 function validLegacyPendingReply(key, value) {
@@ -157,7 +217,7 @@ function corruptInboxStateError() {
 export function assertValidInboxStateV2(candidate, { allowLegacyPlaintext = false } = {}) {
   const allowed = new Set([
     'version', 'initialized', 'cursors', 'processedMessageIds', 'pendingContinuations',
-    'processedInteractions', 'createdTasksByInteraction',
+    'processedInteractions', 'createdTasksByInteraction', 'discordTurnOrigins',
   ]);
   if (allowLegacyPlaintext) allowed.add('pendingReplies');
   const validPendingContinuations = candidate?.pendingContinuations === undefined && allowLegacyPlaintext ||
@@ -167,11 +227,15 @@ export function assertValidInboxStateV2(candidate, { allowLegacyPlaintext = fals
     (Array.isArray(candidate?.processedInteractions) && candidate.processedInteractions.every(validProcessedInteraction));
   const validCreatedTasks = candidate?.createdTasksByInteraction === undefined && allowLegacyPlaintext ||
     (isRecord(candidate?.createdTasksByInteraction) && Object.values(candidate.createdTasksByInteraction).every(validTaskCreationRecord));
+  const validOrigins = candidate?.discordTurnOrigins === undefined && allowLegacyPlaintext ||
+    (isRecord(candidate?.discordTurnOrigins) && Object.keys(candidate.discordTurnOrigins).length <= MAX_DISCORD_TURN_ORIGINS &&
+      Object.entries(candidate.discordTurnOrigins).every(([key, value]) =>
+      isNonEmptyString(key) && validDiscordTurnOrigin(key, value)));
   const valid = isRecord(candidate) && hasOnlyKeys(candidate, allowed) && candidate.version === 2 &&
     typeof candidate.initialized === 'boolean' && isRecord(candidate.cursors) &&
     Object.entries(candidate.cursors).every(([key, value]) => isNonEmptyString(key) && isNonEmptyString(value)) &&
     Array.isArray(candidate.processedMessageIds) && candidate.processedMessageIds.every(isNonEmptyString) &&
-    validPendingContinuations && validProcessedInteractions && validCreatedTasks &&
+    validPendingContinuations && validProcessedInteractions && validCreatedTasks && validOrigins &&
     (!Object.hasOwn(candidate, 'pendingReplies') || (isRecord(candidate.pendingReplies) &&
       Object.entries(candidate.pendingReplies).every(([key, value]) => validLegacyPendingReply(key, value))));
   if (!valid) throw corruptInboxStateError();
@@ -182,7 +246,7 @@ export function assertValidInboxStateV2(candidate, { allowLegacyPlaintext = fals
 export function assertValidLegacyInboxState(candidate) {
   const allowed = new Set([
     'version', 'initialized', 'cursors', 'processedMessageIds', 'pendingReplies',
-    'createdTasksByInteraction',
+    'createdTasksByInteraction', 'discordTurnOrigins',
   ]);
   const valid = isRecord(candidate) && hasOnlyKeys(candidate, allowed) &&
     (candidate.version === undefined || candidate.version === 1) &&
@@ -194,7 +258,9 @@ export function assertValidLegacyInboxState(candidate) {
     (candidate.pendingReplies === undefined || (isRecord(candidate.pendingReplies) &&
       Object.entries(candidate.pendingReplies).every(([key, value]) => validLegacyPendingReply(key, value)))) &&
     (candidate.createdTasksByInteraction === undefined || (isRecord(candidate.createdTasksByInteraction) &&
-      Object.values(candidate.createdTasksByInteraction).every(validTaskCreationRecord)));
+      Object.values(candidate.createdTasksByInteraction).every(validTaskCreationRecord))) &&
+    (candidate.discordTurnOrigins === undefined || (isRecord(candidate.discordTurnOrigins) &&
+      Object.entries(candidate.discordTurnOrigins).every(([key, value]) => isNonEmptyString(key) && validDiscordTurnOrigin(key, value))));
   if (!valid) throw corruptInboxStateError();
   return candidate;
 }
@@ -261,6 +327,28 @@ function pruneCreatedTaskHistory(state) {
   }
 }
 
+function pruneDiscordTurnOrigins(state) {
+  const origins = state?.discordTurnOrigins;
+  if (!isRecord(origins)) return;
+  for (const origin of Object.values(origins)) {
+    origin.deliveredEventIds = Array.isArray(origin?.deliveredEventIds)
+      ? origin.deliveredEventIds.map(String).filter(Boolean).slice(-MAX_ORIGIN_EVENT_IDS)
+      : [];
+  }
+  let overflow = Math.max(0, Object.keys(origins).length - MAX_DISCORD_TURN_ORIGINS);
+  if (!overflow) return;
+  const terminal = Object.entries(origins)
+    .filter(([, origin]) => origin?.deliveryState === 'terminal-delivered')
+    .sort((left, right) => String(left[1]?.deliveredAt ?? left[1]?.createdAt ?? '')
+      .localeCompare(String(right[1]?.deliveredAt ?? right[1]?.createdAt ?? '')));
+  for (const [turnId] of terminal) {
+    if (!overflow) break;
+    delete origins[turnId];
+    overflow -= 1;
+  }
+  if (overflow > 0) throw new Error('Discord turn origin capacity exceeded');
+}
+
 export async function commitInboxState({
   state,
   persistState,
@@ -292,12 +380,18 @@ export async function commitInboxState({
       if (uniqueFields.includes('createdTasksByInteraction') || Object.hasOwn(entries, 'createdTasksByInteraction')) {
         pruneCreatedTaskHistory(immutableSnapshot);
       }
+      if (uniqueFields.includes('discordTurnOrigins') || Object.hasOwn(entries, 'discordTurnOrigins')) {
+        pruneDiscordTurnOrigins(immutableSnapshot);
+      }
       if (uniqueFields.includes('pendingContinuations') || Object.hasOwn(entries, 'pendingContinuations')) {
         pruneContinuationHistory(immutableSnapshot);
       }
       await persistState(immutableSnapshot);
       if (uniqueFields.includes('createdTasksByInteraction') || Object.hasOwn(entries, 'createdTasksByInteraction')) {
         pruneCreatedTaskHistory(state);
+      }
+      if (uniqueFields.includes('discordTurnOrigins') || Object.hasOwn(entries, 'discordTurnOrigins')) {
+        pruneDiscordTurnOrigins(state);
       }
       if (uniqueFields.includes('pendingContinuations') || Object.hasOwn(entries, 'pendingContinuations')) {
         pruneContinuationHistory(state);
@@ -365,6 +459,9 @@ export function createContinuationRequest({
   cwd,
   text,
   channelId,
+  guildId,
+  projectId,
+  projectName,
   replyToMessageId,
   createdAt = new Date().toISOString(),
 }) {
@@ -384,6 +481,9 @@ export function createContinuationRequest({
     cwd: String(cwd ?? '') || undefined,
     text: String(text),
     channelId: String(channelId ?? '') || undefined,
+    guildId: String(guildId ?? '') || undefined,
+    projectId: String(projectId ?? '') || undefined,
+    projectName: String(projectName ?? '') || undefined,
     replyToMessageId: String(replyToMessageId ?? '') || undefined,
     createdAt: String(createdAt),
   };
@@ -398,6 +498,13 @@ export function migrateInboxState(candidate) {
   state.pendingContinuations = state.pendingContinuations && typeof state.pendingContinuations === 'object'
     ? state.pendingContinuations
     : {};
+  for (const pending of Object.values(state.pendingContinuations)) {
+    if (pending?.status !== 'queued') delete pending.blockedReason;
+    if (pending?.status !== 'takeover-claimed') {
+      delete pending.takeoverClaimId;
+      delete pending.takeoverClaimedAt;
+    }
+  }
   state.processedInteractions = Array.isArray(state.processedInteractions)
     ? state.processedInteractions.slice(-MAX_PROCESSED_INTERACTIONS)
     : [];
@@ -405,6 +512,10 @@ export function migrateInboxState(candidate) {
     ? state.createdTasksByInteraction
     : {};
   pruneCreatedTaskHistory(state);
+  state.discordTurnOrigins = state.discordTurnOrigins && typeof state.discordTurnOrigins === 'object'
+    ? state.discordTurnOrigins
+    : {};
+  pruneDiscordTurnOrigins(state);
 
   pruneContinuationHistory(state);
 
@@ -436,6 +547,188 @@ export function migrateInboxState(candidate) {
   return state;
 }
 
+function normalizedDiscordTurnOrigin(origin) {
+  const turnId = String(origin?.turnId ?? '').trim();
+  const value = {
+    threadId: String(origin?.threadId ?? '').trim(),
+    guildId: String(origin?.guildId ?? '').trim(),
+    channelId: String(origin?.channelId ?? '').trim(),
+    source: String(origin?.source ?? '').trim(),
+    createdAt: String(origin?.createdAt ?? '').trim(),
+    rolloutCursor: Math.max(0, Math.floor(Number(origin?.rolloutCursor ?? 0))),
+    deliveredEventIds: Array.isArray(origin?.deliveredEventIds)
+      ? origin.deliveredEventIds.map(String).filter(Boolean).slice(-MAX_ORIGIN_EVENT_IDS)
+      : [],
+    deliveryState: String(origin?.deliveryState ?? 'pending'),
+  };
+  const projectId = String(origin?.projectId ?? '').trim();
+  const projectName = String(origin?.projectName ?? '').trim();
+  const deliveredAt = String(origin?.deliveredAt ?? '').trim();
+  const lastMessageId = String(origin?.lastMessageId ?? '').trim();
+  const rolloutFingerprint = String(origin?.rolloutFingerprint ?? '').trim().toLocaleLowerCase();
+  const terminalEventId = String(origin?.terminalEventId ?? '').trim().toLocaleLowerCase();
+  if (projectId) value.projectId = projectId;
+  if (projectName) value.projectName = projectName;
+  if (deliveredAt) value.deliveredAt = deliveredAt;
+  if (lastMessageId) value.lastMessageId = lastMessageId;
+  if (rolloutFingerprint) value.rolloutFingerprint = rolloutFingerprint;
+  if (terminalEventId) value.terminalEventId = terminalEventId;
+  if (!turnId || !validDiscordTurnOrigin(turnId, value)) throw new Error('Discord turn origin is invalid');
+  return { turnId, value };
+}
+
+export function createDiscordTurnOriginRecord(origin) {
+  const normalized = normalizedDiscordTurnOrigin(origin);
+  return { turnId: normalized.turnId, ...structuredClone(normalized.value) };
+}
+
+/** Persist source-channel provenance only after Codex returns an exact turn id. */
+export async function persistDiscordTurnOrigin({ state, persistState, origin }) {
+  const normalized = normalizedDiscordTurnOrigin(origin);
+  return commitInboxState({
+    state,
+    persistState,
+    entries: { discordTurnOrigins: [normalized.turnId] },
+    mutate: () => {
+      state.discordTurnOrigins ??= {};
+      const existing = state.discordTurnOrigins[normalized.turnId];
+      if (existing) {
+        const sameBinding = existing.threadId === normalized.value.threadId &&
+          existing.guildId === normalized.value.guildId && existing.channelId === normalized.value.channelId;
+        if (!sameBinding) throw new Error('Discord turn origin conflicts with an existing binding');
+        return structuredClone(existing);
+      }
+      state.discordTurnOrigins[normalized.turnId] = normalized.value;
+      return structuredClone(normalized.value);
+    },
+    errorMessage: 'Discord turn origin persistence failed',
+  });
+}
+
+/** Enrich a native notification only from a trusted exact persisted turn/thread binding. */
+export function enrichDiscordOriginNotification(notification, state) {
+  const turnId = String(notification?.['turn-id'] ?? '').trim();
+  const threadId = String(notification?.['thread-id'] ?? '').trim();
+  if (!turnId || !threadId) return null;
+  const origin = state?.discordTurnOrigins?.[turnId];
+  if (!origin || !validDiscordTurnOrigin(turnId, origin) || origin.threadId !== threadId) return null;
+  for (const [field, expected] of [
+    ['discord-guild-id', origin.guildId],
+    ['discord-origin-channel-id', origin.channelId],
+  ]) {
+    if (notification?.[field] === undefined) continue;
+    const supplied = String(notification[field] ?? '').trim();
+    if (!/^\d{17,20}$/u.test(supplied) || supplied !== expected) return null;
+  }
+  return {
+    ...notification,
+    'discord-guild-id': origin.guildId,
+    'discord-origin-channel-id': origin.channelId,
+  };
+}
+
+/** Resolve only an exact turn/thread/guild/channel binding after trusted enrichment. */
+export function resolveDiscordOrigin(notification, state) {
+  const turnId = String(notification?.['turn-id'] ?? '').trim();
+  const threadId = String(notification?.['thread-id'] ?? '').trim();
+  const guildId = String(notification?.['discord-guild-id'] ?? '').trim();
+  const channelId = String(notification?.['discord-origin-channel-id'] ?? '').trim();
+  if (!turnId || !threadId || !/^\d{17,20}$/u.test(guildId) || !/^\d{17,20}$/u.test(channelId)) return null;
+  const origin = state?.discordTurnOrigins?.[turnId];
+  if (!origin || !validDiscordTurnOrigin(turnId, origin)) return null;
+  if (origin.threadId !== threadId || origin.guildId !== guildId || origin.channelId !== channelId) return null;
+  return origin;
+}
+
+export async function prepareDiscordOriginTerminalDelivery({ state, persistState, turnId, eventId }) {
+  const key = String(turnId ?? '').trim();
+  const normalizedEventId = String(eventId ?? '').trim().toLocaleLowerCase();
+  if (!key || !/^[a-f0-9]{64}$/u.test(normalizedEventId) || !state?.discordTurnOrigins?.[key]) {
+    throw new Error('Discord terminal delivery intent is invalid');
+  }
+  return commitInboxState({
+    state,
+    persistState,
+    entries: { discordTurnOrigins: [key] },
+    mutate: () => {
+      const current = state.discordTurnOrigins[key];
+      if (current.deliveryState === 'terminal-delivered') return structuredClone(current);
+      if (current.terminalEventId && current.terminalEventId !== normalizedEventId) {
+        throw new Error('Discord terminal delivery identity changed');
+      }
+      current.terminalEventId = normalizedEventId;
+      current.deliveryState = 'terminal-dispatching';
+      return structuredClone(current);
+    },
+    errorMessage: 'Discord terminal delivery intent persistence failed',
+  });
+}
+
+export async function prepareDiscordOriginProgressDelivery({ state, persistState, turnId, dispatch }) {
+  const key = String(turnId ?? '').trim();
+  if (!key || !state?.discordTurnOrigins?.[key] || !validProgressDispatch(dispatch)) {
+    throw new Error('Discord progress delivery intent is invalid');
+  }
+  return commitInboxState({
+    state,
+    persistState,
+    entries: { discordTurnOrigins: [key] },
+    mutate: () => {
+      const current = state.discordTurnOrigins[key];
+      if (current.progressDispatch && current.progressDispatch.eventId !== dispatch.eventId) {
+        throw new Error('Discord progress delivery intent conflicts');
+      }
+      current.progressDispatch ??= structuredClone(dispatch);
+      return structuredClone(current.progressDispatch);
+    },
+    errorMessage: 'Discord progress delivery intent persistence failed',
+  });
+}
+
+/** Advance a durable rollout cursor only after its corresponding Discord send succeeds. */
+export async function advanceDiscordTurnOrigin({
+  state,
+  persistState,
+  turnId,
+  rolloutCursor,
+  eventId,
+  lastMessageId,
+  terminalDeliveredAt,
+  rolloutFingerprint,
+}) {
+  const key = String(turnId ?? '').trim();
+  if (!key || !state?.discordTurnOrigins?.[key]) throw new Error('Discord turn origin was not found');
+  return commitInboxState({
+    state,
+    persistState,
+    entries: { discordTurnOrigins: [key] },
+    mutate: () => {
+      const current = state.discordTurnOrigins[key];
+      current.rolloutCursor = Math.max(Number(current.rolloutCursor ?? 0), Math.max(0, Math.floor(Number(rolloutCursor ?? 0))));
+      if (String(eventId ?? '').trim() && !current.deliveredEventIds.includes(String(eventId))) {
+        current.deliveredEventIds.push(String(eventId));
+        current.deliveredEventIds = current.deliveredEventIds.slice(-MAX_ORIGIN_EVENT_IDS);
+      }
+      if (current.progressDispatch?.eventId === String(eventId ?? '').trim()) delete current.progressDispatch;
+      if (String(lastMessageId ?? '').trim()) current.lastMessageId = String(lastMessageId);
+      if (String(rolloutFingerprint ?? '').trim()) {
+        const fingerprint = String(rolloutFingerprint).trim().toLocaleLowerCase();
+        if (!/^[a-f0-9]{64}$/u.test(fingerprint)) throw new Error('Discord rollout fingerprint is invalid');
+        if (current.rolloutFingerprint && current.rolloutFingerprint !== fingerprint) {
+          throw new Error('Discord rollout fingerprint changed');
+        }
+        current.rolloutFingerprint = fingerprint;
+      }
+      if (terminalDeliveredAt) {
+        current.deliveryState = 'terminal-delivered';
+        current.deliveredAt = String(terminalDeliveredAt);
+      }
+      return structuredClone(current);
+    },
+    errorMessage: 'Discord turn origin progress persistence failed',
+  });
+}
+
 export function enqueueContinuation(state, request) {
   if (!state || typeof state !== 'object') throw new Error('Continuation state is required');
   if (state.version !== 2 || !state.pendingContinuations) migrateInboxState(state);
@@ -457,6 +750,9 @@ export function enqueueContinuation(state, request) {
     encryptedText: String(request?.encryptedText ?? '') || undefined,
     summary: continuationSummary(request?.summary ?? request?.text),
     channelId: String(request?.channelId ?? '') || undefined,
+    guildId: String(request?.guildId ?? '') || undefined,
+    projectId: String(request?.projectId ?? '') || undefined,
+    projectName: String(request?.projectName ?? '') || undefined,
     replyToMessageId: String(request?.replyToMessageId ?? '') || undefined,
     referencedMessageId: String(request?.referencedMessageId ?? '') || undefined,
     mapping: request?.mapping ? structuredClone(request.mapping) : undefined,
@@ -489,6 +785,7 @@ export function cancelContinuation(state, queueId, now = new Date().toISOString(
   if (item.status === 'cancelled') return { status: 'already-cancelled', queueId: item.queueId };
   if (item.status !== 'queued') return { status: 'already-started', queueId: item.queueId };
   item.status = 'cancelled';
+  delete item.blockedReason;
   item.cancelledAt = String(now);
   if (item.source === 'slash') recordProcessedInteraction(state, item.requestId, { status: 'failed', queueId: item.queueId, reason: 'cancelled' }, now);
   const result = { status: 'cancelled', queueId: item.queueId };
@@ -500,12 +797,107 @@ export async function cancelContinuationPersisted({ state, queueId, now = new Da
   return persistMutation(state, persistState, () => cancelContinuation(state, queueId, now), [String(queueId)]);
 }
 
+function takeoverClaimMatches(item, claim) {
+  return item?.status === 'takeover-claimed' &&
+    String(item?.queueId ?? '') === String(claim?.queueId ?? '') &&
+    String(item?.threadId ?? '') === String(claim?.targetThreadId ?? '') &&
+    String(item?.takeoverClaimId ?? '') === String(claim?.claimId ?? '') &&
+    String(claim?.claimId ?? '').length > 0;
+}
+
+export async function claimContinuationTakeover({
+  state,
+  queueId,
+  targetThreadId,
+  now = new Date().toISOString(),
+  persistState,
+  randomBytes: randomBytesImpl = randomBytes,
+}) {
+  const normalizedQueueId = String(queueId ?? '');
+  const normalizedThreadId = String(targetThreadId ?? '');
+  try {
+    const claimId = randomBytesImpl(12).toString('base64url');
+    return await commitInboxState({
+      state,
+      persistState,
+      entries: { pendingContinuations: [normalizedQueueId] },
+      mutate: () => {
+        const item = state?.pendingContinuations?.[normalizedQueueId];
+        if (!item || item.status !== 'queued' || item.blockedReason !== 'active-writer' ||
+            item.threadId !== normalizedThreadId) {
+          return { status: 'unavailable', reason: 'queue-state-changed' };
+        }
+        item.status = 'takeover-claimed';
+        item.takeoverClaimId = claimId;
+        item.takeoverClaimedAt = String(now);
+        delete item.blockedReason;
+        return {
+          status: 'claimed',
+          queueId: normalizedQueueId,
+          targetThreadId: normalizedThreadId,
+          claimId,
+        };
+      },
+      errorMessage: 'Continuation takeover claim persistence failed',
+    });
+  } catch {
+    return { status: 'failed', reason: 'state-persist-failed' };
+  }
+}
+
+export async function releaseContinuationTakeoverClaim({
+  state,
+  claim,
+  now = new Date().toISOString(),
+  persistState,
+}) {
+  const queueId = String(claim?.queueId ?? '');
+  try {
+    return await commitInboxState({
+      state,
+      persistState,
+      fields: ['processedInteractions'],
+      entries: { pendingContinuations: [queueId] },
+      mutate: () => {
+        const item = state?.pendingContinuations?.[queueId];
+        if (!takeoverClaimMatches(item, claim)) {
+          return { status: 'unavailable', reason: 'queue-state-changed' };
+        }
+        item.status = 'queued';
+        item.blockedReason = 'active-writer';
+        delete item.takeoverClaimId;
+        delete item.takeoverClaimedAt;
+        if (item.source === 'slash') {
+          recordProcessedInteraction(state, item.requestId, {
+            status: 'queued', queueId: item.queueId, reason: 'active-writer',
+          }, now);
+        }
+        return { status: 'queued', queueId: item.queueId, reason: 'active-writer' };
+      },
+      errorMessage: 'Continuation takeover release persistence failed',
+    });
+  } catch {
+    return { status: 'failed', reason: 'state-persist-failed' };
+  }
+}
+
 export function recoverContinuationAttempts(state, now = new Date().toISOString()) {
   migrateInboxState(state);
   for (const item of Object.values(state.pendingContinuations)) {
-    if (item?.status === 'resuming') {
+    if (item?.status === 'takeover-claimed') {
+      item.status = 'queued';
+      item.blockedReason = 'active-writer';
+      delete item.takeoverClaimId;
+      delete item.takeoverClaimedAt;
+      if (item.source === 'slash') {
+        recordProcessedInteraction(state, item.requestId, {
+          status: 'queued', queueId: item.queueId, reason: 'active-writer',
+        }, now);
+      }
+    } else if (item?.status === 'resuming') {
       item.status = 'queued';
       item.failureReason = undefined;
+      delete item.blockedReason;
       if (item.source === 'slash') {
         recordProcessedInteraction(state, item.requestId, { status: 'queued', queueId: item.queueId }, now);
       }
@@ -513,6 +905,7 @@ export function recoverContinuationAttempts(state, now = new Date().toISOString(
       item.status = 'start-uncertain';
       item.uncertainAt = String(now);
       item.failureReason = 'start-outcome-uncertain';
+      delete item.blockedReason;
       if (item.source === 'slash') {
         recordProcessedInteraction(state, item.requestId, {
           status: 'uncertain', queueId: item.queueId, reason: 'start-outcome-uncertain',
@@ -520,6 +913,7 @@ export function recoverContinuationAttempts(state, now = new Date().toISOString(
       }
     } else if (item?.status === 'acknowledging') {
       item.status = 'confirmed-start';
+      delete item.blockedReason;
     }
   }
   pruneContinuationHistory(state);
@@ -532,6 +926,9 @@ export function markContinuationDelivered(state, queueId, now = new Date().toISO
   if (item.status === 'cancelled') return { status: 'cancelled', queueId: item.queueId };
   item.status = 'delivered';
   item.deliveredAt = String(now);
+  delete item.blockedReason;
+  delete item.takeoverClaimId;
+  delete item.takeoverClaimedAt;
   pruneContinuationHistory(state);
   return item;
 }
@@ -664,6 +1061,11 @@ export async function dispatchContinuation(request, dependencies = {}) {
   let existing = listContinuations(state).find((item) => item.source === source && item.requestId === requestId);
   const wasQueuedRequest = Boolean(existing);
   const isQueuedRetry = Boolean(request?.queueId && existing?.queueId === String(request.queueId));
+  const takeoverClaimId = String(dependencies.takeoverClaimId ?? '');
+  const isClaimedRetry = Boolean(isQueuedRetry && takeoverClaimId &&
+    existing?.status === 'takeover-claimed' &&
+    existing?.takeoverClaimId === takeoverClaimId &&
+    existing?.threadId === String(request?.threadId ?? ''));
   if (existing?.status === 'start-uncertain') {
     return { status: 'uncertain', queueId: existing.queueId, reason: 'start-outcome-uncertain' };
   }
@@ -675,7 +1077,9 @@ export async function dispatchContinuation(request, dependencies = {}) {
       if (['confirmed-start', 'delivered'].includes(existing.status)) {
         return { status: 'started', queueId: existing.queueId, turnId: existing.turnId };
       }
-      if (existing.status === 'queued') return { status: 'queued', queueId: existing.queueId };
+      if (existing.status === 'queued') {
+        return { status: 'queued', queueId: existing.queueId, reason: existing.blockedReason };
+      }
       return { status: 'failed', queueId: existing.queueId, reason: ['resuming', 'submitting', 'attempting', 'start-submitted', 'acknowledging'].includes(existing.status) ? 'attempt-in-progress' : existing.failureReason ?? existing.status };
     }
     const processed = source === 'slash' ? processedInteraction(state, requestId) : null;
@@ -688,7 +1092,7 @@ export async function dispatchContinuation(request, dependencies = {}) {
       };
     }
   }
-  if (existing && existing.status !== 'queued') {
+  if (existing && existing.status !== 'queued' && !isClaimedRetry) {
     return {
       status: ['confirmed-start', 'delivered'].includes(existing.status) ? 'started' : 'failed',
       queueId: existing.queueId,
@@ -711,6 +1115,9 @@ export async function dispatchContinuation(request, dependencies = {}) {
       cwd: target?.cwd,
       text: continuationText,
       channelId: target?.channelId,
+      guildId: target?.guildId,
+      projectId: target?.projectId,
+      projectName: target?.projectName,
       replyToMessageId: target?.replyToMessageId ?? target?.requestId,
       createdAt: target?.createdAt ?? now,
     });
@@ -763,11 +1170,20 @@ export async function dispatchContinuation(request, dependencies = {}) {
       entries: { pendingContinuations: [existing.queueId] },
       mutate: () => {
         const current = state.pendingContinuations[existing.queueId];
-        if (!current || current.status !== 'queued') {
+        const canClaimQueued = current?.status === 'queued';
+        const canConsumeTakeover = isClaimedRetry && takeoverClaimMatches(current, {
+          queueId: existing.queueId,
+          targetThreadId: request?.threadId,
+          claimId: takeoverClaimId,
+        });
+        if (!canClaimQueued && !canConsumeTakeover) {
           claimObservation = current ? structuredClone(current) : null;
           return;
         }
         current.status = 'resuming';
+        delete current.blockedReason;
+        delete current.takeoverClaimId;
+        delete current.takeoverClaimedAt;
         current.lastAttemptAt = now;
         current.attempts = Number(current.attempts ?? 0) + 1;
         if (source === 'slash') recordProcessedInteraction(state, requestId, { status: 'resuming', queueId: current.queueId }, now);
@@ -847,7 +1263,10 @@ export async function dispatchContinuation(request, dependencies = {}) {
         await persistMutation(state, dependencies.persistState, () => {
           const queued = state.pendingContinuations[existing.queueId];
           queued.status = 'queued';
-          if (source === 'slash') recordProcessedInteraction(state, requestId, { status: 'queued', queueId: queued.queueId }, now);
+          queued.blockedReason = 'active-writer';
+          if (source === 'slash') recordProcessedInteraction(state, requestId, {
+            status: 'queued', queueId: queued.queueId, reason: 'active-writer',
+          }, now);
         }, [existing.queueId]);
       } catch {
         await withInboxStateLock(state, () => {
@@ -859,12 +1278,12 @@ export async function dispatchContinuation(request, dependencies = {}) {
         });
         return { status: 'failed', queueId: existing.queueId, reason: 'state-persist-failed' };
       }
-      const result = { status: 'queued', queueId: existing.queueId };
+      const result = { status: 'queued', queueId: existing.queueId, reason: 'active-writer' };
       if (!wasQueuedRequest) {
         await acknowledgeContinuation(
           dependencies,
           normalized,
-          '⏳ 已排队：原 Codex 任务目前正被桌面端占用；任务释放后会自动送达，无需再次回复。',
+          '⏳ 已排队：原 Codex 任务目前正被其他写入者占用；任务释放后会自动送达，无需再次回复。',
         ).catch(() => {});
       }
       return result;
@@ -876,6 +1295,7 @@ export async function dispatchContinuation(request, dependencies = {}) {
           uncertain.status = 'start-uncertain';
           uncertain.uncertainAt = now;
           uncertain.failureReason = 'start-outcome-uncertain';
+          delete uncertain.blockedReason;
           if (source === 'slash') recordProcessedInteraction(state, requestId, {
             status: 'uncertain', queueId: uncertain.queueId, reason: 'start-outcome-uncertain',
           }, now);
@@ -891,6 +1311,7 @@ export async function dispatchContinuation(request, dependencies = {}) {
         failed.status = 'failed';
         failed.failedAt = now;
         failed.failureReason = 'resume-failed';
+        delete failed.blockedReason;
         if (source === 'slash') recordProcessedInteraction(state, requestId, { status: 'failed', queueId: failed.queueId, reason: 'resume-failed' }, now);
       }, [existing.queueId]);
     } catch {
@@ -901,15 +1322,48 @@ export async function dispatchContinuation(request, dependencies = {}) {
 
   const turnId = String(started?.turnId ?? '') || undefined;
   const result = { status: 'started', queueId: existing.queueId, turnId };
+  const originCandidate = turnId && /^\d{17,20}$/u.test(String(existing.guildId ?? '')) &&
+      /^\d{17,20}$/u.test(String(existing.channelId ?? ''))
+    ? normalizedDiscordTurnOrigin({
+      turnId,
+      threadId: existing.threadId,
+      guildId: existing.guildId,
+      channelId: existing.channelId,
+      source: existing.source,
+      createdAt: now,
+      projectId: existing.projectId,
+      projectName: existing.projectName,
+    })
+    : null;
   try {
-    await persistMutation(state, dependencies.persistState, () => {
-      const confirmed = state.pendingContinuations[existing.queueId];
-      confirmed.status = source === 'slash' ? 'delivered' : 'confirmed-start';
-      confirmed.confirmedAt = now;
-      if (source === 'slash') confirmed.deliveredAt = now;
-      confirmed.turnId = turnId;
-      if (source === 'slash') recordProcessedInteraction(state, requestId, result, now);
-    }, [existing.queueId]);
+    await commitInboxState({
+      state,
+      persistState: dependencies.persistState,
+      fields: ['processedInteractions'],
+      entries: {
+        pendingContinuations: [existing.queueId],
+        discordTurnOrigins: originCandidate ? [originCandidate.turnId] : [],
+      },
+      mutate: () => {
+        const confirmed = state.pendingContinuations[existing.queueId];
+        confirmed.status = source === 'slash' ? 'delivered' : 'confirmed-start';
+        delete confirmed.blockedReason;
+        confirmed.confirmedAt = now;
+        if (source === 'slash') confirmed.deliveredAt = now;
+        confirmed.turnId = turnId;
+        if (originCandidate) {
+          state.discordTurnOrigins ??= {};
+          const prior = state.discordTurnOrigins[originCandidate.turnId];
+          if (prior && (prior.threadId !== originCandidate.value.threadId || prior.guildId !== originCandidate.value.guildId ||
+              prior.channelId !== originCandidate.value.channelId)) {
+            throw new Error('Discord turn origin conflicts with an existing binding');
+          }
+          state.discordTurnOrigins[originCandidate.turnId] ??= originCandidate.value;
+        }
+        if (source === 'slash') recordProcessedInteraction(state, requestId, result, now);
+      },
+      errorMessage: 'Continuation completion state persistence failed',
+    });
   } catch {
     await withInboxStateLock(state, () => {
       const current = state.pendingContinuations[existing.queueId];
@@ -927,7 +1381,7 @@ export async function dispatchContinuation(request, dependencies = {}) {
     } catch {
       // The external turn remains started even when local tracking cannot attach.
     }
-    return { ...result, reason: 'state-persist-failed' };
+    return { ...result, status: 'uncertain', reason: 'state-persist-failed' };
   }
   try {
     await dependencies.trackCompletion?.(started, normalized);
@@ -1212,7 +1666,11 @@ export async function getDiscordMessagesAfter({ token, channelId, after = '0', f
   return (Array.isArray(messages) ? messages : []).sort((a, b) => compareSnowflakes(a.id, b.id));
 }
 
-export async function sendDiscordReply({ token, channelId, replyToMessageId, content, fetchImpl = fetch }) {
+export async function sendDiscordReply({
+  token, channelId, replyToMessageId, content, nonce, enforceNonce = false, fetchImpl = fetch,
+}) {
+  const normalizedNonce = /^\d{1,25}$/u.test(String(nonce ?? '')) ? String(nonce) : null;
+  const referenceId = String(replyToMessageId ?? '').trim();
   return discordRequest({
     token,
     route: `/channels/${channelId}/messages`,
@@ -1221,11 +1679,12 @@ export async function sendDiscordReply({ token, channelId, replyToMessageId, con
     body: {
       content: String(content).slice(0, 2000),
       allowed_mentions: { parse: [] },
-      message_reference: {
+      ...(normalizedNonce ? { nonce: normalizedNonce, enforce_nonce: Boolean(enforceNonce) } : {}),
+      ...(referenceId ? { message_reference: {
         message_id: replyToMessageId,
         channel_id: channelId,
         fail_if_not_exists: false,
-      },
+      } } : {}),
     },
   });
 }

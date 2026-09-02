@@ -7,6 +7,8 @@ import path from 'node:path';
 import { PassThrough } from 'node:stream';
 import test from 'node:test';
 
+import * as bridgeModule from '../discord-bridge.mjs';
+import * as bridgeLib from '../discord-bridge-lib.mjs';
 import { startNewCodexTask } from '../discord-task-create-lib.mjs';
 import { createBridgeApplication, finalizeContinuationOutcome, getDiscordBotMember, pollChannel } from '../discord-bridge.mjs';
 import { createInteractionRouter } from '../discord-interactions.mjs';
@@ -25,6 +27,7 @@ import {
   discordRequest,
   enqueueContinuation,
   enqueuePendingReply,
+  enrichDiscordOriginNotification,
   getPendingReplies,
   initializeAppServerClient,
   initializeInboxCursors,
@@ -32,11 +35,13 @@ import {
   listContinuations,
   listRetryableContinuations,
   markContinuationDelivered,
+  persistDiscordTurnOrigin,
   migrateInboxState,
   migrateLegacyPendingReplies,
   recordInboxMessage,
   recoverContinuationAttempts,
   removePendingReply,
+  resolveDiscordOrigin,
   resolveCodexExecutable,
   resumeCodexThread,
   writeJsonAtomic,
@@ -62,6 +67,319 @@ const mapping = {
   },
 };
 
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+test('production interaction wiring refreshes the shared index and uses only bounded control actions', async () => {
+  assert.equal(typeof bridgeModule.createProductionBridgeDependencies, 'function');
+  const events = [];
+  const controlCalls = [];
+  let interactionDependencies;
+  const rebuilt = { version: 1, generatedAt: '2026-09-01T08:00:00.000Z', tasks: [{ threadId: 'fresh-root' }] };
+  const production = bridgeModule.createProductionBridgeDependencies({
+    runOnce: true,
+    buildTaskIndexImpl: async (options) => {
+      events.push(['build', options.previousIndex, options.projects, options.createdTasksByInteraction]);
+      return rebuilt;
+    },
+    writeTaskIndexAtomicImpl: async (_targetPath, index) => { events.push(['write', structuredClone(index)]); },
+    runCodexControlActionImpl: async (options) => {
+      controlCalls.push(options);
+      return options.action === 'status'
+        ? { ok: true, desktop: { running: true } }
+        : { ok: true, stoppedProcessCount: 1 };
+    },
+    createInteractionRestClientImpl: () => ({ callback: async () => {}, editOriginal: async () => ({ id: 'message-1' }) }),
+    createInteractionRouterImpl: (dependencies) => {
+      interactionDependencies = dependencies;
+      return { handle: async () => {} };
+    },
+  });
+  const originalIndex = { version: 1, generatedAt: '2026-09-01T07:00:00.000Z', tasks: [] };
+  const context = {
+    config: {
+      ...config,
+      discordApplicationId: '111111111111111111',
+      discordWorktreeRoot: 'C:\\safe\\worktrees',
+      discordProjectlessRoot: 'C:\\safe\\projectless',
+    },
+    token: 'test-token',
+    executables: { codexPath: 'codex.exe', powershellPath: 'pwsh.exe' },
+    taskIndex: originalIndex,
+    inboxState: createEmptyInboxState(),
+    inboxReadOnly: false,
+    projectCatalog: { snapshot: () => [{ id: 'project-1', name: 'POS', roots: ['C:\\saved\\POS'] }] },
+    trackDiscordRest: (operation) => operation(),
+    trackActiveResource: (resource) => resource,
+    getSystemStatus: () => ({}),
+    recordActivity: (field, at) => events.push(['activity', field, at]),
+  };
+
+  await production.createInteractionHandler(context);
+  const refreshed = await interactionDependencies.refreshTaskIndex();
+  assert.notEqual(refreshed, originalIndex);
+  assert.deepEqual(originalIndex, rebuilt);
+  assert.notEqual(refreshed.tasks, originalIndex.tasks);
+  originalIndex.tasks.push({ threadId: 'later-shared-mutation' });
+  assert.deepEqual(refreshed.tasks, [{ threadId: 'fresh-root' }]);
+  assert.deepEqual(events.map((event) => event[0]), ['build', 'write', 'activity']);
+  assert.equal(events[0][1], originalIndex);
+  assert.deepEqual(events[0][2], [{ id: 'project-1', name: 'POS', roots: ['C:\\saved\\POS'] }]);
+  assert.strictEqual(events[0][3], context.inboxState.createdTasksByInteraction);
+
+  assert.deepEqual(await interactionDependencies.getCodexControlStatus(), { ok: true, desktop: { running: true } });
+  assert.deepEqual(await interactionDependencies.stopCodexDesktop(), { ok: true, stoppedProcessCount: 1 });
+  assert.deepEqual(controlCalls.map((call) => call.action), ['status', 'stop-codex']);
+  for (const call of controlCalls) {
+    assert.equal(call.powershellPath, 'pwsh.exe');
+    assert.match(call.controlPath, /codex-control\.ps1$/u);
+    assert.deepEqual(Object.keys(call).sort(), ['action', 'controlPath', 'powershellPath']);
+  }
+});
+
+test('production legacy watcher initialization receives the validated inbox origins', async () => {
+  const inboxState = createEmptyInboxState();
+  inboxState.discordTurnOrigins['turn-existing-complete'] = {
+    threadId: 'thread-existing-complete', guildId: '222222222222222222', channelId: '777777777777777777',
+    source: 'new-task', createdAt: '2026-09-01T00:00:00.000Z', rolloutCursor: 0,
+    deliveredEventIds: [], deliveryState: 'pending',
+  };
+  const rolloutState = { version: 2, initialized: false, files: {}, pending: {} };
+  let initializedWith = null;
+  const production = bridgeModule.createProductionBridgeDependencies({
+    runOnce: true,
+    readRolloutWatcherStateImpl: async () => rolloutState,
+    initializeRolloutWatcherStateImpl: async (options) => {
+      initializedWith = options.inboxState;
+      options.state.initialized = true;
+      options.state.pending['turn-existing-complete'] = { threadId: 'thread-existing-complete' };
+    },
+    writeRolloutWatcherStateImpl: async () => {},
+    pollRolloutCompletionsImpl: async () => {},
+    logImpl: async () => {},
+  });
+  const context = {
+    config, token: 'test-token', inboxState, inboxReadOnly: true,
+    trackDiscordRest: (operation) => operation(), executables: { powershellPath: 'pwsh.exe' },
+    setLatestErrorCategory: () => {}, recordActivity: () => {}, timestamps: {},
+  };
+  const pollers = await production.startLegacyPollers(context);
+  await pollers.completion;
+
+  assert.strictEqual(initializedWith, inboxState);
+  assert.equal(context.rolloutState.pending['turn-existing-complete'].threadId, 'thread-existing-complete');
+});
+
+test('production takeover retry reloads only the exact queued record through tracked resources and replies', async () => {
+  let interactionDependencies;
+  const starts = [];
+  const replies = [];
+  const trackedResources = [];
+  let trackedRestCalls = 0;
+  const persistedSnapshots = [];
+  const production = bridgeModule.createProductionBridgeDependencies({
+    runOnce: true,
+    startContinuationImpl: async (options) => {
+      starts.push(options);
+      options.trackActiveResource({ kind: 'continuation', turnId: 'turn-exact' });
+      await options.sendReply({ channelId: 'channel-1', content: 'tracked reply' });
+      return { status: 'started', queueId: options.request.queueId, turnId: 'turn-exact' };
+    },
+    sendDiscordReplyImpl: async (payload) => { replies.push(payload); },
+    persistInboxStateImpl: async (snapshot) => { persistedSnapshots.push(structuredClone(snapshot)); },
+    createInteractionRestClientImpl: () => ({ callback: async () => {}, editOriginal: async () => ({ id: 'message-1' }) }),
+    createInteractionRouterImpl: (dependencies) => {
+      interactionDependencies = dependencies;
+      return { handle: async () => {} };
+    },
+  });
+  const inboxState = createEmptyInboxState();
+  const first = enqueueContinuation(inboxState, {
+    ...createContinuationRequest({ source: 'slash', requestId: 'retry-other', threadId: 'root-other', text: 'other' }),
+    encryptedText: 'cipher-other',
+  });
+  const exact = enqueueContinuation(inboxState, {
+    ...createContinuationRequest({ source: 'slash', requestId: 'retry-exact', threadId: 'root-exact', text: 'exact' }),
+    encryptedText: 'cipher-exact',
+  });
+  exact.blockedReason = 'active-writer';
+  const terminal = enqueueContinuation(inboxState, {
+    ...createContinuationRequest({ source: 'slash', requestId: 'retry-terminal', threadId: 'root-terminal', text: 'done' }),
+    encryptedText: 'cipher-terminal', status: 'failed',
+  });
+  const context = {
+    config: {
+      ...config,
+      discordApplicationId: '111111111111111111',
+      discordWorktreeRoot: 'C:\\safe\\worktrees',
+      discordProjectlessRoot: 'C:\\safe\\projectless',
+    },
+    token: 'test-token',
+    executables: { codexPath: 'codex.exe', powershellPath: 'pwsh.exe' },
+    taskIndex: { version: 1, generatedAt: null, tasks: [] },
+    inboxState,
+    inboxReadOnly: false,
+    projectCatalog: {},
+    trackDiscordRest: async (operation) => { trackedRestCalls += 1; return operation(); },
+    trackActiveResource: (resource) => { trackedResources.push(resource); return resource; },
+    getSystemStatus: () => ({}),
+    recordActivity: () => {},
+    publishHealth: () => {},
+  };
+  await production.createInteractionHandler(context);
+
+  const claim = await interactionDependencies.claimContinuationTakeover({
+    queueId: exact.queueId,
+    targetThreadId: exact.threadId,
+  });
+  assert.equal(claim.status, 'claimed');
+  assert.equal(inboxState.pendingContinuations[exact.queueId].status, 'takeover-claimed');
+  const result = await interactionDependencies.retryContinuation(claim);
+
+  assert.equal(result.status, 'started');
+  assert.equal(starts.length, 1);
+  assert.strictEqual(starts[0].state, inboxState);
+  assert.strictEqual(starts[0].request, inboxState.pendingContinuations[exact.queueId]);
+  assert.equal(starts[0].takeoverClaimId, claim.claimId);
+  assert.notStrictEqual(starts[0].request, first);
+  assert.deepEqual(trackedResources, [{ kind: 'continuation', turnId: 'turn-exact' }]);
+  assert.equal(trackedRestCalls, 1);
+  assert.deepEqual(replies, [{ token: 'test-token', channelId: 'channel-1', content: 'tracked reply' }]);
+
+  assert.deepEqual(await interactionDependencies.retryContinuation({
+    queueId: 'missing-queue', targetThreadId: 'root-exact', claimId: claim.claimId,
+  }), {
+    status: 'failed', reason: 'not-found',
+  });
+  assert.deepEqual(await interactionDependencies.retryContinuation({
+    queueId: terminal.queueId, targetThreadId: terminal.threadId, claimId: claim.claimId,
+  }), {
+    status: 'failed', reason: 'not-found',
+  });
+  assert.equal(starts.length, 1);
+  assert.equal(persistedSnapshots.length >= 1, true);
+});
+
+test('production index refreshes serialize an older scan before a fresh takeover snapshot without stopping on a new task', async () => {
+  const oldBuild = deferred();
+  const callbacks = [];
+  const edits = [];
+  let buildCalls = 0;
+  let stopCalls = 0;
+  const taskA = {
+    threadId: 'root-a', taskName: '任务 A', status: 'running',
+    lastActivityAt: '2026-09-01T07:00:00.000Z',
+  };
+  const taskB = {
+    threadId: 'root-b', taskName: '新活动任务 B', status: 'running',
+    lastActivityAt: '2026-09-01T08:00:00.000Z',
+  };
+  const initial = { version: 1, generatedAt: '2026-09-01T07:00:00.000Z', tasks: [taskA] };
+  const older = { version: 1, generatedAt: '2026-09-01T07:30:00.000Z', tasks: [taskA] };
+  const fresh = { version: 1, generatedAt: '2026-09-01T08:00:00.000Z', tasks: [taskA, taskB] };
+  const production = bridgeModule.createProductionBridgeDependencies({
+    runOnce: true,
+    buildTaskIndexImpl: async () => {
+      buildCalls += 1;
+      if (buildCalls === 1) return structuredClone(initial);
+      if (buildCalls === 2) return oldBuild.promise;
+      return structuredClone(fresh);
+    },
+    writeTaskIndexAtomicImpl: async () => {},
+    runCodexControlActionImpl: async ({ action }) => {
+      if (action === 'stop-codex') stopCalls += 1;
+      return action === 'status'
+        ? { ok: true, desktop: { running: true } }
+        : { ok: true, stoppedProcessCount: 1 };
+    },
+    createInteractionRestClientImpl: () => ({
+      async callback(interaction, body) { callbacks.push({ interaction, body }); },
+      async editOriginal(interaction, body) { edits.push({ interaction, body }); return { id: 'risk-message' }; },
+    }),
+  });
+  const context = {
+    config: {
+      ...config,
+      discordApplicationId: '111111111111111111',
+      discordWorktreeRoot: 'C:\\safe\\worktrees',
+      discordProjectlessRoot: 'C:\\safe\\projectless',
+    },
+    token: 'test-token',
+    executables: { codexPath: 'codex.exe', powershellPath: 'pwsh.exe' },
+    taskIndex: { version: 1, generatedAt: null, tasks: [] },
+    inboxState: createEmptyInboxState(),
+    inboxReadOnly: false,
+    projectCatalog: {},
+    gatewayStatus: { state: 'ready' },
+    trackDiscordRest: (operation) => operation(),
+    trackActiveResource: (resource) => resource,
+    getSystemStatus: () => ({}),
+    recordActivity: () => {},
+  };
+  const handle = await production.createInteractionHandler(context);
+  const identity = { guild_id: config.discordGuildId, member: { user: { id: config.discordAllowedUserId } } };
+  await handle({
+    id: 'initial-exit', token: 'initial-token', type: 2, ...identity,
+    data: { name: '退出Codex', options: [] },
+  });
+  const confirmId = edits[0].body.components[0].components[0].custom_id;
+
+  assert.equal(typeof production.refreshTaskIndex, 'function');
+  const olderRefresh = production.refreshTaskIndex(context, { nowMs: Date.parse(older.generatedAt) });
+  await Promise.resolve();
+  assert.equal(buildCalls, 2);
+  const confirmation = handle({
+    id: 'confirm-exit', token: 'confirm-token', type: 3, ...identity,
+    message: { id: 'risk-message' },
+    data: { custom_id: confirmId, component_type: 2 },
+  });
+  await Promise.resolve();
+  assert.equal(buildCalls, 2);
+
+  oldBuild.resolve(structuredClone(older));
+  await olderRefresh;
+  await confirmation;
+
+  assert.equal(buildCalls, 3);
+  assert.equal(stopCalls, 0);
+  assert.deepEqual(context.taskIndex.tasks.map((item) => item.threadId), ['root-a', 'root-b']);
+  assert.deepEqual(callbacks.map((item) => item.body.type), [5, 6]);
+  assert.match(edits.at(-1).body.embeds[0].description, /检测到新活动任务/);
+  assert.match(edits.at(-1).body.embeds[0].description, /新活动任务 B/);
+});
+
+test('a rejected production index refresh propagates but does not poison the serial coordinator', async () => {
+  let buildCalls = 0;
+  const activities = [];
+  const production = bridgeModule.createProductionBridgeDependencies({
+    buildTaskIndexImpl: async () => {
+      buildCalls += 1;
+      if (buildCalls === 1) throw new Error('offline index failure');
+      return { version: 1, generatedAt: '2026-09-01T09:00:00.000Z', tasks: [] };
+    },
+    writeTaskIndexAtomicImpl: async () => {},
+  });
+  const context = {
+    config: { discordWorktreeRoot: 'C:\\safe\\worktrees' },
+    taskIndex: { version: 1, generatedAt: null, tasks: [] },
+    recordActivity: (field, at) => activities.push([field, at]),
+  };
+
+  assert.equal(typeof production.refreshTaskIndex, 'function');
+  await assert.rejects(production.refreshTaskIndex(context), /offline index failure/u);
+  const recovered = await production.refreshTaskIndex(context);
+  assert.equal(buildCalls, 2);
+  assert.equal(recovered.generatedAt, '2026-09-01T09:00:00.000Z');
+  assert.deepEqual(activities, [['lastIndexUpdateAt', '2026-09-01T09:00:00.000Z']]);
+});
+
 function makeBridgeDependencies(events, overrides = {}) {
   const timestamps = [
     '2026-09-01T00:00:01.000Z', '2026-09-01T00:00:02.000Z',
@@ -80,12 +398,15 @@ function makeBridgeDependencies(events, overrides = {}) {
     async registerCommands() { events.push('commands-registered'); },
     async fetchRegisteredCommands() { return [
       '任务列表', '任务详情', '任务搜索', '新建任务', '继续任务',
-      '继续队列', '额度', '系统状态', '系统测试', '帮助',
+      '继续队列', '额度', '系统状态', '系统测试', '退出Codex', '帮助',
     ].map((name) => ({ name })); },
     async loadTaskIndex() { events.push('index-ready'); return { version: 1, generatedAt: '2026-09-01T00:00:00.000Z', tasks: [] }; },
     async loadInboxState() { return createEmptyInboxState(); },
     async recoverTaskCreations() { events.push('task-creation-recovered'); },
-    async warmProjectCatalog() { events.push('project-catalog-ready'); return { status: () => ({ warmed: true }) }; },
+    async warmProjectCatalog() {
+      events.push('project-catalog-ready');
+      return { status: () => ({ warmed: true }), snapshot: () => [] };
+    },
     createInteractionHandler() { return async () => {}; },
     async startGateway() { events.push('gateway-started'); return gateway; },
     async startLegacyPollers() {
@@ -106,8 +427,8 @@ test('bridge composition starts registration, index and gateway without disablin
   await app.start();
 
   assert.deepEqual(events.filter((event) => event !== 'executables-resolved').slice(0, 6), [
-    'commands-registered', 'index-ready', 'task-creation-recovered',
-    'project-catalog-ready', 'gateway-started', 'legacy-pollers-started',
+    'commands-registered', 'task-creation-recovered', 'project-catalog-ready',
+    'index-ready', 'gateway-started', 'legacy-pollers-started',
   ]);
   const status = app.getSystemStatus();
   assert.equal(status.index.count, 0);
@@ -134,6 +455,273 @@ test('bridge composition starts registration, index and gateway without disablin
   assert.deepEqual(events.slice(-4), [
     'gateway-stopped', 'legacy-pollers-stopped', 'index-persisted', 'inbox-persisted',
   ]);
+});
+
+test('bridge publishes sanitized health at startup, state changes, heartbeat, and final stop without affecting shutdown', async () => {
+  const events = [];
+  const published = [];
+  const timers = [];
+  const app = createBridgeApplication(makeBridgeDependencies(events, {
+    publishHealth: async (context) => { published.push(context.getSystemStatus()); },
+    setInterval(callback, milliseconds) { timers.push({ callback, milliseconds, cleared: false }); return timers.length - 1; },
+    clearInterval(id) { timers[id].cleared = true; },
+  }));
+
+  await app.start();
+  const afterStart = published.length;
+  assert.ok(afterStart >= 1);
+  assert.equal(timers[0].milliseconds, 10_000);
+  app.recordActivity('lastQueueRetryAt', '2026-09-01T00:00:10.000Z');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(published.length, afterStart + 1);
+  await timers[0].callback();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(published.length, afterStart + 2);
+  await app.stop();
+  assert.equal(timers[0].cleared, true);
+  assert.equal(published.length, afterStart + 3);
+});
+
+test('bridge contains health publication failures as a sanitized category', async () => {
+  const events = [];
+  const app = createBridgeApplication(makeBridgeDependencies(events, {
+    publishHealth: async () => { throw new Error('Token must-not-appear'); },
+  }));
+  await app.start();
+  assert.equal(app.context.latestErrorCategory, 'bridge-health-write-failed');
+  await app.stop();
+});
+
+test('health lifecycle bounds hung publication and makes stopped final publication last', async () => {
+  const events = [];
+  const published = [];
+  const timers = [];
+  let ordinaryRelease;
+  const app = createBridgeApplication(makeBridgeDependencies(events, {
+    healthPublishTimeoutMs: 5,
+    publishHealth: async (_context, { forceFinal, signal } = {}) => {
+      if (forceFinal) { published.push('final'); return; }
+      published.push('ordinary');
+      await new Promise((resolve) => { ordinaryRelease = resolve; });
+      if (signal?.aborted) return;
+      published.push('late-ordinary');
+    },
+    setInterval(callback) { timers.push(callback); return 0; },
+    clearInterval() {},
+  }));
+  const started = await Promise.race([
+    app.start().then(() => 'started'),
+    new Promise((resolve) => setTimeout(() => resolve('timed-out'), 30)),
+  ]);
+  assert.equal(started, 'started');
+  await app.stop();
+  await timers[0]();
+  ordinaryRelease?.();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(published.at(-1), 'final');
+  assert.equal(published.includes('late-ordinary'), false);
+});
+
+test('startup failure preserves its cause while bounded terminal health invalidation fails', async () => {
+  const events = [];
+  let allowStart = false;
+  const app = createBridgeApplication(makeBridgeDependencies(events, {
+    healthPublishTimeoutMs: 5,
+    async registerCommands() {
+      if (!allowStart) throw new Error('startup root cause');
+    },
+    publishHealth: async (_context, { forceFinal } = {}) => {
+      if (forceFinal) throw new Error('terminal write failed');
+    },
+    invalidateHealth() { throw new Error('invalidator sync failure'); },
+  }));
+
+  const outcome = await Promise.race([
+    app.start().then(() => 'started', (error) => error),
+    new Promise((resolve) => setTimeout(() => resolve('timed-out'), 40)),
+  ]);
+  assert.ok(outcome instanceof Error);
+  assert.match(outcome.message, /startup root cause/);
+  allowStart = true;
+  await app.start();
+  await app.stop();
+});
+
+test('startup failure preserves a committed terminal snapshot without invalidation', async () => {
+  const events = [];
+  let invalidations = 0;
+  const terminalSnapshots = [];
+  const app = createBridgeApplication(makeBridgeDependencies(events, {
+    async registerCommands() { throw new Error('startup root cause'); },
+    publishHealth: async (context, { forceFinal } = {}) => {
+      if (forceFinal) terminalSnapshots.push(context.getSystemStatus());
+    },
+    async invalidateHealth() { invalidations += 1; },
+  }));
+
+  await assert.rejects(() => app.start(), /startup root cause/);
+  assert.equal(terminalSnapshots.length, 1);
+  assert.equal(invalidations, 0);
+});
+
+test('startup failure bounds a never-settling health invalidator and preserves its cause', async () => {
+  const events = [];
+  const app = createBridgeApplication(makeBridgeDependencies(events, {
+    healthPublishTimeoutMs: 5,
+    async registerCommands() { throw new Error('startup root cause'); },
+    publishHealth: async (_context, { forceFinal } = {}) => {
+      if (forceFinal) throw new Error('terminal write failed');
+    },
+    invalidateHealth: () => new Promise(() => {}),
+  }));
+
+  const outcome = await Promise.race([
+    app.start().then(() => 'started', (error) => error),
+    new Promise((resolve) => setTimeout(() => resolve('timed-out'), 40)),
+  ]);
+  assert.ok(outcome instanceof Error);
+  assert.match(outcome.message, /startup root cause/);
+});
+
+test('partial startup cleanup detaches resources so entrypoint shutdown preserves the startup cause', async () => {
+  const events = [];
+  const terminalSnapshots = [];
+  let failLegacyStart = true;
+  let failRolloutPersist = true;
+  let failGatewayCleanup = true;
+  let gatewayStops = 0;
+  let rolloutPersists = 0;
+  const gateway = {
+    getStatus: () => ({ state: 'ready' }),
+    async stop() {
+      gatewayStops += 1;
+      if (failGatewayCleanup) throw new Error('gateway cleanup failure');
+    },
+  };
+  const app = createBridgeApplication(makeBridgeDependencies(events, {
+    async startGateway() { return gateway; },
+    async startLegacyPollers() {
+      if (failLegacyStart) throw new Error('legacy startup root cause');
+      return { async stop() {} };
+    },
+    async persistRolloutState() {
+      rolloutPersists += 1;
+      if (failRolloutPersist) throw new Error('partial rollout persistence failure');
+    },
+    publishHealth: async (context, { forceFinal } = {}) => {
+      if (forceFinal) terminalSnapshots.push(structuredClone(context.getSystemStatus()));
+    },
+  }));
+
+  const mainShape = async () => {
+    try {
+      await app.start();
+    } finally {
+      await app.stop();
+    }
+  };
+
+  await assert.rejects(mainShape, /legacy startup root cause/);
+  assert.equal(gatewayStops, 1);
+  assert.equal(rolloutPersists, 0);
+  assert.equal(terminalSnapshots.length, 1);
+  assert.equal(terminalSnapshots[0].gateway.state, 'failed');
+  assert.equal(terminalSnapshots[0].latestErrorCategory, 'startup-failed');
+
+  failLegacyStart = false;
+  failRolloutPersist = false;
+  failGatewayCleanup = false;
+  await app.start();
+  await app.stop();
+});
+
+test('partial startup cleanup bounds hung resources before preserving its startup error', async () => {
+  const events = [];
+  const terminalSnapshots = [];
+  let failStart = true;
+  let hangStops = true;
+  let gatewayStops = 0;
+  let legacyStops = 0;
+  let persistCalls = 0;
+  const unhandled = [];
+  const onUnhandled = (reason) => unhandled.push(reason);
+  process.on('unhandledRejection', onUnhandled);
+  const app = createBridgeApplication(makeBridgeDependencies(events, {
+    shutdownTimeoutMs: 5,
+    healthPublishTimeoutMs: 5,
+    async startGateway() {
+      return {
+        getStatus: () => ({ state: 'ready' }),
+        stop() {
+          gatewayStops += 1;
+          return hangStops ? new Promise(() => {}) : Promise.resolve();
+        },
+      };
+    },
+    async startLegacyPollers() {
+      return {
+        stop() {
+          legacyStops += 1;
+          return hangStops ? new Promise(() => {}) : Promise.resolve();
+        },
+      };
+    },
+    publishHealth: async (context, { forceFinal } = {}) => {
+      if (forceFinal) terminalSnapshots.push(structuredClone(context.getSystemStatus()));
+    },
+    setInterval() {
+      if (failStart) throw new Error('startup root cause');
+      return 1;
+    },
+    clearInterval() {},
+    async persistTaskIndex() { persistCalls += 1; },
+    async persistInboxState() { persistCalls += 1; },
+    async persistRolloutState() { persistCalls += 1; },
+  }));
+  const mainShape = async () => {
+    try {
+      await app.start();
+    } finally {
+      await app.stop();
+    }
+  };
+
+  try {
+    const outcome = await Promise.race([
+      mainShape().then(() => 'started', (error) => error),
+      new Promise((resolve) => setTimeout(() => resolve('timed-out'), 40)),
+    ]);
+    assert.ok(outcome instanceof Error);
+    assert.match(outcome.message, /startup root cause/);
+    assert.equal(gatewayStops, 1);
+    assert.equal(legacyStops, 1);
+    assert.equal(persistCalls, 0);
+    assert.equal(terminalSnapshots.length, 1);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(unhandled, []);
+
+    failStart = false;
+    hangStops = false;
+    await app.start();
+    await app.stop();
+  } finally {
+    process.off('unhandledRejection', onUnhandled);
+  }
+});
+
+test('REST tracker publishes failed then recovered state without raw failures', async () => {
+  const events = [];
+  const published = [];
+  const app = createBridgeApplication(makeBridgeDependencies(events, {
+    publishHealth: async (context) => { published.push(structuredClone(context.getSystemStatus().discordRest)); },
+  }));
+  await app.start();
+  await assert.rejects(() => app.context.trackDiscordRest(() => { throw new Error('Token must-not-appear'); }));
+  await app.context.trackDiscordRest(async () => {});
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(published.slice(-2).map((item) => item.state), ['failed', 'ok']);
+  assert.equal(JSON.stringify(published).includes('must-not-appear'), false);
+  await app.stop();
 });
 
 test('older v2 inbox state gains the newer empty containers before strict validation', async () => {
@@ -471,7 +1059,7 @@ test('shutdown deadline cancels creation and continuation resources from the sha
   assert.equal(app.context.activeResources.size, 0);
 });
 
-test('registration-only lifecycle verifies exactly ten commands without starting Codex or pollers', async () => {
+test('registration-only lifecycle verifies exactly eleven commands without starting Codex or pollers', async () => {
   const events = [];
   const app = createBridgeApplication(makeBridgeDependencies(events, {
     async resolveExecutables() { throw new Error('Codex must not be resolved'); },
@@ -484,7 +1072,7 @@ test('registration-only lifecycle verifies exactly ten commands without starting
 
   assert.deepEqual(result.commandNames, [
     '任务列表', '任务详情', '任务搜索', '新建任务', '继续任务',
-    '继续队列', '额度', '系统状态', '系统测试', '帮助',
+    '继续队列', '额度', '系统状态', '系统测试', '退出Codex', '帮助',
   ]);
   assert.deepEqual(events, ['commands-registered']);
 });
@@ -955,6 +1543,27 @@ test('Discord REST requests always send the required Bot user agent', async () =
   assert.match(observedHeaders['User-Agent'], /^DiscordBot \(.+, \d+\.\d+\.\d+\)$/);
 });
 
+test('source-channel progress sends deterministic Discord nonce without a fake reply reference', async () => {
+  const requests = [];
+  await bridgeLib.sendDiscordReply({
+    token: 'test-token',
+    channelId: '777777777777777777',
+    content: '### 任务进度\n处理中',
+    nonce: '123456789012345678',
+    enforceNonce: true,
+    fetchImpl: async (_url, options) => {
+      requests.push(JSON.parse(options.body));
+      return { ok: true, status: 200, json: async () => ({ id: '888888888888888888' }) };
+    },
+  });
+  assert.deepEqual(requests, [{
+    content: '### 任务进度\n处理中',
+    allowed_mentions: { parse: [] },
+    nonce: '123456789012345678',
+    enforce_nonce: true,
+  }]);
+});
+
 test('queues an active-writer reply with encrypted text and no plaintext at rest', () => {
   const state = createEmptyInboxState();
   const accepted = classifyReply(makeMessage(), config, mapping, state);
@@ -1017,6 +1626,140 @@ test('migrates the reply queue and stores slash continuations without tokens or 
   assert.equal(listContinuations(state).length, 2);
   assert.equal(state.createdTasksByInteraction['create-1'].threadId, 'root-new');
   assert.equal(Object.hasOwn(state, 'pendingReplies'), false);
+});
+
+test('persists bounded Discord turn origins and resolves only an exact trusted binding', async () => {
+  const state = createEmptyInboxState();
+  const snapshots = [];
+  await persistDiscordTurnOrigin({
+    state,
+    persistState: async (snapshot) => { snapshots.push(structuredClone(snapshot)); },
+    origin: {
+      turnId: 'turn-origin-1',
+      threadId: '11111111-1111-4111-8111-111111111111',
+      guildId: '222222222222222222',
+      channelId: '777777777777777777',
+      source: 'slash',
+      createdAt: '2026-09-01T12:00:00.000Z',
+      projectId: 'project-1',
+      projectName: '项目 @everyone **unsafe**',
+    },
+  });
+
+  assert.deepEqual(state.discordTurnOrigins['turn-origin-1'], {
+    threadId: '11111111-1111-4111-8111-111111111111',
+    guildId: '222222222222222222',
+    channelId: '777777777777777777',
+    source: 'slash',
+    createdAt: '2026-09-01T12:00:00.000Z',
+    projectId: 'project-1',
+    projectName: '项目 @everyone **unsafe**',
+    rolloutCursor: 0,
+    deliveredEventIds: [],
+    deliveryState: 'pending',
+  });
+  assert.equal(JSON.stringify(snapshots).includes('interaction-token'), false);
+
+  const exact = {
+    type: 'agent-turn-complete',
+    'turn-id': 'turn-origin-1',
+    'thread-id': '11111111-1111-4111-8111-111111111111',
+    'discord-guild-id': '222222222222222222',
+    'discord-origin-channel-id': '777777777777777777',
+  };
+  assert.deepEqual(resolveDiscordOrigin(exact, state), state.discordTurnOrigins['turn-origin-1']);
+  const nativeWithoutGuild = { ...exact };
+  delete nativeWithoutGuild['discord-guild-id'];
+  delete nativeWithoutGuild['discord-origin-channel-id'];
+  assert.equal(resolveDiscordOrigin(nativeWithoutGuild, state), null);
+  const enriched = enrichDiscordOriginNotification(nativeWithoutGuild, state);
+  assert.equal(enriched['discord-guild-id'], '222222222222222222');
+  assert.equal(enriched['discord-origin-channel-id'], '777777777777777777');
+  assert.deepEqual(resolveDiscordOrigin(enriched, state), state.discordTurnOrigins['turn-origin-1']);
+  assert.equal(resolveDiscordOrigin({ ...exact, 'thread-id': 'other-thread' }, state), null);
+  assert.equal(resolveDiscordOrigin({ ...exact, 'discord-guild-id': '999999999999999999' }, state), null);
+  assert.equal(resolveDiscordOrigin({ ...exact, 'discord-guild-id': 'not-a-snowflake' }, state), null);
+  assert.equal(enrichDiscordOriginNotification({ ...nativeWithoutGuild, 'discord-guild-id': '999999999999999999' }, state), null);
+  state.discordTurnOrigins['turn-origin-1'].channelId = 'not-a-snowflake';
+  assert.equal(resolveDiscordOrigin(exact, state), null);
+});
+
+test('origin capacity rejects overflow when every retained turn is still pending', async () => {
+  const state = createEmptyInboxState();
+  for (let index = 0; index < 2_000; index += 1) {
+    state.discordTurnOrigins[`turn-live-${index}`] = {
+      threadId: `root-live-${index}`,
+      guildId: '222222222222222222', channelId: '777777777777777777', source: 'slash',
+      createdAt: '2026-09-01T00:00:00.000Z', rolloutCursor: 0, deliveredEventIds: [], deliveryState: 'pending',
+    };
+  }
+  await assert.rejects(() => persistDiscordTurnOrigin({
+    state,
+    persistState: async () => {},
+    origin: {
+      turnId: 'turn-overflow', threadId: 'root-overflow',
+      guildId: '222222222222222222', channelId: '777777777777777777', source: 'slash',
+      createdAt: '2026-09-02T00:00:00.000Z',
+    },
+  }), /persistence failed|capacity/i);
+  assert.equal(Object.hasOwn(state.discordTurnOrigins, 'turn-overflow'), false);
+  assert.equal(Object.keys(state.discordTurnOrigins).length, 2_000);
+});
+
+test('origin migration bounds terminal history and per-turn dedupe without deleting pending turns', () => {
+  const discordTurnOrigins = Object.fromEntries(Array.from({ length: 2_005 }, (_, index) => [
+    `turn-old-${index}`,
+    {
+      threadId: `root-${index}`,
+      guildId: '222222222222222222',
+      channelId: '777777777777777777',
+      source: 'new-task',
+      createdAt: new Date(Date.UTC(2026, 7, 1, 0, 0, index)).toISOString(),
+      rolloutCursor: index,
+      deliveredEventIds: Array.from({ length: 140 }, (__, eventIndex) => `event-${eventIndex}`),
+      deliveryState: 'terminal-delivered',
+      deliveredAt: new Date(Date.UTC(2026, 7, 2, 0, 0, index)).toISOString(),
+    },
+  ]));
+  discordTurnOrigins['turn-live'] = {
+    threadId: 'root-live', guildId: '222222222222222222', channelId: '777777777777777777',
+    source: 'reply', createdAt: '2026-09-01T00:00:00.000Z', rolloutCursor: 0,
+    deliveredEventIds: [], deliveryState: 'pending',
+  };
+
+  const state = migrateInboxState({ discordTurnOrigins });
+  assert.equal(Object.keys(state.discordTurnOrigins).length, 2_000);
+  assert.equal(Object.hasOwn(state.discordTurnOrigins, 'turn-live'), true);
+  assert.equal(Object.hasOwn(state.discordTurnOrigins, 'turn-old-0'), false);
+  assert.equal(state.discordTurnOrigins['turn-old-2004'].deliveredEventIds.length, 128);
+});
+
+test('a successful slash continuation commits its origin before returning started', async () => {
+  const state = createEmptyInboxState();
+  const snapshots = [];
+  const request = createContinuationRequest({
+    source: 'slash', requestId: '1544329941024374935',
+    threadId: '11111111-1111-4111-8111-111111111111', text: '继续处理',
+    guildId: '222222222222222222', channelId: '777777777777777777',
+    projectId: 'project-1', projectName: '项目一',
+    createdAt: '2026-09-01T20:55:55.000Z',
+  });
+
+  const result = await dispatchContinuation(request, {
+    state,
+    now: () => '2026-09-01T20:55:56.000Z',
+    encryptText: async () => 'opaque-ciphertext',
+    persistState: async (snapshot) => { snapshots.push(structuredClone(snapshot)); },
+    resumeCodexThread: async () => ({
+      turnId: 'turn-exact-origin', completion: Promise.resolve({ turn: { status: 'completed' } }),
+    }),
+  });
+
+  assert.equal(result.status, 'started');
+  assert.equal(state.discordTurnOrigins['turn-exact-origin'].channelId, '777777777777777777');
+  assert.equal(state.discordTurnOrigins['turn-exact-origin'].threadId, request.threadId);
+  assert.equal(state.discordTurnOrigins['turn-exact-origin'].projectName, '项目一');
+  assert.equal(snapshots.at(-1).discordTurnOrigins['turn-exact-origin'].deliveryState, 'pending');
 });
 
 test('deduplicates continuation request ids, rejects blank text, and bounds interaction records', () => {
@@ -1105,6 +1848,8 @@ test('dispatch queues an active writer, retries delivery, and preserves legacy r
   assert.equal(listContinuations(state).length, 1);
   assert.equal(Object.values(state.pendingContinuations).some((item) => Object.hasOwn(item, 'text')), false);
   assert.match(acknowledgements[0].content, /已排队/);
+  assert.match(acknowledgements[0].content, /其他写入者/);
+  assert.equal(acknowledgements[0].content.includes('桌面端占用'), false);
 
   const delivered = await dispatchContinuation(listContinuations(state)[0], dependencies);
   assert.equal(delivered.status, 'started');
@@ -1112,6 +1857,408 @@ test('dispatch queues an active writer, retries delivery, and preserves legacy r
   assert.equal(listContinuations(state)[0].status, 'delivered');
   assert.match(acknowledgements[1].content, /排队回复现已送达/);
   assert.equal(persisted.length >= 2, true);
+});
+
+test('an active-writer downgrade durably records its structured blocking reason', async () => {
+  const state = createEmptyInboxState();
+  const snapshots = [];
+  const request = createContinuationRequest({
+    source: 'slash', requestId: 'active-writer-reason', threadId: 'root-1', text: 'continue',
+  });
+
+  const result = await dispatchContinuation(request, {
+    state,
+    encryptText: async () => 'opaque-ciphertext',
+    persistState: async (snapshot) => { snapshots.push(structuredClone(snapshot)); },
+    resumeCodexThread: async () => { throw new Error('thread already has an active writer'); },
+  });
+
+  assert.deepEqual(
+    { status: result.status, reason: result.reason },
+    { status: 'queued', reason: 'active-writer' },
+  );
+  assert.equal(listContinuations(state)[0].blockedReason, 'active-writer');
+  assert.equal(listContinuations(snapshots.at(-1))[0].blockedReason, 'active-writer');
+});
+
+test('claiming a blocked continuation clears the stale active-writer reason before resume', async () => {
+  const state = createEmptyInboxState();
+  const queued = enqueueContinuation(state, {
+    ...createContinuationRequest({ source: 'slash', requestId: 'clear-blocked-on-claim', threadId: 'root-1', text: 'continue' }),
+    encryptedText: 'opaque-ciphertext',
+  });
+  queued.blockedReason = 'active-writer';
+
+  const result = await dispatchContinuation(queued, {
+    state,
+    decryptText: async () => 'continue',
+    persistState: async () => {},
+    resumeCodexThread: async () => {
+      assert.equal(Object.hasOwn(state.pendingContinuations[queued.queueId], 'blockedReason'), false);
+      return { turnId: 'turn-cleared', completion: Promise.resolve({ turn: { status: 'completed' } }) };
+    },
+  });
+
+  assert.equal(result.status, 'started');
+  assert.equal(Object.hasOwn(state.pendingContinuations[queued.queueId], 'blockedReason'), false);
+});
+
+test('state migration removes active-writer reasons from non-queued continuation states', () => {
+  const state = createEmptyInboxState();
+  const failed = enqueueContinuation(state, {
+    ...createContinuationRequest({ source: 'slash', requestId: 'stale-blocked-failed', threadId: 'root-1', text: 'continue' }),
+    encryptedText: 'opaque-ciphertext', status: 'failed',
+  });
+  failed.blockedReason = 'active-writer';
+
+  migrateInboxState(state);
+
+  assert.equal(Object.hasOwn(state.pendingContinuations[failed.queueId], 'blockedReason'), false);
+});
+
+test('continuation schema accepts active-writer only on queued records', () => {
+  const state = createEmptyInboxState();
+  const queued = enqueueContinuation(state, {
+    ...createContinuationRequest({ source: 'slash', requestId: 'schema-blocked', threadId: 'root-1', text: 'continue' }),
+    encryptedText: 'opaque-ciphertext',
+  });
+  queued.blockedReason = 'active-writer';
+  assert.doesNotThrow(() => bridgeLib.assertValidInboxStateV2(structuredClone(state)));
+
+  const invalidStatus = structuredClone(state);
+  invalidStatus.pendingContinuations[queued.queueId].status = 'failed';
+  assert.throws(() => bridgeLib.assertValidInboxStateV2(invalidStatus), /corrupt/iu);
+
+  const invalidReason = structuredClone(state);
+  invalidReason.pendingContinuations[queued.queueId].blockedReason = 'raw-error-detail';
+  assert.throws(() => bridgeLib.assertValidInboxStateV2(invalidReason), /corrupt/iu);
+
+  const invalidTerminalClaim = structuredClone(state);
+  const terminal = invalidTerminalClaim.pendingContinuations[queued.queueId];
+  terminal.status = 'failed';
+  delete terminal.blockedReason;
+  terminal.takeoverClaimId = 'claim-1234567890';
+  terminal.takeoverClaimedAt = '2026-09-01T01:00:00.000Z';
+  assert.throws(() => bridgeLib.assertValidInboxStateV2(invalidTerminalClaim), /corrupt/iu);
+
+  const incompleteClaim = structuredClone(state);
+  const claimed = incompleteClaim.pendingContinuations[queued.queueId];
+  claimed.status = 'takeover-claimed';
+  delete claimed.blockedReason;
+  assert.throws(() => bridgeLib.assertValidInboxStateV2(incompleteClaim), /corrupt/iu);
+});
+
+test('persisted cancellation removes the active-writer marker from every snapshot', async () => {
+  const state = createEmptyInboxState();
+  const queued = enqueueContinuation(state, {
+    ...createContinuationRequest({ source: 'slash', requestId: 'cancel-blocked', threadId: 'root-1', text: 'continue' }),
+    encryptedText: 'opaque-ciphertext',
+  });
+  queued.blockedReason = 'active-writer';
+  const snapshots = [];
+
+  const result = await cancelContinuationPersisted({
+    state,
+    queueId: queued.queueId,
+    persistState: async (snapshot) => { snapshots.push(structuredClone(snapshot)); },
+  });
+
+  assert.equal(result.status, 'cancelled');
+  assert.equal(Object.hasOwn(state.pendingContinuations[queued.queueId], 'blockedReason'), false);
+  assert.equal(Object.hasOwn(snapshots[0].pendingContinuations[queued.queueId], 'blockedReason'), false);
+});
+
+test('takeover claim durably binds one queued active-writer item to its exact thread', async () => {
+  assert.equal(typeof bridgeLib.claimContinuationTakeover, 'function');
+  const state = createEmptyInboxState();
+  const queued = enqueueContinuation(state, {
+    ...createContinuationRequest({ source: 'slash', requestId: 'claim-exact', threadId: 'root-exact', text: 'continue' }),
+    encryptedText: 'opaque-ciphertext',
+  });
+  queued.blockedReason = 'active-writer';
+  const snapshots = [];
+
+  const result = await bridgeLib.claimContinuationTakeover({
+    state,
+    queueId: queued.queueId,
+    targetThreadId: 'root-exact',
+    now: '2026-09-01T01:00:00.000Z',
+    randomBytes: () => Buffer.alloc(12, 7),
+    persistState: async (snapshot) => { snapshots.push(structuredClone(snapshot)); },
+  });
+
+  assert.equal(result.status, 'claimed');
+  assert.equal(result.queueId, queued.queueId);
+  assert.equal(result.targetThreadId, 'root-exact');
+  assert.match(result.claimId, /^[A-Za-z0-9_-]{16}$/u);
+  const claimed = state.pendingContinuations[queued.queueId];
+  assert.equal(claimed.status, 'takeover-claimed');
+  assert.equal(claimed.takeoverClaimId, result.claimId);
+  assert.equal(claimed.takeoverClaimedAt, '2026-09-01T01:00:00.000Z');
+  assert.equal(Object.hasOwn(claimed, 'blockedReason'), false);
+  assert.deepEqual(snapshots.at(-1).pendingContinuations[queued.queueId], claimed);
+  assert.doesNotThrow(() => bridgeLib.assertValidInboxStateV2(structuredClone(state)));
+});
+
+test('takeover claim fails closed for cancelled, already claimed, and mismatched targets', async () => {
+  assert.equal(typeof bridgeLib.claimContinuationTakeover, 'function');
+  const makeBlocked = (requestId, threadId = 'root-1') => {
+    const state = createEmptyInboxState();
+    const item = enqueueContinuation(state, {
+      ...createContinuationRequest({ source: 'slash', requestId, threadId, text: 'continue' }),
+      encryptedText: 'opaque-ciphertext',
+    });
+    item.blockedReason = 'active-writer';
+    return { state, item };
+  };
+  const cancelled = makeBlocked('claim-cancelled');
+  cancelContinuation(cancelled.state, cancelled.item.queueId);
+  const mismatch = makeBlocked('claim-mismatch', 'root-other');
+  const already = makeBlocked('claim-already');
+  already.item.status = 'resuming';
+  delete already.item.blockedReason;
+
+  for (const [fixture, targetThreadId] of [
+    [cancelled, 'root-1'], [mismatch, 'root-1'], [already, 'root-1'],
+  ]) {
+    const result = await bridgeLib.claimContinuationTakeover({
+      state: fixture.state,
+      queueId: fixture.item.queueId,
+      targetThreadId,
+      persistState: async () => {},
+    });
+    assert.equal(result.status, 'unavailable');
+    assert.equal(fixture.state.pendingContinuations[fixture.item.queueId].status, fixture.item.status);
+  }
+});
+
+test('failed takeover claim persistence leaves the exact request queued and never claimed', async () => {
+  assert.equal(typeof bridgeLib.claimContinuationTakeover, 'function');
+  const state = createEmptyInboxState();
+  const queued = enqueueContinuation(state, {
+    ...createContinuationRequest({ source: 'slash', requestId: 'claim-persist-failed', threadId: 'root-1', text: 'continue' }),
+    encryptedText: 'opaque-ciphertext',
+  });
+  queued.blockedReason = 'active-writer';
+
+  const result = await bridgeLib.claimContinuationTakeover({
+    state,
+    queueId: queued.queueId,
+    targetThreadId: 'root-1',
+    persistState: async () => { throw new Error('private path'); },
+  });
+
+  assert.deepEqual(result, { status: 'failed', reason: 'state-persist-failed' });
+  assert.equal(state.pendingContinuations[queued.queueId].status, 'queued');
+  assert.equal(state.pendingContinuations[queued.queueId].blockedReason, 'active-writer');
+  assert.equal(Object.hasOwn(state.pendingContinuations[queued.queueId], 'takeoverClaimId'), false);
+});
+
+test('releasing the exact takeover claim durably restores its active-writer queue marker', async () => {
+  assert.equal(typeof bridgeLib.releaseContinuationTakeoverClaim, 'function');
+  const state = createEmptyInboxState();
+  const queued = enqueueContinuation(state, {
+    ...createContinuationRequest({ source: 'slash', requestId: 'claim-release', threadId: 'root-1', text: 'continue' }),
+    encryptedText: 'opaque-ciphertext',
+  });
+  queued.blockedReason = 'active-writer';
+  const claim = await bridgeLib.claimContinuationTakeover({
+    state, queueId: queued.queueId, targetThreadId: 'root-1',
+    randomBytes: () => Buffer.alloc(12, 8), persistState: async () => {},
+  });
+  const snapshots = [];
+
+  const wrong = await bridgeLib.releaseContinuationTakeoverClaim({
+    state, claim: { ...claim, claimId: 'wrong-claim-id' }, persistState: async () => {},
+  });
+  assert.equal(wrong.status, 'unavailable');
+  assert.equal(state.pendingContinuations[queued.queueId].status, 'takeover-claimed');
+
+  const released = await bridgeLib.releaseContinuationTakeoverClaim({
+    state, claim, persistState: async (snapshot) => { snapshots.push(structuredClone(snapshot)); },
+  });
+  assert.deepEqual(released, { status: 'queued', queueId: queued.queueId, reason: 'active-writer' });
+  const restored = state.pendingContinuations[queued.queueId];
+  assert.equal(restored.status, 'queued');
+  assert.equal(restored.blockedReason, 'active-writer');
+  assert.equal(Object.hasOwn(restored, 'takeoverClaimId'), false);
+  assert.equal(Object.hasOwn(restored, 'takeoverClaimedAt'), false);
+  assert.deepEqual(snapshots.at(-1).pendingContinuations[queued.queueId], restored);
+});
+
+test('startup recovery returns a durable takeover claim to the active-writer queue', async () => {
+  assert.equal(typeof bridgeLib.claimContinuationTakeover, 'function');
+  const state = createEmptyInboxState();
+  const queued = enqueueContinuation(state, {
+    ...createContinuationRequest({ source: 'slash', requestId: 'claim-recovery', threadId: 'root-1', text: 'continue' }),
+    encryptedText: 'opaque-ciphertext',
+  });
+  queued.blockedReason = 'active-writer';
+  await bridgeLib.claimContinuationTakeover({
+    state, queueId: queued.queueId, targetThreadId: 'root-1',
+    randomBytes: () => Buffer.alloc(12, 9), persistState: async () => {},
+  });
+
+  recoverContinuationAttempts(state, '2026-09-01T01:05:00.000Z');
+
+  const recovered = state.pendingContinuations[queued.queueId];
+  assert.equal(recovered.status, 'queued');
+  assert.equal(recovered.blockedReason, 'active-writer');
+  assert.equal(Object.hasOwn(recovered, 'takeoverClaimId'), false);
+  assert.equal(Object.hasOwn(recovered, 'takeoverClaimedAt'), false);
+  assert.equal(listRetryableContinuations(state).some((item) => item.queueId === queued.queueId), true);
+});
+
+test('only the exact persisted takeover claim can consume and start its continuation once', async () => {
+  assert.equal(typeof bridgeLib.claimContinuationTakeover, 'function');
+  const state = createEmptyInboxState();
+  const queued = enqueueContinuation(state, {
+    ...createContinuationRequest({ source: 'slash', requestId: 'claim-consume', threadId: 'root-1', text: 'continue' }),
+    encryptedText: 'opaque-ciphertext',
+  });
+  queued.blockedReason = 'active-writer';
+  const claim = await bridgeLib.claimContinuationTakeover({
+    state, queueId: queued.queueId, targetThreadId: 'root-1',
+    randomBytes: () => Buffer.alloc(12, 10), persistState: async () => {},
+  });
+  let starts = 0;
+  const dependencies = {
+    state,
+    takeoverClaimId: 'wrong-claim-id',
+    decryptText: async () => 'continue',
+    persistState: async () => {},
+    resumeCodexThread: async () => { starts += 1; return { turnId: 'turn-claim' }; },
+  };
+
+  const wrong = await dispatchContinuation(state.pendingContinuations[queued.queueId], dependencies);
+  assert.equal(wrong.status, 'failed');
+  assert.equal(starts, 0);
+  assert.equal(state.pendingContinuations[queued.queueId].status, 'takeover-claimed');
+
+  dependencies.takeoverClaimId = claim.claimId;
+  const started = await dispatchContinuation(state.pendingContinuations[queued.queueId], dependencies);
+  assert.equal(started.status, 'started');
+  assert.equal(starts, 1);
+  assert.equal(state.pendingContinuations[queued.queueId].status, 'delivered');
+  assert.equal(Object.hasOwn(state.pendingContinuations[queued.queueId], 'takeoverClaimId'), false);
+
+  const repeated = await dispatchContinuation(state.pendingContinuations[queued.queueId], dependencies);
+  assert.equal(repeated.status, 'started');
+  assert.equal(starts, 1);
+});
+
+test('a durable takeover claim wins atomically over cancellation and background retry', async () => {
+  const state = createEmptyInboxState();
+  const queued = enqueueContinuation(state, {
+    ...createContinuationRequest({ source: 'slash', requestId: 'claim-race', threadId: 'root-1', text: 'continue' }),
+    encryptedText: 'opaque-ciphertext',
+  });
+  queued.blockedReason = 'active-writer';
+  const claimPersisting = deferred();
+  const allowClaimPersist = deferred();
+  let persists = 0;
+  const persistState = async () => {
+    persists += 1;
+    if (persists === 1) {
+      claimPersisting.resolve();
+      await allowClaimPersist.promise;
+    }
+  };
+
+  const claimPromise = bridgeLib.claimContinuationTakeover({
+    state, queueId: queued.queueId, targetThreadId: 'root-1',
+    randomBytes: () => Buffer.alloc(12, 11), persistState,
+  });
+  await claimPersisting.promise;
+  const cancelPromise = cancelContinuationPersisted({
+    state, queueId: queued.queueId, persistState,
+  });
+  let backgroundStarts = 0;
+  const backgroundPromise = dispatchContinuation(state.pendingContinuations[queued.queueId], {
+    state,
+    decryptText: async () => 'continue',
+    persistState,
+    resumeCodexThread: async () => { backgroundStarts += 1; return { turnId: 'unexpected' }; },
+  });
+  allowClaimPersist.resolve();
+
+  const [claim, cancelled, background] = await Promise.all([claimPromise, cancelPromise, backgroundPromise]);
+
+  assert.equal(claim.status, 'claimed');
+  assert.equal(cancelled.status, 'already-started');
+  assert.equal(background.status, 'failed');
+  assert.equal(backgroundStarts, 0);
+  assert.equal(state.pendingContinuations[queued.queueId].status, 'takeover-claimed');
+  assert.equal(state.pendingContinuations[queued.queueId].takeoverClaimId, claim.claimId);
+});
+
+test('takeover retry persistence failure preserves its claim and post-submit ambiguity stays one-shot', async () => {
+  const state = createEmptyInboxState();
+  const queued = enqueueContinuation(state, {
+    ...createContinuationRequest({ source: 'slash', requestId: 'takeover-uncertain', threadId: 'root-1', text: 'continue' }),
+    encryptedText: 'opaque-ciphertext',
+  });
+  queued.blockedReason = 'active-writer';
+  const claim = await bridgeLib.claimContinuationTakeover({
+    state, queueId: queued.queueId, targetThreadId: 'root-1',
+    randomBytes: () => Buffer.alloc(12, 12), persistState: async () => {},
+  });
+  let externalStarts = 0;
+
+  const failedPersist = await dispatchContinuation(state.pendingContinuations[queued.queueId], {
+    state,
+    takeoverClaimId: claim.claimId,
+    decryptText: async () => 'continue',
+    persistState: async (snapshot) => {
+      if (snapshot.pendingContinuations[queued.queueId].status === 'resuming') throw new Error('private path');
+    },
+    resumeCodexThread: async () => { externalStarts += 1; return { turnId: 'unexpected' }; },
+  });
+  assert.equal(failedPersist.reason, 'state-persist-failed');
+  assert.equal(externalStarts, 0);
+  assert.equal(state.pendingContinuations[queued.queueId].status, 'takeover-claimed');
+  assert.equal(state.pendingContinuations[queued.queueId].takeoverClaimId, claim.claimId);
+
+  const dependencies = {
+    state,
+    takeoverClaimId: claim.claimId,
+    decryptText: async () => 'continue',
+    persistState: async () => {},
+    resumeCodexThread: async ({ onStartSubmitted }) => {
+      externalStarts += 1;
+      await onStartSubmitted();
+      const error = new Error('transport closed');
+      error.submissionStage = 'post-submit';
+      throw error;
+    },
+  };
+  const uncertain = await dispatchContinuation(state.pendingContinuations[queued.queueId], dependencies);
+  const repeated = await dispatchContinuation(state.pendingContinuations[queued.queueId], dependencies);
+
+  assert.equal(uncertain.status, 'uncertain');
+  assert.equal(repeated.status, 'uncertain');
+  assert.equal(externalStarts, 1);
+  assert.equal(state.pendingContinuations[queued.queueId].status, 'start-uncertain');
+  assert.equal(Object.hasOwn(state.pendingContinuations[queued.queueId], 'takeoverClaimId'), false);
+});
+
+test('a failed retry cannot retain a stale active-writer reason', async () => {
+  const state = createEmptyInboxState();
+  const queued = enqueueContinuation(state, {
+    ...createContinuationRequest({ source: 'slash', requestId: 'clear-blocked-on-failure', threadId: 'root-1', text: 'continue' }),
+    encryptedText: 'opaque-ciphertext',
+  });
+  queued.blockedReason = 'active-writer';
+
+  const result = await dispatchContinuation(queued, {
+    state,
+    decryptText: async () => 'continue',
+    persistState: async () => {},
+    resumeCodexThread: async () => { throw new Error('task not found'); },
+  });
+
+  assert.equal(result.status, 'failed');
+  assert.equal(Object.hasOwn(state.pendingContinuations[queued.queueId], 'blockedReason'), false);
 });
 
 test('a queued retry that cannot resume becomes failed instead of claiming delivery', async () => {
@@ -1364,7 +2511,7 @@ test('bridge retry candidates include queued work and confirmed replies awaiting
   );
 });
 
-test('a confirmed turn stays started when confirmation persistence, acknowledgement, or tracking fails', async () => {
+test('a confirmed external turn reports uncertain when its origin confirmation cannot be persisted', async () => {
   const state = createEmptyInboxState();
   const events = [];
   let persistCount = 0;
@@ -1386,7 +2533,7 @@ test('a confirmed turn stays started when confirmation persistence, acknowledgem
     sendReply: async () => { events.push('ack'); throw new Error('private token'); },
     trackCompletion: () => { events.push('track'); throw new Error('private tracker'); },
   });
-  assert.equal(result.status, 'started');
+  assert.equal(result.status, 'uncertain');
   assert.equal(result.turnId, 'turn-confirmed');
   assert.equal(result.reason, 'state-persist-failed');
   assert.equal(listContinuations(state)[0].status, 'start-uncertain');
@@ -1419,7 +2566,7 @@ test('restart preserves an uncertain external start after confirmation persisten
       return { turnId: 'turn-uncertain', completion: Promise.resolve({ turn: { status: 'completed' } }) };
     },
   });
-  assert.equal(first.status, 'started');
+  assert.equal(first.status, 'uncertain');
   assert.equal(first.reason, 'state-persist-failed');
   assert.equal(listContinuations(persistedState)[0].status, 'start-submitted');
 

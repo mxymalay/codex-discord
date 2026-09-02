@@ -102,11 +102,11 @@ $text = Get-ChildItem $repo -Recurse -File |
 $joined = $text -join "`n"
 if ($joined -match 'https://discord\.com/api/webhooks/[0-9]+/[A-Za-z0-9_-]{20,}') { throw 'real webhook pattern found' }
 $personalPaths = @(
-    ('C:' + '\Users\' + '86166'),
-    ('G:' + '\' + 'Codex' + 'Data')
+    ('C:' + '\Users\' + 'operator'),
+    ('D:' + '\' + 'codex' + '-data')
 )
 foreach ($personalPath in $personalPaths) { if ($joined.Contains($personalPath)) { throw 'personal absolute path found' } }
-$realIds = @('154397' + '9587627647036','154396' + '9985800446053','148378' + '9348146118708')
+$realIds = @('111111' + '111111111111','222222' + '222222222222','333333' + '333333333333')
 foreach ($id in $realIds) { if ($joined.Contains($id)) { throw 'personal Discord deployment id found' } }
 Write-Output 'PASS: repository contains no runtime state or personal deployment values'
 ```

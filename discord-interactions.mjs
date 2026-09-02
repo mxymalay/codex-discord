@@ -5,6 +5,12 @@ import { COMMAND_NAMES, authorizeInteraction, ephemeral } from './discord-comman
 import { cancelContinuationPersisted as cancelPersistedContinuation, createContinuationRequest } from './discord-bridge-lib.mjs';
 import { renderHealthReport, runFullHealthChecks, runQuickHealthChecks } from './discord-health-lib.mjs';
 import { NO_PROJECT, resolveProjectSelection } from './discord-task-create-lib.mjs';
+import {
+  buildTakeoverSnapshot,
+  createTakeoverUiState,
+  hasNewActiveTasks,
+  validateTakeoverUiState,
+} from './codex-takeover-lib.mjs';
 
 const DISCORD_API = 'https://discord.com/api/v10';
 const UI_TTL_MS = 15 * 60_000;
@@ -338,8 +344,14 @@ function displayText(value, fallback, maximum = 80) {
 }
 
 function metadataText(value, fallback = '未知', maximum = 80) {
-  const singleLine = text(value, fallback).replace(/\s+/gu, ' ');
+  const singleLine = text(value, fallback).replace(/@/gu, '＠').replace(/\s+/gu, ' ');
   const escaped = singleLine.replace(/([\\`*_{}\[\]()#+.!|>~-])/gu, '\\$1');
+  return escaped.length <= maximum ? escaped : `${escaped.slice(0, Math.max(0, maximum - 1))}…`;
+}
+
+function markdownBodyValue(value, fallback = '未知', maximum = 20_000) {
+  const normalized = text(value, fallback).replace(/\r\n?/gu, '\n').replace(/@/gu, '＠');
+  const escaped = normalized.replace(/([\\`*_{}\[\]()#+.!|>~-])/gu, '\\$1');
   return escaped.length <= maximum ? escaped : `${escaped.slice(0, Math.max(0, maximum - 1))}…`;
 }
 
@@ -368,6 +380,39 @@ function statusLabel(value) {
   return STATUS_LABELS[String(value ?? '')] ?? text(value);
 }
 
+/** Render a takeover risk list without exposing thread IDs, PIDs, or paths. */
+export function renderTakeoverPreview(snapshot, {
+  desktopRunning = false,
+  indexAvailable = true,
+  newTasksDetected = false,
+} = {}) {
+  if (!desktopRunning) return { content: 'Codex 桌面端未运行，无需退出。' };
+  if (!indexAvailable) {
+    return {
+      embeds: [{
+        description: '## Codex 正在运行\n\n⚠️ 任务清单不可用。为安全起见，本次不会退出，也未提供退出确认。',
+      }],
+    };
+  }
+  const lines = (Array.isArray(snapshot?.items) ? snapshot.items : []).map((item, index) => {
+    const status = item?.status === 'confirmation-required' ? '待确认' : '正在执行';
+    const target = item?.target ? '，目标任务' : '';
+    return `${index + 1}. ${metadataText(item?.taskName, '未命名任务', 200)}（${status}${target}）`;
+  });
+  const remaining = Math.max(0, Math.floor(Number(snapshot?.remaining) || 0));
+  if (remaining > 0) lines.push(`另有 ${remaining} 个任务未列出。`);
+  return {
+    embeds: [{
+      description: [
+        '## Codex 正在运行',
+        newTasksDetected ? '⚠️ 检测到新活动任务，原确认已失效。请重新核对后再次确认。' : '',
+        lines.length ? lines.join('\n') : '未检测到运行中主任务。',
+        '⚠️ 强制退出可能中断以上桌面任务。',
+      ].filter(Boolean).join('\n\n'),
+    }],
+  };
+}
+
 export function renderTaskList(tasks, { status = '全部' } = {}) {
   const desired = String(status ?? '全部');
   const values = (Array.isArray(tasks) ? tasks : [])
@@ -377,8 +422,9 @@ export function renderTaskList(tasks, { status = '全部' } = {}) {
   return [
     `## 最近任务（${metadataText(desired, '全部')}）`,
     ...values.map((item, index) => [
-      `${index + 1}. **${metadataText(item?.projectName, '无项目')} / ${metadataText(item?.taskName, '未命名任务')}**`,
-      `   状态：${metadataText(statusLabel(item?.status))}｜最后活动：${formatTimestamp(item?.lastActivityAt)}｜运行时间：${formatDuration(item?.runtimeMs)}`,
+      `${index + 1}. **项目：** ${metadataText(item?.projectName, '无项目')}`,
+      `   **任务：** ${metadataText(item?.taskName, '未命名任务')}`,
+      `   **状态：** ${metadataText(statusLabel(item?.status))}｜**最后活动：** ${formatTimestamp(item?.lastActivityAt)}｜**运行时间：** ${formatDuration(item?.runtimeMs)}`,
     ].join('\n')),
   ].join('\n');
 }
@@ -386,6 +432,7 @@ export function renderTaskList(tasks, { status = '全部' } = {}) {
 function continuationStatusLabel(status) {
   return ({
     queued: '等待发送',
+    'takeover-claimed': '接管处理中',
     resuming: '正在连接',
     submitting: '正在提交启动请求',
     attempting: '正在尝试',
@@ -413,7 +460,7 @@ function continuationQueueView(items, taskIndex = null) {
   const values = Array.isArray(items) ? items : [];
   if (!values.length) return { description: '## 继续队列\n当前没有继续请求。', displayed: [] };
   const tasks = Array.isArray(taskIndex?.tasks) ? taskIndex.tasks : [];
-  const priorityStatuses = ['start-uncertain', 'start-submitted', 'submitting', 'attempting', 'resuming', 'acknowledging', 'confirmed-start', 'queued'];
+  const priorityStatuses = ['start-uncertain', 'start-submitted', 'submitting', 'attempting', 'takeover-claimed', 'resuming', 'acknowledging', 'confirmed-start', 'queued'];
   const priorityStatusSet = new Set(priorityStatuses);
   const ordered = [
     ...priorityStatuses.flatMap((status) => values.filter((item) => item?.status === status)),
@@ -426,9 +473,10 @@ function continuationQueueView(items, taskIndex = null) {
       const taskName = item?.taskName ?? task?.taskName ?? `任务 …${String(item?.threadId ?? '').slice(-8)}`;
       const source = item?.source === 'reply' ? '通知回复' : 'Slash 命令';
       return [
-        `${index + 1}. **${metadataText(projectName, '无项目')} / ${metadataText(taskName, '未命名任务')}**（…${metadataText(String(item?.queueId ?? '').slice(-8), '未知', 16)}）`,
-        `   内容：${metadataText(continuationSummaryText(item?.summary), '（无可用摘要）', 140)}`,
-        `   来源：${source}｜加入：${formatTimestamp(item?.createdAt ?? item?.queuedAt)}｜最后尝试：${formatTimestamp(item?.lastAttemptAt)}｜状态：${continuationStatusLabel(item?.status)}`,
+        `${index + 1}. **项目：** ${metadataText(projectName, '无项目')}`,
+        `   **任务：** ${metadataText(taskName, '未命名任务')}｜**队列编号：** …${metadataText(String(item?.queueId ?? '').slice(-8), '未知', 16)}`,
+        `   **内容：** ${metadataText(continuationSummaryText(item?.summary), '（无可用摘要）', 140)}`,
+        `   **来源：** ${source}｜**加入：** ${formatTimestamp(item?.createdAt ?? item?.queuedAt)}｜**最后尝试：** ${formatTimestamp(item?.lastAttemptAt)}｜**状态：** ${continuationStatusLabel(item?.status)}`,
       ].join('\n');
     };
   const displayed = [];
@@ -452,16 +500,17 @@ export function renderContinuationQueue(items, taskIndex = null) {
 
 export function renderTaskDetail(detail) {
   if (!detail) return '任务不存在或已不再是侧边栏主任务。';
-  const taskText = text(detail.taskText, detail.contentAvailable === false ? '内容暂不可用，请稍后重试。' : '（无可用内容）');
-  const resultText = text(detail.resultText, detail.contentAvailable === false ? '内容暂不可用，请稍后重试。' : '（暂无结果）');
+  const taskText = markdownBodyValue(detail.taskText, detail.contentAvailable === false ? '内容暂不可用，请稍后重试。' : '（无可用内容）');
+  const resultText = markdownBodyValue(detail.resultText, detail.contentAvailable === false ? '内容暂不可用，请稍后重试。' : '（暂无结果）');
   return [
     `# ${metadataText(detail.taskName, '未命名任务', 200)}`,
-    `项目：${metadataText(detail.projectName, '无项目', 200)}`,
-    `状态：${metadataText(statusLabel(detail.status), '未知', 100)}`,
-    `任务 ID：…${metadataText(text(detail.threadId).slice(-8), '未知', 16)}`,
-    `开始时间：${formatTimestamp(detail.startedAt ?? detail.createdAt)}`,
-    `最后活动：${formatTimestamp(detail.lastActivityAt)}`,
-    `运行时间：${formatDuration(detail.runtimeMs)}`,
+    `**项目：** ${metadataText(detail.projectName, '无项目', 200)}`,
+    `**任务：** ${metadataText(detail.taskName, '未命名任务', 200)}`,
+    `**状态：** ${metadataText(statusLabel(detail.status), '未知', 100)}`,
+    `**任务 ID：** …${metadataText(text(detail.threadId).slice(-8), '未知', 16)}`,
+    `**开始时间：** ${formatTimestamp(detail.startedAt ?? detail.createdAt)}`,
+    `**最后活动：** ${formatTimestamp(detail.lastActivityAt)}`,
+    `**运行时间：** ${formatDuration(detail.runtimeMs)}`,
     '',
     '## 原始任务',
     taskText,
@@ -476,8 +525,11 @@ export function renderSearchResults(results, keyword) {
   if (!values.length) return `没有找到与“${metadataText(keyword, '', 100)}”匹配的主任务。`;
   return [
     `## 搜索结果：${metadataText(keyword, '', 100)}`,
-    ...values.map((item, index) =>
-      `${index + 1}. **${metadataText(item?.projectName, '无项目')} / ${metadataText(item?.taskName, '未命名任务')}**｜${metadataText(statusLabel(item?.status))}｜${formatTimestamp(item?.lastActivityAt)}`),
+    ...values.map((item, index) => [
+      `${index + 1}. **项目：** ${metadataText(item?.projectName, '无项目')}`,
+      `   **任务：** ${metadataText(item?.taskName, '未命名任务')}`,
+      `   **状态：** ${metadataText(statusLabel(item?.status))}｜**最后活动：** ${formatTimestamp(item?.lastActivityAt)}`,
+    ].join('\n')),
   ].join('\n');
 }
 
@@ -541,19 +593,21 @@ export function renderQuota(state, { nowMs = Date.now() } = {}) {
       trend = acceleration > 0 ? '这次使用速度变得更快！' : '这次使用速度变得更慢！';
     }
   }
-  const transition = previous === null ? `当前剩余：${percent(remaining)}%` : `额度：${percent(previous)}% → ${percent(remaining)}%`;
+  const transition = previous === null
+    ? `**额度：** 当前剩余 ${percent(remaining)}%`
+    : `**额度：** ${percent(previous)}% → ${percent(remaining)}%`;
   const resetText = Number.isFinite(resetMs) && resetMs > Number(nowMs)
     ? formatDuration(resetMs - Number(nowMs))
     : '未知或已经到期';
   return [
     '## Codex 周额度',
     transition,
-    `距上次变化：${Number.isFinite(lastChangeMs) ? formatDuration(Math.max(0, Number(nowMs) - lastChangeMs)) : '未知'}`,
-    trend,
-    `距下次更新还有：${resetText}`,
-    `如果以当前速度连续，${exhaustion(remaining, currentRate, resetMs, observedMs)}`,
-    `如果以重置至今平均速度，${exhaustion(remaining, averageRate, resetMs, observedMs)}`,
-    `快照时间：${formatTimestamp(state.observedAt)}${age > 15 * 60_000 ? '（数据已过期）' : ''}`,
+    `**距上次变化：** ${Number.isFinite(lastChangeMs) ? formatDuration(Math.max(0, Number(nowMs) - lastChangeMs)) : '未知'}`,
+    `**使用速度：** ${trend}`,
+    `**距下次更新还有：** ${resetText}`,
+    `**按当前速度：** ${exhaustion(remaining, currentRate, resetMs, observedMs)}`,
+    `**按重置至今平均速度：** ${exhaustion(remaining, averageRate, resetMs, observedMs)}`,
+    `**快照时间：** ${formatTimestamp(state.observedAt)}${age > 15 * 60_000 ? '（数据已过期）' : ''}`,
   ].join('\n');
 }
 
@@ -574,17 +628,17 @@ export function renderSystemStatus(status = {}) {
   const category = safeCategory(status.latestErrorCategory ?? status.gateway?.lastError ?? status.rollout?.lastError);
   return [
     '## 系统状态',
-    `Gateway：${stateName(status.gateway)}`,
-    `Discord REST：${stateName(status.discordRest)}`,
-    `通知监听：${stateName(status.notificationListener)}｜最近成功：${formatTimestamp(status.notificationListener?.lastSuccessAt)}`,
-    `完成补发：${stateName(status.rollout)}｜最近推进：${formatTimestamp(status.rollout?.lastProgressAt)}`,
-    `任务索引：${finiteNumber(index.count) ?? 0} 项｜生成时间：${formatTimestamp(index.generatedAt)}`,
-    `继续队列：${finiteNumber(status.queueCount) ?? 0} 项`,
-    `额度快照：${formatTimestamp(quota.observedAt)}`,
-    `命令注册：${formatTimestamp(timestamps.lastRegistrationAt)}｜索引更新：${formatTimestamp(timestamps.lastIndexUpdateAt)}`,
-    `Gateway 事件：${formatTimestamp(timestamps.lastGatewayEventAt)}｜rollout 推进：${formatTimestamp(timestamps.lastRolloutProgressAt)}`,
-    `通知发送：${formatTimestamp(timestamps.lastNotificationSentAt)}｜任务创建：${formatTimestamp(timestamps.lastTaskCreationAt)}｜队列重试：${formatTimestamp(timestamps.lastQueueRetryAt)}`,
-    `最近错误类别：${category}`,
+    `**Gateway：** ${stateName(status.gateway)}`,
+    `**Discord REST：** ${stateName(status.discordRest)}`,
+    `**通知监听：** ${stateName(status.notificationListener)}｜**最近成功：** ${formatTimestamp(status.notificationListener?.lastSuccessAt)}`,
+    `**完成补发：** ${stateName(status.rollout)}｜**最近推进：** ${formatTimestamp(status.rollout?.lastProgressAt)}`,
+    `**任务索引：** ${finiteNumber(index.count) ?? 0} 项｜**生成时间：** ${formatTimestamp(index.generatedAt)}`,
+    `**继续队列：** ${finiteNumber(status.queueCount) ?? 0} 项`,
+    `**额度快照：** ${formatTimestamp(quota.observedAt)}`,
+    `**命令注册：** ${formatTimestamp(timestamps.lastRegistrationAt)}｜**索引更新：** ${formatTimestamp(timestamps.lastIndexUpdateAt)}`,
+    `**Gateway 事件：** ${formatTimestamp(timestamps.lastGatewayEventAt)}｜**rollout 推进：** ${formatTimestamp(timestamps.lastRolloutProgressAt)}`,
+    `**通知发送：** ${formatTimestamp(timestamps.lastNotificationSentAt)}｜**任务创建：** ${formatTimestamp(timestamps.lastTaskCreationAt)}｜**队列重试：** ${formatTimestamp(timestamps.lastQueueRetryAt)}`,
+    `**最近错误类别：** ${category}`,
   ].join('\n');
 }
 
@@ -599,14 +653,24 @@ export function renderHelp() {
     额度: '查看最后一份本机官方周额度快照。',
     系统状态: '查看 Gateway、监听、索引、队列与额度状态。',
     系统测试: '执行快速检查，或执行三路完整通知测试。',
+    退出Codex: '先查看可能中断的主任务，再通过一次性确认安全退出 Codex 桌面端。',
     帮助: '显示本帮助。',
   };
   return [
     '# Codex Discord 命令帮助',
-    ...COMMAND_NAMES.map((name) => `- /${name} — ${descriptions[name]}`),
+    ...COMMAND_NAMES.map((name) => `- **/${name}** — ${descriptions[name]}`),
+    '',
+    '### 远程接管与任务进度',
+    '- `/继续任务` 遇到 active-writer（桌面写入者占用）时会先安全排队，再给出接管选项；不会同时让两个写入者操作同一任务。',
+    '- `/退出Codex` 会先列出可能中断的主任务，只有你再次确认后才退出 Codex 桌面端；风险清单变化时必须重新确认。',
+    '- 从 Discord 新建或继续的任务都会回到发起任务的原频道，包括 commentary、脱敏工具进度、待确认和最终结果。',
+    '',
+    '### 本机服务',
+    '- Codex 桌面端可以关闭，但电脑必须保持 Windows 用户已登录、处于唤醒状态并已联网；关机、休眠或 Bot 离线时命令不可执行。',
+    '- `Codex Discord 控制台` 提供临时开启、临时停止、长期开启、长期停用。临时开启或停止不改变长期自启设置。',
     '',
     '所有消息结果仅调用者可见，并且不会触发 Discord mentions。',
-    '电脑或 Bot 离线时命令不可执行；已有本地队列会在电脑恢复并登录后继续处理。',
+    '已有本地队列会在电脑恢复、登录并联网后继续处理。Markdown 结构由 Bot 生成，任务值会转义、截断且禁用 mentions。',
   ].join('\n');
 }
 
@@ -624,6 +688,10 @@ function userId(interaction) {
 
 function guildId(interaction) {
   return String(interaction?.guild_id ?? '');
+}
+
+function channelId(interaction) {
+  return String(interaction?.channel_id ?? '');
 }
 
 function nowValue(dependencies) {
@@ -822,9 +890,11 @@ function creationReceipt(result, selection) {
   const mode = result?.workspace?.mode === 'worktree' ? 'Git 隔离工作树' : '保存目录';
   let receipt;
   if (result?.status === 'first-turn-failed') {
-    receipt = `任务线程已保留，但首轮启动失败。\n项目：${projectName}\n任务：${taskName}\n任务 ID：…${suffix}\n运行方式：${mode}\n工作目录：${safeWorkspaceName(result?.workspace)}`;
+    receipt = `## 任务创建结果\n任务线程已保留，但首轮启动失败。\n**项目：** ${projectName}\n**任务：** ${taskName}\n**状态：** 首轮启动失败\n**任务 ID：** …${suffix}\n**运行方式：** ${mode}\n**工作目录：** ${safeWorkspaceName(result?.workspace)}`;
+  } else if (result?.status === 'start-uncertain') {
+    receipt = `## 任务创建结果\n任务可能已经启动，但本地状态尚未确认；请勿重复提交。\n**项目：** ${projectName}\n**任务：** ${taskName}\n**状态：** 等待自动恢复确认\n**任务 ID：** …${suffix}\n**运行方式：** ${mode}\n**工作目录：** ${safeWorkspaceName(result?.workspace)}`;
   } else {
-    receipt = `任务创建成功。\n项目：${projectName}\n任务：${taskName}\n任务 ID：…${suffix}\n运行方式：${mode}\n工作目录：${safeWorkspaceName(result?.workspace)}`;
+    receipt = `## 任务创建结果\n任务创建成功。\n**项目：** ${projectName}\n**任务：** ${taskName}\n**状态：** 正在运行\n**任务 ID：** …${suffix}\n**运行方式：** ${mode}\n**工作目录：** ${safeWorkspaceName(result?.workspace)}`;
   }
   return receipt.length <= 2_000 ? receipt : `${receipt.slice(0, 1_999)}…`;
 }
@@ -878,8 +948,427 @@ async function editOriginal(dependencies, interaction, payload) {
   return body;
 }
 
+async function recordCreationReceiptOutcome(dependencies, interaction, outcome) {
+  try {
+    await dependencies.recordCreationReceiptOutcome?.(String(interaction?.id ?? ''), outcome);
+  } catch {
+    // Receipt delivery already happened (or already failed); persistence cannot safely be retried here.
+  }
+}
+
+async function deliverCreationReceipt(dependencies, interaction, receipt) {
+  const body = mentionSafePayload({ content: receipt });
+  try {
+    const message = await dependencies.editOriginal?.(body, interaction);
+    await recordCreationReceiptOutcome(dependencies, interaction, {
+      status: 'original-edited',
+      ...(message?.id ? { messageId: String(message.id) } : {}),
+    });
+    return body;
+  } catch {
+    const fallback = privatePayload({ content: receipt });
+    try {
+      if (typeof dependencies.followup !== 'function') throw new Error('Follow-up delivery unavailable');
+      const message = await dependencies.followup(fallback, interaction);
+      await recordCreationReceiptOutcome(dependencies, interaction, {
+        status: 'followup-sent',
+        ...(message?.id ? { messageId: String(message.id) } : {}),
+      });
+      return fallback;
+    } catch {
+      const failed = { status: 'failed', errorCategory: 'creation-receipt-delivery-failed' };
+      await recordCreationReceiptOutcome(dependencies, interaction, failed);
+      return privatePayload({ content: '任务已处理，但 Discord 回执发送失败；请使用 /任务列表 查询结果。' });
+    }
+  }
+}
+
 async function defer(dependencies, interaction) {
   return respond(dependencies, interaction, privateResponse({}, 5));
+}
+
+async function deferMessageUpdate(dependencies, interaction) {
+  return respond(dependencies, interaction, { type: 6 });
+}
+
+function takeoverComponents(stateId) {
+  return [{
+    type: 1,
+    components: [
+      { type: 2, style: 4, label: '确认强制退出', custom_id: `takeover-confirm:${stateId}` },
+      { type: 2, style: 2, label: '取消', custom_id: `takeover-cancel:${stateId}` },
+    ],
+  }];
+}
+
+function continuationTakeoverComponents(stateId) {
+  return [{
+    type: 1,
+    components: [
+      { type: 2, style: 4, label: '退出 Codex 并立即继续', custom_id: `takeover-continue:${stateId}` },
+      { type: 2, style: 2, label: '保持排队', custom_id: `takeover-keep:${stateId}` },
+    ],
+  }];
+}
+
+function queuedTakeoverUnavailable(reason = 'untrusted') {
+  const detail = reason === 'index-unavailable'
+    ? '当前任务清单不可用，无法安全确认会中断哪些桌面任务。'
+    : '当前无法确认占用者是 Codex 桌面端。';
+  return {
+    content: `目标任务正被其他写入者占用，继续请求已安全排队。${detail}占用者可能是其他 CLI 或插件，因此不会提供强制退出；请求将保持排队。`,
+    components: [],
+  };
+}
+
+async function inspectQueuedTakeover(dependencies, targetThreadId) {
+  const [indexResult, statusResult] = await Promise.allSettled([
+    Promise.resolve().then(() => dependencies.refreshTaskIndex()),
+    Promise.resolve().then(() => dependencies.getCodexControlStatus()),
+  ]);
+  const status = statusResult.status === 'fulfilled' ? statusResult.value : null;
+  if (!status?.ok || typeof status?.desktop?.running !== 'boolean' || !status.desktop.running) {
+    return { available: false, payload: queuedTakeoverUnavailable() };
+  }
+  const index = indexResult.status === 'fulfilled' ? indexResult.value : null;
+  if (!Array.isArray(index?.tasks)) {
+    return { available: false, payload: queuedTakeoverUnavailable('index-unavailable') };
+  }
+  return {
+    available: true,
+    snapshot: buildTakeoverSnapshot(index, { targetThreadId }),
+  };
+}
+
+async function publishContinuationTakeover(dependencies, interaction, {
+  queueId,
+  targetThreadId,
+  snapshot,
+  messageId = null,
+  newTasksDetected = false,
+}) {
+  const stateId = makeStateId(dependencies);
+  const state = {
+    ...createTakeoverUiState({
+      id: stateId,
+      kind: 'takeover-continue',
+      userId: userId(interaction),
+      guildId: guildId(interaction),
+      targetThreadId,
+      queueId,
+      snapshot,
+      nowMs: nowValue(dependencies),
+    }),
+    messageId: messageId == null ? null : String(messageId),
+  };
+  dependencies.uiState.set(stateId, state);
+  const payload = mentionSafePayload({
+    content: '目标任务正被其他写入者占用，继续请求已安全排队。请核对下列桌面任务后选择是否接管。',
+    ...renderTakeoverPreview(snapshot, { desktopRunning: true, newTasksDetected }),
+    components: continuationTakeoverComponents(stateId),
+  });
+  try {
+    const reply = await dependencies.editOriginal?.(payload, interaction);
+    const boundMessageId = state.messageId || String(reply?.id ?? '');
+    if (!boundMessageId) {
+      dependencies.uiState.delete(stateId);
+      return editOriginal(dependencies, interaction, queuedTakeoverUnavailable());
+    }
+    state.messageId = boundMessageId;
+    return payload;
+  } catch {
+    dependencies.uiState.delete(stateId);
+    throw new Error('Continuation takeover response failed');
+  }
+}
+
+async function publishTakeoverConfirmation(dependencies, interaction, snapshot, {
+  messageId = null,
+  newTasksDetected = false,
+} = {}) {
+  const stateId = makeStateId(dependencies);
+  const state = {
+    ...createTakeoverUiState({
+      id: stateId,
+      kind: 'takeover-exit',
+      userId: userId(interaction),
+      guildId: guildId(interaction),
+      snapshot,
+      nowMs: nowValue(dependencies),
+    }),
+    messageId: messageId == null ? null : String(messageId),
+  };
+  dependencies.uiState.set(stateId, state);
+  const payload = mentionSafePayload({
+    ...renderTakeoverPreview(snapshot, { desktopRunning: true, newTasksDetected }),
+    components: takeoverComponents(stateId),
+  });
+  try {
+    const reply = await dependencies.editOriginal?.(payload, interaction);
+    const boundMessageId = state.messageId || String(reply?.id ?? '');
+    if (!boundMessageId) {
+      dependencies.uiState.delete(stateId);
+      return editOriginal(dependencies, interaction, {
+        content: '无法创建安全的退出确认，请重新执行 /退出Codex。',
+        components: [],
+      });
+    }
+    state.messageId = boundMessageId;
+    return payload;
+  } catch {
+    dependencies.uiState.delete(stateId);
+    throw new Error('Takeover confirmation response failed');
+  }
+}
+
+async function beginTakeoverExit(dependencies, interaction) {
+  await defer(dependencies, interaction);
+  const [indexResult, statusResult] = await Promise.allSettled([
+    Promise.resolve().then(() => dependencies.refreshTaskIndex()),
+    Promise.resolve().then(() => dependencies.getCodexControlStatus()),
+  ]);
+  const status = statusResult.status === 'fulfilled' ? statusResult.value : null;
+  if (!status?.ok || typeof status?.desktop?.running !== 'boolean') {
+    return editOriginal(dependencies, interaction, { content: 'Codex 桌面端状态暂不可用；本次未执行退出。' });
+  }
+  if (!status.desktop.running) {
+    return editOriginal(dependencies, interaction, renderTakeoverPreview(null, { desktopRunning: false }));
+  }
+  const index = indexResult.status === 'fulfilled' ? indexResult.value : null;
+  if (!Array.isArray(index?.tasks)) {
+    return editOriginal(dependencies, interaction, renderTakeoverPreview(null, {
+      desktopRunning: true,
+      indexAvailable: false,
+    }));
+  }
+  return publishTakeoverConfirmation(dependencies, interaction, buildTakeoverSnapshot(index));
+}
+
+function takeoverStateError(dependencies, interaction, state) {
+  const validated = validateTakeoverUiState(state, {
+    kind: 'takeover-exit',
+    userId: userId(interaction),
+    guildId: guildId(interaction),
+    nowMs: nowValue(dependencies),
+  });
+  if (!validated.ok) {
+    if (validated.reason === 'expired') return '此退出确认已过期，请重新执行 /退出Codex。';
+    if (['wrong-user', 'wrong-guild'].includes(validated.reason)) return '此退出确认不属于当前用户或服务器，无权执行。';
+    return '此退出确认已使用、过期或无效，请重新执行 /退出Codex。';
+  }
+  const componentMessageId = String(interaction?.message?.id ?? '');
+  if (!state.messageId || componentMessageId !== String(state.messageId)) {
+    return '此退出确认不属于当前消息或已失效。';
+  }
+  return null;
+}
+
+async function cancelTakeoverExit(dependencies, interaction, stateId) {
+  const state = dependencies.uiState.get(stateId);
+  const invalid = takeoverStateError(dependencies, interaction, state);
+  if (invalid) {
+    if (state && nowValue(dependencies) >= Number(state.expiresAt)) dependencies.uiState.delete(stateId);
+    return respond(dependencies, interaction, privateResponse(invalid));
+  }
+  dependencies.uiState.delete(stateId);
+  return respond(dependencies, interaction, {
+    type: 7,
+    data: mentionSafePayload({ content: '已取消退出 Codex。', components: [] }),
+  });
+}
+
+async function confirmTakeoverExit(dependencies, routerState, interaction, stateId) {
+  const state = dependencies.uiState.get(stateId);
+  const invalid = takeoverStateError(dependencies, interaction, state);
+  if (invalid) {
+    if (state && nowValue(dependencies) >= Number(state.expiresAt)) dependencies.uiState.delete(stateId);
+    return respond(dependencies, interaction, privateResponse(invalid));
+  }
+
+  dependencies.uiState.delete(stateId);
+  if (routerState.takeoverInProgress) {
+    return respond(dependencies, interaction, privateResponse('另一个退出操作正在执行；本确认未重复执行。'));
+  }
+  routerState.takeoverInProgress = true;
+  try {
+    await deferMessageUpdate(dependencies, interaction);
+    const [indexResult, statusResult] = await Promise.allSettled([
+      Promise.resolve().then(() => dependencies.refreshTaskIndex()),
+      Promise.resolve().then(() => dependencies.getCodexControlStatus()),
+    ]);
+    const status = statusResult.status === 'fulfilled' ? statusResult.value : null;
+    if (!status?.ok || typeof status?.desktop?.running !== 'boolean') {
+      return editOriginal(dependencies, interaction, { content: 'Codex 桌面端状态暂不可用；本次未执行退出。', components: [] });
+    }
+    if (!status.desktop.running) {
+      return editOriginal(dependencies, interaction, { content: 'Codex 桌面端已经退出，无需再次操作。', components: [] });
+    }
+    const index = indexResult.status === 'fulfilled' ? indexResult.value : null;
+    if (!Array.isArray(index?.tasks)) {
+      return editOriginal(dependencies, interaction, {
+        ...renderTakeoverPreview(null, { desktopRunning: true, indexAvailable: false }),
+        components: [],
+      });
+    }
+    const currentSnapshot = buildTakeoverSnapshot(index, { targetThreadId: state.targetThreadId });
+    if (hasNewActiveTasks(state.snapshot, currentSnapshot)) {
+      return publishTakeoverConfirmation(dependencies, interaction, currentSnapshot, {
+        messageId: interaction?.message?.id,
+        newTasksDetected: true,
+      });
+    }
+    let result;
+    try {
+      result = await dependencies.stopCodexDesktop();
+    } catch {
+      result = null;
+    }
+    if (!result?.ok) {
+      return editOriginal(dependencies, interaction, { content: '退出 Codex 失败；未确认桌面端已停止，请稍后重试。', components: [] });
+    }
+    return editOriginal(dependencies, interaction, { content: 'Codex 桌面端已退出。', components: [] });
+  } finally {
+    routerState.takeoverInProgress = false;
+  }
+}
+
+function continuationTakeoverStateError(dependencies, interaction, state) {
+  const validated = validateTakeoverUiState(state, {
+    kind: 'takeover-continue',
+    userId: userId(interaction),
+    guildId: guildId(interaction),
+    nowMs: nowValue(dependencies),
+  });
+  if (!validated.ok) {
+    if (validated.reason === 'expired') return '此接管建议已过期，请重新执行 /继续任务。';
+    if (['wrong-user', 'wrong-guild'].includes(validated.reason)) return '此接管建议不属于当前用户或服务器，无权执行。';
+    return '此接管建议已使用、过期或无效，请重新执行 /继续任务。';
+  }
+  const componentMessageId = String(interaction?.message?.id ?? '');
+  if (!state.messageId || componentMessageId !== String(state.messageId)) {
+    return '此接管建议不属于当前消息或已失效。';
+  }
+  if (!state.queueId || !state.targetThreadId) return '此接管建议缺少安全绑定，已拒绝执行。';
+  return null;
+}
+
+async function keepContinuationQueued(dependencies, interaction, stateId) {
+  const state = dependencies.uiState.get(stateId);
+  const invalid = continuationTakeoverStateError(dependencies, interaction, state);
+  if (invalid) {
+    if (state && nowValue(dependencies) >= Number(state.expiresAt)) dependencies.uiState.delete(stateId);
+    return respond(dependencies, interaction, privateResponse(invalid));
+  }
+  dependencies.uiState.delete(stateId);
+  await deferMessageUpdate(dependencies, interaction);
+  return editOriginal(dependencies, interaction, {
+    content: '请求保持排队，可通过 /继续队列 查看或取消。',
+    components: [],
+  });
+}
+
+function continuationTakeoverResult(result) {
+  if (result?.status === 'started') {
+    const suffix = result?.turnId ? `本轮 ID：…${String(result.turnId).slice(-8)}` : '';
+    return `Codex 桌面端退出操作已完成，目标任务已开始继续执行。${suffix}`;
+  }
+  if (result?.status === 'queued') {
+    return 'Codex 桌面端退出操作已完成，但目标任务仍被占用；请求将继续排队。占用者可能是其他 CLI 或插件。';
+  }
+  if (result?.status === 'uncertain') {
+    return 'Codex 桌面端退出操作已完成，但目标任务的启动结果不确定；为避免重复执行不会自动重试，请打开原任务确认实际状态。';
+  }
+  return 'Codex 桌面端退出操作已完成，但目标任务没有成功立即继续；请通过 /继续队列 查看当前状态。';
+}
+
+async function confirmContinuationTakeover(dependencies, routerState, interaction, stateId) {
+  const state = dependencies.uiState.get(stateId);
+  const invalid = continuationTakeoverStateError(dependencies, interaction, state);
+  if (invalid) {
+    if (state && nowValue(dependencies) >= Number(state.expiresAt)) dependencies.uiState.delete(stateId);
+    return respond(dependencies, interaction, privateResponse(invalid));
+  }
+
+  dependencies.uiState.delete(stateId);
+  if (routerState.takeoverInProgress) {
+    return respond(dependencies, interaction, privateResponse('另一个退出操作正在执行；本接管建议未重复执行。'));
+  }
+  routerState.takeoverInProgress = true;
+  try {
+    await deferMessageUpdate(dependencies, interaction);
+    const [indexResult, statusResult] = await Promise.allSettled([
+      Promise.resolve().then(() => dependencies.refreshTaskIndex()),
+      Promise.resolve().then(() => dependencies.getCodexControlStatus()),
+    ]);
+    const status = statusResult.status === 'fulfilled' ? statusResult.value : null;
+    if (!status?.ok || typeof status?.desktop?.running !== 'boolean') {
+      return editOriginal(dependencies, interaction, queuedTakeoverUnavailable());
+    }
+    const index = indexResult.status === 'fulfilled' ? indexResult.value : null;
+    if (!Array.isArray(index?.tasks)) {
+      return editOriginal(dependencies, interaction, queuedTakeoverUnavailable('index-unavailable'));
+    }
+    const currentSnapshot = buildTakeoverSnapshot(index, { targetThreadId: state.targetThreadId });
+    if (status.desktop.running && hasNewActiveTasks(state.snapshot, currentSnapshot)) {
+      return publishContinuationTakeover(dependencies, interaction, {
+        queueId: state.queueId,
+        targetThreadId: state.targetThreadId,
+        snapshot: currentSnapshot,
+        messageId: interaction?.message?.id,
+        newTasksDetected: true,
+      });
+    }
+    let claim;
+    try {
+      claim = await dependencies.claimContinuationTakeover({
+        queueId: state.queueId,
+        targetThreadId: state.targetThreadId,
+      });
+    } catch {
+      claim = { status: 'failed', reason: 'state-persist-failed' };
+    }
+    if (claim?.status !== 'claimed') {
+      const content = claim?.status === 'unavailable'
+        ? '队列状态已变化，目标请求可能已经取消或由其他处理器接管；未退出 Codex，也未重复执行。'
+        : '无法安全锁定目标队列；未退出 Codex，目标请求将保持排队。';
+      return editOriginal(dependencies, interaction, { content, components: [] });
+    }
+    if (status.desktop.running) {
+      let stopResult;
+      try {
+        stopResult = await dependencies.stopCodexDesktop();
+      } catch {
+        stopResult = null;
+      }
+      if (!stopResult?.ok) {
+        let release;
+        try {
+          release = await dependencies.releaseContinuationTakeoverClaim(claim);
+        } catch {
+          release = { status: 'failed' };
+        }
+        const content = release?.status === 'queued'
+          ? '退出 Codex 失败；未确认桌面端已停止，目标任务已恢复为保持排队。'
+          : '退出 Codex 失败；未确认桌面端已停止，接管状态将在服务恢复时安全回到继续队列。';
+        return editOriginal(dependencies, interaction, {
+          content,
+          components: [],
+        });
+      }
+    }
+    let result;
+    try {
+      result = await dependencies.retryContinuation(claim);
+    } catch {
+      result = { status: 'failed' };
+    }
+    return editOriginal(dependencies, interaction, {
+      content: continuationTakeoverResult(result),
+      components: [],
+    });
+  } finally {
+    routerState.takeoverInProgress = false;
+  }
 }
 
 async function openContinuationModal(dependencies, interaction, record) {
@@ -1019,6 +1508,7 @@ async function handleCommand(dependencies, interaction) {
       return respond(dependencies, interaction, privateResponse('系统状态暂不可用，请稍后重试。'));
     }
   }
+  if (name === '退出Codex') return beginTakeoverExit(dependencies, interaction);
   if (name === '帮助') return respond(dependencies, interaction, privateResponse(renderHelp()));
   if (name === '系统测试') {
     const mode = optionValue(interaction, '类型') === '完整' ? '完整' : '快速';
@@ -1053,15 +1543,15 @@ function modalStateError(dependencies, interaction, state, kind = 'new-task') {
 
 function continuationReceipt(result) {
   if (result?.status === 'started') {
-    return `已开始继续执行。${result?.turnId ? `本轮 ID：…${String(result.turnId).slice(-8)}` : ''}`;
+    return `## 继续任务结果\n**状态：** 已开始继续执行${result?.turnId ? `\n**本轮 ID：** …${String(result.turnId).slice(-8)}` : ''}`;
   }
   if (result?.status === 'queued') {
-    return `已排队；目标任务释放后会自动送达。队列编号：…${String(result?.queueId ?? '').slice(-8)}`;
+    return `## 继续任务结果\n**状态：** 已排队\n目标任务释放后会自动送达。\n**队列编号：** …${String(result?.queueId ?? '').slice(-8)}`;
   }
   if (result?.status === 'uncertain') {
-    return 'Codex 启动结果不确定；为避免重复执行不会自动重试，请打开原任务确认实际状态。';
+    return '## 继续任务结果\n**状态：** 启动结果不确定\n为避免重复执行不会自动重试，请打开原任务确认实际状态。';
   }
-  return '没有成功续接原 Codex 任务；不会新建任务，请稍后重试。';
+  return '## 继续任务结果\n**状态：** 续接失败\n没有成功续接原 Codex 任务；不会新建任务，请稍后重试。';
 }
 
 async function handleContinueModal(dependencies, submissions, interaction, stateId, state) {
@@ -1078,7 +1568,12 @@ async function handleContinueModal(dependencies, submissions, interaction, state
     const submissionInteractionId = String(interaction.id);
     const promise = (async () => {
       const record = findTask(dependencies, state.threadId);
-      if (!record) return '任务不存在或已不再是侧边栏主任务，未发送继续内容。';
+      if (!record) {
+        return {
+          result: { status: 'failed', reason: 'not-found' },
+          payload: { content: '任务不存在或已不再是侧边栏主任务，未发送继续内容。' },
+        };
+      }
       let request;
       try {
         request = createContinuationRequest({
@@ -1087,23 +1582,48 @@ async function handleContinueModal(dependencies, submissions, interaction, state
           threadId: record.threadId,
           cwd: record.worktreePath,
           text: continuationText,
+          guildId: guildId(interaction),
+          channelId: channelId(interaction),
+          projectId: record.projectId,
+          projectName: record.projectName,
           createdAt: new Date(nowValue(dependencies)).toISOString(),
         });
       } catch {
-        return '继续内容无效，未发送。';
+        return {
+          result: { status: 'failed', reason: 'invalid-request' },
+          payload: { content: '继续内容无效，未发送。' },
+        };
       }
+      let result;
       try {
-        return continuationReceipt(await dependencies.dispatchContinuation(request));
+        result = await dependencies.dispatchContinuation(request);
       } catch {
-        return continuationReceipt({ status: 'failed' });
+        result = { status: 'failed' };
       }
+      return {
+        result,
+        payload: { content: continuationReceipt(result) },
+        targetThreadId: String(record.threadId),
+      };
     })();
     submission = { interactionId: submissionInteractionId, promise };
     submissions.set(stateId, submission);
-    promise.then((receipt) => { submission.receipt = receipt; }).catch(() => {});
+    promise.then((outcome) => { submission.outcome = outcome; }).catch(() => {});
   }
-  const receipt = submission.receipt ?? await submission.promise;
-  return editOriginal(dependencies, interaction, { content: receipt });
+  const outcome = submission.outcome ?? await submission.promise;
+  if (outcome?.result?.status === 'queued' && outcome?.result?.reason === 'active-writer') {
+    submission.takeoverPromise ??= (async () => {
+      const inspection = await inspectQueuedTakeover(dependencies, outcome.targetThreadId);
+      if (!inspection.available) return editOriginal(dependencies, interaction, inspection.payload);
+      return publishContinuationTakeover(dependencies, interaction, {
+        queueId: outcome.result.queueId,
+        targetThreadId: outcome.targetThreadId,
+        snapshot: inspection.snapshot,
+      });
+    })();
+    return submission.takeoverPromise;
+  }
+  return editOriginal(dependencies, interaction, outcome.payload);
 }
 
 async function handleModal(dependencies, submissions, interaction) {
@@ -1168,6 +1688,13 @@ async function handleModal(dependencies, submissions, interaction) {
           fileSystem: dependencies.fileSystem,
           persistState: dependencies.persistCreationState,
           now: new Date(nowValue(dependencies)),
+          discordOrigin: {
+            guildId: guildId(interaction),
+            channelId: channelId(interaction),
+            source: 'new-task',
+            projectId: selection.projectId,
+            projectName: selection.projectName,
+          },
         });
       } catch {
         return '任务创建失败；未创建可继续的任务。请检查系统状态后重试。';
@@ -1180,7 +1707,7 @@ async function handleModal(dependencies, submissions, interaction) {
     promise.then((receipt) => { submission.receipt = receipt; }).catch(() => {});
   }
   const receipt = submission.receipt ?? await submission.promise;
-  return editOriginal(dependencies, interaction, { content: receipt });
+  return deliverCreationReceipt(dependencies, interaction, receipt);
 }
 
 function componentStateError(dependencies, interaction, state) {
@@ -1190,8 +1717,18 @@ function componentStateError(dependencies, interaction, state) {
   return null;
 }
 
-async function handleComponent(dependencies, interaction) {
+async function handleComponent(dependencies, interaction, routerState) {
   const customId = String(interaction?.data?.custom_id ?? '');
+  const takeoverContinue = customId.match(/^takeover-continue:([A-Za-z0-9_-]{16})$/u);
+  if (takeoverContinue) {
+    return confirmContinuationTakeover(dependencies, routerState, interaction, takeoverContinue[1]);
+  }
+  const takeoverKeep = customId.match(/^takeover-keep:([A-Za-z0-9_-]{16})$/u);
+  if (takeoverKeep) return keepContinuationQueued(dependencies, interaction, takeoverKeep[1]);
+  const takeoverConfirm = customId.match(/^takeover-confirm:([A-Za-z0-9_-]{16})$/u);
+  if (takeoverConfirm) return confirmTakeoverExit(dependencies, routerState, interaction, takeoverConfirm[1]);
+  const takeoverCancel = customId.match(/^takeover-cancel:([A-Za-z0-9_-]{16})$/u);
+  if (takeoverCancel) return cancelTakeoverExit(dependencies, interaction, takeoverCancel[1]);
   const cancelMatch = customId.match(/^cancel:([A-Za-z0-9_-]{16})$/u);
   if (cancelMatch) {
     const state = dependencies.uiState.get(cancelMatch[1]);
@@ -1259,7 +1796,10 @@ function isStateMutationInteraction(interaction) {
   const customId = String(interaction?.data?.custom_id ?? '');
   if ([2, 4].includes(type)) return ['新建任务', '继续任务'].includes(name);
   if (type === 5) return customId.startsWith('new:') || customId.startsWith('continue:');
-  if (type === 3) return customId.startsWith('cancel:') || customId.startsWith('continue-open:');
+  if (type === 3) {
+    return customId.startsWith('cancel:') || customId.startsWith('continue-open:') ||
+      customId.startsWith('takeover-continue:');
+  }
   return false;
 }
 
@@ -1267,6 +1807,7 @@ function isStateMutationInteraction(interaction) {
 export function createInteractionRouter(dependencies = {}) {
   dependencies.uiState ??= new Map();
   const submissions = new Map();
+  const routerState = { takeoverInProgress: false };
 
   return {
     async handle(interaction) {
@@ -1292,7 +1833,7 @@ export function createInteractionRouter(dependencies = {}) {
       }
       if (Number(interaction?.type) === 2) return handleCommand(dependencies, interaction);
       if (Number(interaction?.type) === 5) return handleModal(dependencies, submissions, interaction);
-      if (Number(interaction?.type) === 3) return handleComponent(dependencies, interaction);
+      if (Number(interaction?.type) === 3) return handleComponent(dependencies, interaction, routerState);
       return respond(dependencies, interaction, privateResponse('不支持的交互类型。'));
     },
     sweepExpiredUiState(at = nowValue(dependencies)) {

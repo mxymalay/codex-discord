@@ -1,0 +1,565 @@
+[CmdletBinding()]
+param()
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+$sourceRoot = Split-Path -Parent $PSScriptRoot
+. (Join-Path $sourceRoot 'codex-control-lib.ps1')
+
+$programFiles = [Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFiles)
+$trusted = Join-Path $programFiles 'WindowsApps\OpenAI.Codex_1.2.3.0_x64__publisher\app\ChatGPT.exe'
+$trustedChild = $trusted
+
+if (-not (Test-CodexDesktopRootPath -Path $trusted)) {
+    throw 'trusted Store ChatGPT path was not accepted'
+}
+$boundStartTime = ConvertTo-ControlCreationTime -Value '20260901120000.000000+480'
+if (-not (Test-CodexBoundProcessIdentity -BoundProcess ([pscustomobject]@{ ProcessId=42; StartTimeUtc=$boundStartTime.UtcDateTime }) -ProcessId 42 -CreationDate '20260901120000.000000+480')) {
+    throw 'bound process identity did not validate a held process object start time'
+}
+foreach ($tickRemainder in 1..9) {
+    if (-not (Test-CodexBoundProcessIdentity -BoundProcess ([pscustomobject]@{ ProcessId=42; StartTimeUtc=$boundStartTime.UtcDateTime.AddTicks($tickRemainder) }) -ProcessId 42 -CreationDate '20260901120000.000000+480')) {
+        throw "bound process identity rejected the same CIM-microsecond process at +$tickRemainder ticks"
+    }
+}
+foreach ($differentMicrosecond in @(10, 11, 19, 20)) {
+    if (Test-CodexBoundProcessIdentity -BoundProcess ([pscustomobject]@{ ProcessId=42; StartTimeUtc=$boundStartTime.UtcDateTime.AddTicks($differentMicrosecond) }) -ProcessId 42 -CreationDate '20260901120000.000000+480') {
+        throw "bound process identity accepted a process created +$differentMicrosecond ticks later"
+    }
+}
+foreach ($untrustedPath in @(
+    'D:\Program Files\WindowsApps\OpenAI.Codex_1.2.3.0_x64__publisher\app\ChatGPT.exe',
+    (Join-Path $programFiles 'WindowsApps\OpenAI.Codex_1.2.3.0_x64__publisher\app\ChatGPT.exe\child.exe'),
+    (Join-Path $programFiles 'WindowsApps\OpenAI.Other_1.2.3.0_x64__publisher\app\ChatGPT.exe')
+)) {
+    if (Test-CodexDesktopRootPath -Path $untrustedPath) {
+        throw "ambiguous or non-Codex Store path was accepted: $untrustedPath"
+    }
+}
+
+$processes = @(
+    [pscustomobject]@{ ProcessId=100; ParentProcessId=10; Name='ChatGPT.exe'; ExecutablePath=$trusted; CreationDate='20260901120000.000000+480' },
+    [pscustomobject]@{ ProcessId=101; ParentProcessId=100; Name='codex.exe'; ExecutablePath='C:\Users\test\AppData\Local\OpenAI\Codex\bin\v\codex.exe'; CreationDate='20260901120001.000000+480' },
+    [pscustomobject]@{ ProcessId=102; ParentProcessId=100; Name='ChatGPT.exe'; ExecutablePath=$trustedChild; CreationDate='20260901120002.000000+480' },
+    [pscustomobject]@{ ProcessId=103; ParentProcessId=102; Name='utility.exe'; ExecutablePath=$trustedChild; CreationDate='20260901120003.000000+480' },
+    [pscustomobject]@{ ProcessId=200; ParentProcessId=10; Name='codex.exe'; ExecutablePath='C:\tools\codex.exe'; CreationDate='20260901120004.000000+480' }
+)
+$plan = Get-CodexDesktopProcessPlan -Processes $processes
+if ((@($plan.Roots).ProcessId -join ',') -ne '100') { throw 'trusted root selection included a Store helper or missed root' }
+if ((@($plan.ProcessIds) -join ',') -ne '100,101,102,103') { throw 'tree boundary is wrong' }
+if ($plan.CreationTimes[100] -ne '20260901120000.000000+480') { throw 'root creation time was not captured for revalidation' }
+
+$invalidPackageParent = @(
+    [pscustomobject]@{ ProcessId=200; ParentProcessId=10; Name='ChatGPT.exe'; ExecutablePath=$trusted; CreationDate=$null },
+    [pscustomobject]@{ ProcessId=201; ParentProcessId=200; Name='ChatGPT.exe'; ExecutablePath=$trusted; CreationDate='20260901130001.000000+480' }
+)
+$invalidPackageParentPlan = Get-CodexDesktopProcessPlan -Processes $invalidPackageParent
+if (@($invalidPackageParentPlan.Roots).Count -ne 0) {
+    throw 'canonical renderer was promoted to a root when its same-package parent was unverifiable'
+}
+
+$reusedDesktopParent = @(
+    [pscustomobject]@{ ProcessId=100; ParentProcessId=10; Name='ChatGPT.exe'; ExecutablePath=$trusted; CreationDate='20260901130000.000000+480' },
+    [pscustomobject]@{ ProcessId=500; ParentProcessId=10; Name='node.exe'; ExecutablePath='C:\Program Files\nodejs\node.exe'; CreationDate='20260901110000.000000+480' },
+    [pscustomobject]@{ ProcessId=101; ParentProcessId=100; Name='codex.exe'; ExecutablePath='C:\Users\test\AppData\Local\OpenAI\Codex\bin\v\codex.exe'; CreationDate='20260901120000.000000+480' }
+)
+$reusedDesktopParentPlan = Get-CodexDesktopProcessPlan -Processes $reusedDesktopParent
+if (-not $reusedDesktopParentPlan.PSObject.Properties['IsValid'] -or $reusedDesktopParentPlan.IsValid) {
+    throw 'bridge app-server with an old reused parent PID did not invalidate the desktop tree'
+}
+
+function Assert-UnverifiableCodexTreeFailsBeforeOperations {
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][object[]]$Processes
+    )
+
+    $invalidPlan = Get-CodexDesktopProcessPlan -Processes $Processes
+    if (-not $invalidPlan.PSObject.Properties['IsValid'] -or $invalidPlan.IsValid) {
+        throw "$Name did not invalidate the Codex process plan"
+    }
+    $callState = [pscustomobject]@{ open=0; close=0; stop=0 }
+    $invalidResult = Stop-CodexDesktop -Operations @{
+        GetProcesses = { $Processes }
+        OpenProcess = { param($processId) $callState.open++; throw 'invalid tree must not open a process' }
+        RequestClose = { param($bound) $callState.close++ }
+        StopProcess = { param($bound) $callState.stop++ }
+        Sleep = { param($milliseconds) }
+    } -GraceMilliseconds 0
+    if ($invalidResult.ok -or $callState.open -ne 0 -or $callState.close -ne 0 -or $callState.stop -ne 0) {
+        throw "$Name performed a process operation after tree verification failed"
+    }
+}
+
+Assert-UnverifiableCodexTreeFailsBeforeOperations -Name 'same-package parent with invalid ParentProcessId' -Processes @(
+    [pscustomobject]@{ ProcessId=210; ParentProcessId='invalid'; Name='ChatGPT.exe'; ExecutablePath=$trusted; CreationDate='20260901130000.000000+480' },
+    [pscustomobject]@{ ProcessId=211; ParentProcessId=210; Name='ChatGPT.exe'; ExecutablePath=$trusted; CreationDate='20260901130001.000000+480' }
+)
+Assert-UnverifiableCodexTreeFailsBeforeOperations -Name 'trusted root with missing ParentProcessId' -Processes @(
+    [pscustomobject]@{ ProcessId=215; ParentProcessId=$null; Name='ChatGPT.exe'; ExecutablePath=$trusted; CreationDate='20260901130000.000000+480' }
+)
+Assert-UnverifiableCodexTreeFailsBeforeOperations -Name 'direct descendant with invalid CreationDate' -Processes @(
+    [pscustomobject]@{ ProcessId=220; ParentProcessId=10; Name='ChatGPT.exe'; ExecutablePath=$trusted; CreationDate='20260901130000.000000+480' },
+    [pscustomobject]@{ ProcessId=221; ParentProcessId=220; Name='codex.exe'; ExecutablePath='C:\Users\test\AppData\Local\OpenAI\Codex\bin\v\codex.exe'; CreationDate='invalid' }
+)
+Assert-UnverifiableCodexTreeFailsBeforeOperations -Name 'deep descendant with invalid CreationDate' -Processes @(
+    [pscustomobject]@{ ProcessId=230; ParentProcessId=10; Name='ChatGPT.exe'; ExecutablePath=$trusted; CreationDate='20260901130000.000000+480' },
+    [pscustomobject]@{ ProcessId=231; ParentProcessId=230; Name='renderer.exe'; ExecutablePath=$trusted; CreationDate='20260901130001.000000+480' },
+    [pscustomobject]@{ ProcessId=232; ParentProcessId=231; Name='utility.exe'; ExecutablePath=$trusted; CreationDate='invalid' }
+)
+$invalidExecutablePath = 'C:\invalid' + [char]0
+Assert-UnverifiableCodexTreeFailsBeforeOperations -Name 'direct descendant with missing ExecutablePath' -Processes @(
+    [pscustomobject]@{ ProcessId=240; ParentProcessId=10; Name='ChatGPT.exe'; ExecutablePath=$trusted; CreationDate='20260901130000.000000+480' },
+    [pscustomobject]@{ ProcessId=241; ParentProcessId=240; Name='codex.exe'; ExecutablePath=$null; CreationDate='20260901130001.000000+480' }
+)
+Assert-UnverifiableCodexTreeFailsBeforeOperations -Name 'deep descendant with an unnormalizable ExecutablePath' -Processes @(
+    [pscustomobject]@{ ProcessId=250; ParentProcessId=10; Name='ChatGPT.exe'; ExecutablePath=$trusted; CreationDate='20260901130000.000000+480' },
+    [pscustomobject]@{ ProcessId=251; ParentProcessId=250; Name='renderer.exe'; ExecutablePath=$trusted; CreationDate='20260901130001.000000+480' },
+    [pscustomobject]@{ ProcessId=252; ParentProcessId=251; Name='utility.exe'; ExecutablePath=$invalidExecutablePath; CreationDate='20260901130002.000000+480' }
+)
+
+$events = [System.Collections.Generic.List[string]]::new()
+$boundProcesses = @{}
+$boundProcessState = [pscustomobject]@{ nextId = 0 }
+$ops = @{
+    GetProcesses = { $processes }
+    OpenProcess = {
+        param($processId)
+        $boundProcessState.nextId++
+        $process = @($processes | Where-Object { $_.ProcessId -eq $processId })[0]
+        $bound = [pscustomobject]@{ ProcessId=$processId; CreationDate=$process.CreationDate; bindingId=$boundProcessState.nextId }
+        $boundProcesses[$bound.bindingId] = $bound
+        return $bound
+    }
+    RequestClose = { param($bound) if (-not [object]::ReferenceEquals($boundProcesses[$bound.bindingId], $bound)) { throw 'close did not receive the bound process object' }; $events.Add("close:$($bound.bindingId)"); $false }
+    StopProcess = { param($bound) if (-not [object]::ReferenceEquals($boundProcesses[$bound.bindingId], $bound)) { throw 'stop did not receive the bound process object' }; $events.Add("stop:$($bound.ProcessId):$($bound.CreationDate):$($bound.bindingId)") }
+    Sleep = { param($milliseconds) $events.Add("sleep:${milliseconds}") }
+}
+$result = Stop-CodexDesktop -Operations $ops -GraceMilliseconds 10
+if (-not $result.ok -or $result.stoppedProcessCount -ne 4) { throw 'verified tree was not stopped' }
+$rootStop = @($events | ForEach-Object { if ($_ -like 'stop:100:20260901120000.000000+480:*') { $_ } })[0]
+foreach ($childStop in @(
+    'stop:101:20260901120001.000000+480:*',
+    'stop:102:20260901120002.000000+480:*',
+    'stop:103:20260901120003.000000+480:*'
+)) {
+    $matchedChildStop = @($events | ForEach-Object { if ($_ -like $childStop) { $_ } })[0]
+    if ($null -eq $matchedChildStop -or $events.IndexOf($matchedChildStop) -gt $events.IndexOf($rootStop)) {
+        throw 'verified descendants did not stop before the root'
+    }
+}
+if (@($events | Where-Object { $_ -like 'stop:200:*' }).Count -ne 0) { throw 'untrusted codex process was stopped' }
+
+$reusedEvents = [System.Collections.Generic.List[string]]::new()
+$reusedResult = Stop-CodexDesktop -Operations @{
+    GetProcesses = { $reusedDesktopParent }
+    OpenProcess = { param($processId) $process = @($reusedDesktopParent | Where-Object { $_.ProcessId -eq $processId })[0]; [pscustomobject]@{ ProcessId=$processId; CreationDate=$process.CreationDate } }
+    RequestClose = { param($bound) $reusedEvents.Add("close:$($bound.ProcessId)") }
+    StopProcess = { param($bound) $reusedEvents.Add("stop:$($bound.ProcessId)") }
+    Sleep = { param($milliseconds) }
+} -GraceMilliseconds 0
+if ($reusedResult.ok -or $reusedEvents.Count -ne 0) {
+    throw 'bridge app-server tree did not fail closed after its old desktop parent PID was reused'
+}
+
+$changedRoot = @(
+    [pscustomobject]@{ ProcessId=100; ParentProcessId=10; Name='ChatGPT.exe'; ExecutablePath=$trusted; CreationDate='20260901130000.000000+480' }
+)
+$revalidationState = [pscustomobject]@{ callCount = 0 }
+$revalidationEvents = [System.Collections.Generic.List[string]]::new()
+$revalidationOps = @{
+    GetProcesses = { $revalidationState.callCount++; if ($revalidationState.callCount -eq 1) { $processes } else { $changedRoot } }
+    OpenProcess = { param($processId) $process = @($processes | Where-Object { $_.ProcessId -eq $processId })[0]; [pscustomobject]@{ ProcessId=$processId; CreationDate=$process.CreationDate } }
+    RequestClose = { param($bound) $revalidationEvents.Add("close:$($bound.ProcessId)"); $true }
+    StopProcess = { param($bound) $revalidationEvents.Add("stop:$($bound.ProcessId):$($bound.CreationDate)") }
+    Sleep = { param($milliseconds) $revalidationEvents.Add("sleep:${milliseconds}") }
+}
+$revalidationResult = Stop-CodexDesktop -Operations $revalidationOps -GraceMilliseconds 0
+if ($revalidationResult.ok -or @($revalidationEvents | Where-Object { $_ -like 'stop:*' }).Count -ne 0) {
+    throw 'PID reuse with a changed creation time did not fail closed'
+}
+
+$untrustedOnly = @([pscustomobject]@{ ProcessId=300; ParentProcessId=1; Name='ChatGPT.exe'; ExecutablePath='D:\WindowsApps\OpenAI.Codex_x\app\ChatGPT.exe'; CreationDate='20260901140000.000000+480' })
+$untrustedEvents = [System.Collections.Generic.List[string]]::new()
+$untrustedResult = Stop-CodexDesktop -Operations @{
+    GetProcesses = { $untrustedOnly }
+    OpenProcess = { param($processId) throw 'untrusted process must not be opened' }
+    RequestClose = { param($bound) $untrustedEvents.Add("close:$($bound.ProcessId)") }
+    StopProcess = { param($bound) $untrustedEvents.Add("stop:$($bound.ProcessId)") }
+    Sleep = { param($milliseconds) $untrustedEvents.Add("sleep:${milliseconds}") }
+} -GraceMilliseconds 0
+if (-not $untrustedResult.ok -or -not $untrustedResult.alreadyStopped -or $untrustedEvents.Count -ne 0) {
+    throw 'ambiguous path did not fail closed without a stop operation'
+}
+
+$status = Get-CodexControlStatus -Operations @{ GetProcesses = { $processes } } -ToolDir $sourceRoot
+if (-not $status.ok -or -not $status.codexDesktop.running -or $status.codexDesktop.processCount -ne 4) {
+    throw 'control status did not report the trusted process plan'
+}
+
+function New-FakeBridgeOperations {
+    param([Parameter(Mandatory)][hashtable]$State)
+
+    $operations = @{
+        GetTask = { [pscustomobject]@{ installed=$State.installed; enabled=$State.enabled; running=($State.running -and $State.mode -eq 'scheduled') } }
+        GetProcesses = {
+            if (-not $State.running) { return @() }
+            return @([pscustomobject]@{ ProcessId=501; CreationTimeUtc='2026-09-01T12:00:00.0000000Z' })
+        }
+        GetRuntime = {
+            if (-not $State.running) { return $null }
+            return [pscustomobject]@{ processId=501; creationTimeUtc='2026-09-01T12:00:00.0000000Z'; mode=$State.mode }
+        }
+        InstallTask = { $State.installed=$true }
+        EnableTask = { $State.enabled=$true }
+        DisableTask = { $State.enabled=$false }
+        StartTask = { $State.running=$true; $State.mode='scheduled' }
+        StopTask = { $State.running=$false; $State.mode=$null }
+        StartDetached = { param($startupPath,$mode) $State.running=$true; $State.mode=$mode }
+        StopRuntime = { param($runtime) if ($runtime.processId -ne 501) { throw 'wrong runtime stopped' }; $State.running=$false; $State.mode=$null }
+    }
+    foreach ($name in @($operations.Keys)) { $operations[$name] = $operations[$name].GetNewClosure() }
+    return $operations
+}
+
+$bridgeRuntimeRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('codex-bridge-runtime-' + [guid]::NewGuid().ToString('N'))
+try {
+    New-Item -ItemType Directory -Path $bridgeRuntimeRoot -Force | Out-Null
+    $runtimePath = Join-Path $bridgeRuntimeRoot 'discord-bridge-runtime.json'
+    [void](Write-BridgeRuntimeIdentity -Path $runtimePath -Mode temporary -ProcessId 501 -CreationTimeUtc '2026-09-01T12:00:00.0000000Z' -ToolDir $bridgeRuntimeRoot)
+    $runtime = Read-ValidatedBridgeRuntimeIdentity -Path $runtimePath -Processes @([pscustomobject]@{ ProcessId=501; CreationTimeUtc='2026-09-01T12:00:00.0000000Z' }) -ToolDir $bridgeRuntimeRoot
+    if ($null -eq $runtime -or $runtime.mode -ne 'temporary' -or $runtime.processId -ne 501) {
+        throw 'runtime identity did not validate its matching synthetic supervisor'
+    }
+    if ($null -ne (Read-ValidatedBridgeRuntimeIdentity -Path $runtimePath -Processes @([pscustomobject]@{ ProcessId=501; CreationTimeUtc='2026-09-01T12:00:01.0000000Z' }) -ToolDir $bridgeRuntimeRoot)) {
+        throw 'runtime identity accepted a reused PID with a different creation time'
+    }
+    if ($null -ne (Read-ValidatedBridgeRuntimeIdentity -Path $runtimePath -Processes @([pscustomobject]@{ ProcessId=501; CreationTimeUtc='2026-09-01T12:00:00.0000000Z' }) -ToolDir (Join-Path $bridgeRuntimeRoot 'other-tool-dir'))) {
+        throw 'runtime identity accepted a different tool directory'
+    }
+    [void](Remove-BridgeRuntimeIdentity -Path $runtimePath -ExpectedProcessId 502)
+    if (-not (Test-Path -LiteralPath $runtimePath)) { throw 'runtime cleanup removed a different supervisor identity' }
+    [void](Remove-BridgeRuntimeIdentity -Path $runtimePath -ExpectedProcessId 501)
+    if (Test-Path -LiteralPath $runtimePath) { throw 'runtime cleanup did not remove its matching supervisor identity' }
+}
+finally {
+    Remove-Item -LiteralPath $bridgeRuntimeRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+$bridgeState = @{ installed=$false; enabled=$false; running=$false; mode=$null }
+$bridgeOps = New-FakeBridgeOperations -State $bridgeState
+$startTemporary = Invoke-CodexBridgeServiceAction -Action 'start-temporary' -ToolDir $sourceRoot -Operations $bridgeOps
+if (-not $startTemporary.ok) { throw "temporary start failed: $($startTemporary.errorCategory)" }
+if (-not $bridgeState.running -or $bridgeState.enabled -or $bridgeState.mode -ne 'temporary') { throw 'temporary start changed long-term setting or did not use detached ownership' }
+$enableLongTerm = Invoke-CodexBridgeServiceAction -Action 'enable-long-term' -ToolDir $sourceRoot -Operations $bridgeOps
+if (-not $enableLongTerm.ok) { throw "long-term enable failed: $($enableLongTerm.errorCategory)" }
+if (-not $bridgeState.running -or -not $bridgeState.enabled -or $bridgeState.mode -ne 'scheduled') { throw 'long-term enable did not adopt scheduled ownership' }
+$stopTemporary = Invoke-CodexBridgeServiceAction -Action 'stop-temporary' -ToolDir $sourceRoot -Operations $bridgeOps
+if (-not $stopTemporary.ok) { throw "temporary stop failed: $($stopTemporary.errorCategory)" }
+if ($bridgeState.running -or -not $bridgeState.enabled) { throw 'temporary stop changed long-term setting' }
+$disableLongTerm = Invoke-CodexBridgeServiceAction -Action 'disable-long-term' -ToolDir $sourceRoot -Operations $bridgeOps
+if (-not $disableLongTerm.ok) { throw "long-term disable failed: $($disableLongTerm.errorCategory)" }
+if ($bridgeState.running -or $bridgeState.enabled) { throw 'long-term disable did not persist' }
+
+function Get-ScheduledTask {
+    param([string]$TaskPath, [string]$TaskName, [object]$ErrorAction)
+    [pscustomobject]@{
+        TaskPath = $TaskPath
+        TaskName = $TaskName
+        State = 'Disabled'
+        Settings = [pscustomobject]@{ AllowDemandStart=$true }
+        Actions = @([pscustomobject]@{ Execute='pwsh.exe'; Arguments='-NoProfile -File "ignored.ps1"' })
+        Principal = [pscustomobject]@{ UserId='operator' }
+        Triggers = @([pscustomobject]@{ Enabled=$true })
+    }
+}
+function Export-ScheduledTask { param([string]$TaskPath, [string]$TaskName, [object]$ErrorAction); '<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"><Settings><Enabled>false</Enabled></Settings></Task>' }
+try {
+    $productionTaskOperations = New-CodexControlOperations
+    $disabledBridgeTask = & $productionTaskOperations.GetTask
+    $disabledGuardTask = & $productionTaskOperations.GetNotificationGuardTask
+}
+finally {
+    Remove-Item Function:Get-ScheduledTask -Force
+    Remove-Item Function:Export-ScheduledTask -Force
+}
+if ($disabledBridgeTask.enabled -or $disabledGuardTask.enabled) { throw 'production task status did not recognize the ScheduledTask Disabled state' }
+
+$guardState = @{ exists=$true; enabled=$true; running=$true; actions=0 }
+$trustedGuardAction = [pscustomobject]@{
+    Execute = 'C:\Program Files\PowerShell\7\pwsh.exe'
+    Arguments = '-NoProfile -File "' + (Join-Path $sourceRoot 'watch-notify.ps1') + '"'
+    WorkingDirectory = $sourceRoot
+}
+$guardCurrentIdentity = [pscustomobject]@{Name='CONTOSO\operator';Sid='S-1-5-21-1000'}
+$guardScriptXml = [System.Security.SecurityElement]::Escape((Join-Path $sourceRoot 'watch-notify.ps1'))
+$guardToolXml = [System.Security.SecurityElement]::Escape($sourceRoot)
+$guardPowerShellXml = 'C:\Program Files\PowerShell\7\pwsh.exe'
+$guardDefinitionXml = '<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"><Principals><Principal id="Author"><UserId>S-1-5-21-1000</UserId><LogonType>InteractiveToken</LogonType></Principal></Principals><Triggers><LogonTrigger><Enabled>true</Enabled><UserId>CONTOSO\operator</UserId></LogonTrigger></Triggers><Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><Enabled>true</Enabled><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><RestartOnFailure><Interval>PT2S</Interval><Count>3</Count></RestartOnFailure></Settings><Actions Context="Author"><Exec><Command>' + $guardPowerShellXml + '</Command><Arguments>-NoProfile -File &quot;' + $guardScriptXml + '&quot;</Arguments><WorkingDirectory>' + $guardToolXml + '</WorkingDirectory></Exec></Actions></Task>'
+$guardDefinitionState = @{Xml=$guardDefinitionXml}
+$guardOperations = @{
+    GetNotificationGuardTask = {
+        if (-not $guardState.exists) { return $null }
+        [pscustomobject]@{ enabled=$guardState.enabled; running=$guardState.running; actions=@($trustedGuardAction); taskPath='\'; taskName='Codex ntfy Notification Guard'; principal=[pscustomobject]@{UserId='S-1-5-21-1000';LogonType='Interactive';RunLevel='Limited'}; triggers=@('logon'); settings=[pscustomobject]@{RestartCount=3}; definitionXml=$guardDefinitionState.Xml }
+    }
+    GetPowerShellPath = { 'C:\Program Files\PowerShell\7\pwsh.exe' }
+    GetCurrentUserIdentity = { $guardCurrentIdentity }
+    StopNotificationGuardTask = { $guardState.actions++; $guardState.running=$false }
+    StartNotificationGuardTask = { $guardState.actions++; $guardState.running=$true }
+    EnableNotificationGuardTask = { $guardState.actions++; $guardState.enabled=$true }
+    DisableNotificationGuardTask = { $guardState.actions++; $guardState.enabled=$false }
+}
+foreach ($name in @($guardOperations.Keys)) { $guardOperations[$name] = $guardOperations[$name].GetNewClosure() }
+$guardStatus = Get-CodexNotificationGuardStatus -Operations $guardOperations -ToolDir $sourceRoot
+if (-not $guardStatus.ok -or -not $guardStatus.exists -or -not $guardStatus.trusted -or -not $guardStatus.enabled -or -not $guardStatus.running) {
+    throw 'notification guard status did not retain its trusted exact task state'
+}
+$disabledDefinition = $guardDefinitionXml.Replace('<Enabled>true</Enabled><RestartOnFailure>', '<Enabled>false</Enabled><RestartOnFailure>')
+if ((Get-CodexNotificationGuardDefinitionHash -DefinitionXml $guardDefinitionXml) -cne (Get-CodexNotificationGuardDefinitionHash -DefinitionXml $disabledDefinition)) {
+    throw 'notification guard definition hash changed for the deployment-managed enabled bit'
+}
+$missingEnabledDefinition = $guardDefinitionXml.Replace('<Enabled>true</Enabled><ExecutionTimeLimit>', '<ExecutionTimeLimit>')
+if ((Get-CodexNotificationGuardDefinitionHash -DefinitionXml $guardDefinitionXml) -cne (Get-CodexNotificationGuardDefinitionHash -DefinitionXml $missingEnabledDefinition)) {
+    throw 'notification guard definition hash changed when the deployment-managed Enabled node was absent'
+}
+$extraTriggerDefinition = $guardDefinitionXml.Replace('</Triggers>', '<TimeTrigger><StartBoundary>2030-01-01T00:00:00</StartBoundary></TimeTrigger></Triggers>')
+if ((Get-CodexNotificationGuardDefinitionHash -DefinitionXml $guardDefinitionXml) -ceq (Get-CodexNotificationGuardDefinitionHash -DefinitionXml $extraTriggerDefinition)) {
+    throw 'notification guard definition hash ignored an additional trigger'
+}
+$restartChangedDefinition = $guardDefinitionXml.Replace('<Count>3</Count>', '<Count>99</Count>')
+if ((Get-CodexNotificationGuardDefinitionHash -DefinitionXml $guardDefinitionXml) -ceq (Get-CodexNotificationGuardDefinitionHash -DefinitionXml $restartChangedDefinition)) {
+    throw 'notification guard definition hash ignored restart settings'
+}
+$guardDefinitionState.Xml = $extraTriggerDefinition
+$extraTriggerStatus = Get-CodexNotificationGuardStatus -Operations $guardOperations -ToolDir $sourceRoot
+if ($extraTriggerStatus.trusted) { throw 'notification guard accepted an additional trigger' }
+$guardDefinitionState.Xml = $guardDefinitionXml.Replace('<UserId>S-1-5-21-1000</UserId><LogonType>', '<UserId>S-1-5-18</UserId><LogonType>')
+$wrongPrincipalStatus = Get-CodexNotificationGuardStatus -Operations $guardOperations -ToolDir $sourceRoot
+if ($wrongPrincipalStatus.trusted) { throw 'notification guard accepted a different or elevated principal' }
+$guardDefinitionState.Xml = $guardDefinitionXml.Replace('<Enabled>true</Enabled><UserId>CONTOSO\operator</UserId></LogonTrigger>', '<Enabled>true</Enabled><UserId>CONTOSO\other</UserId></LogonTrigger>')
+$wrongTriggerUserStatus = Get-CodexNotificationGuardStatus -Operations $guardOperations -ToolDir $sourceRoot
+if ($wrongTriggerUserStatus.trusted) { throw 'notification guard accepted another user logon trigger' }
+$guardDefinitionState.Xml = $guardDefinitionXml.Replace('</LogonType>', '</LogonType><RunLevel>HighestAvailable</RunLevel>')
+$elevatedRunLevelStatus = Get-CodexNotificationGuardStatus -Operations $guardOperations -ToolDir $sourceRoot
+if ($elevatedRunLevelStatus.trusted) { throw 'notification guard accepted an elevated run level' }
+$guardDefinitionState.Xml = $guardDefinitionXml.Replace('<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>', '<MultipleInstancesPolicy>Parallel</MultipleInstancesPolicy>')
+$parallelGuardStatus = Get-CodexNotificationGuardStatus -Operations $guardOperations -ToolDir $sourceRoot
+if ($parallelGuardStatus.trusted) { throw 'notification guard accepted unsafe multiple-instance settings' }
+$guardDefinitionState.Xml = $guardDefinitionXml
+$originalGuardDisable = $guardOperations.DisableNotificationGuardTask
+$guardOperations.DisableNotificationGuardTask = {
+    $guardState.actions++
+    $guardState.enabled = $false
+    $guardDefinitionState.Xml = $guardDefinitionXml.Replace('<Count>3</Count>', '<Count>4</Count>')
+}.GetNewClosure()
+$guardDefinitionMutation = Invoke-CodexNotificationGuardAction -Action disable -Operations $guardOperations -ToolDir $sourceRoot -PollAttempts 1 -PollMilliseconds 0
+if ($guardDefinitionMutation.ok) { throw 'notification guard action accepted a changed definition fingerprint' }
+$guardOperations.DisableNotificationGuardTask = $originalGuardDisable
+$guardDefinitionState.Xml = $guardDefinitionXml
+$guardState.enabled = $true
+$guardState.actions = 0
+$guardStop = Invoke-CodexNotificationGuardAction -Action stop -Operations $guardOperations -ToolDir $sourceRoot -PollAttempts 1 -PollMilliseconds 0
+if (-not $guardStop.ok -or $guardState.running -or -not $guardState.enabled -or $guardState.actions -ne 1) {
+    throw 'notification guard stop did not preserve its enabled setting'
+}
+$trustedGuardAction.Arguments = '-NoProfile -File "C:\Tools\other.ps1"'
+$untrustedGuard = Get-CodexNotificationGuardStatus -Operations $guardOperations -ToolDir $sourceRoot
+if (-not $untrustedGuard.ok -or $untrustedGuard.trusted -or -not $untrustedGuard.exists) { throw 'notification guard accepted an unrelated task action' }
+$untrustedStart = Invoke-CodexNotificationGuardAction -Action start -Operations $guardOperations -ToolDir $sourceRoot -PollAttempts 1 -PollMilliseconds 0
+if ($untrustedStart.ok -or $guardState.actions -ne 1) { throw 'notification guard mutated an untrusted scheduled task' }
+
+$reviewRuntimeRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('codex-reviewed-bridge-' + [guid]::NewGuid().ToString('N'))
+try {
+    New-Item -ItemType Directory -Path $reviewRuntimeRoot -Force | Out-Null
+    $reviewRuntimePath = Join-Path $reviewRuntimeRoot 'discord-bridge-runtime.json'
+    [void](Write-BridgeRuntimeIdentity -Path $reviewRuntimePath -Mode scheduled -ProcessId 701 -CreationTimeUtc '2026-09-01T13:00:00.0000000Z' -ToolDir $reviewRuntimeRoot)
+
+    $statusState = @{ opens=0; enumerations=0 }
+    $statusOps = @{
+        GetTask = { [pscustomobject]@{ installed=$true; enabled=$true; running=$true } }
+        OpenBridgeProcess = {
+            param($processId)
+            $statusState.opens++
+            if ($processId -ne 701) { throw 'runtime lookup used the wrong PID' }
+            [pscustomobject]@{ ProcessId=701; StartTimeUtc='2026-09-01T13:00:00.0000000Z'; Process=[pscustomobject]@{} }
+        }
+        GetBridgeProcesses = { $statusState.enumerations++; throw 'unrelated process enumeration is forbidden' }
+        GetProcesses = { $statusState.enumerations++; throw 'unrelated process enumeration is forbidden' }
+    }
+    $productionStatus = Get-CodexBridgeServiceStatus -Operations $statusOps -ToolDir $reviewRuntimeRoot
+    if (-not $productionStatus.ok -or -not $productionStatus.running -or $productionStatus.runtime.mode -ne 'scheduled' -or $statusState.opens -ne 1 -or $statusState.enumerations -ne 0) {
+        throw 'production service status did not bind only the identity-selected synthetic PID'
+    }
+
+    $stopEvents = [System.Collections.Generic.List[string]]::new()
+    $reusedStop = Stop-CodexBridgeRuntime -Runtime ([pscustomobject]@{ processId=702; creationTimeUtc='2026-09-01T13:00:00.0000000Z'; mode='temporary' }) -Operations @{
+        OpenBridgeProcess = { param($processId) [pscustomobject]@{ ProcessId=$processId; StartTimeUtc='2026-09-01T13:00:01.0000000Z'; Process=[pscustomobject]@{} } }
+        StopRuntimeTree = { param($bound) $stopEvents.Add('kill') }
+        WaitForRuntimeExit = { param($bound,$milliseconds) $true }
+        WaitForRuntimeRelease = { param($milliseconds) $true }
+    } -TimeoutMilliseconds 1
+    if ($reusedStop.ok -or $stopEvents.Count -ne 0) {
+        throw 'a changed/reused runtime identity performed a termination operation'
+    }
+
+    $boundSupervisor = [pscustomobject]@{ ProcessId=702; StartTimeUtc='2026-09-01T13:00:00.0000000Z'; Process=[pscustomobject]@{} }
+    $treeEvents = [System.Collections.Generic.List[string]]::new()
+    $treeStop = Stop-CodexBridgeRuntime -Runtime ([pscustomobject]@{ processId=702; creationTimeUtc='2026-09-01T13:00:00.0000000Z'; mode='temporary' }) -Operations @{
+        OpenBridgeProcess = { param($processId) $boundSupervisor }
+        StopRuntimeTree = { param($bound) if (-not [object]::ReferenceEquals($bound, $boundSupervisor)) { throw 'tree stop did not receive the held process binding' }; $treeEvents.Add('tree') }
+        WaitForRuntimeExit = { param($bound,$milliseconds) if (-not [object]::ReferenceEquals($bound, $boundSupervisor)) { throw 'exit wait did not receive the held process binding' }; $treeEvents.Add('exit'); $true }
+        WaitForRuntimeRelease = { param($milliseconds) $treeEvents.Add('release'); $true }
+    } -TimeoutMilliseconds 1
+    if (-not $treeStop.ok -or ($treeEvents -join ',') -ne 'tree,exit,release') { throw 'verified supervisor tree was not stopped and released in order' }
+
+    $timeoutStop = Stop-CodexBridgeRuntime -Runtime ([pscustomobject]@{ processId=702; creationTimeUtc='2026-09-01T13:00:00.0000000Z'; mode='temporary' }) -Operations @{
+        OpenBridgeProcess = { param($processId) $boundSupervisor }
+        StopRuntimeTree = { param($bound) }
+        WaitForRuntimeExit = { param($bound,$milliseconds) $false }
+        WaitForRuntimeRelease = { param($milliseconds) throw 'release must not run after exit timeout' }
+    } -TimeoutMilliseconds 1
+    if ($timeoutStop.ok -or $timeoutStop.errorCategory -ne 'runtime-stop-timeout') { throw 'unconfirmed runtime exit was not failed closed' }
+
+    $scheduledState = @{ installed=$true; enabled=$true; running=$true; mode='scheduled'; stopTask=0; stopRuntime=0 }
+    $scheduledOps = @{
+        GetTask = { [pscustomobject]@{ installed=$scheduledState.installed; enabled=$scheduledState.enabled; running=$scheduledState.running } }
+        GetRuntime = { if ($scheduledState.running) { [pscustomobject]@{ processId=703; creationTimeUtc='2026-09-01T13:00:00.0000000Z'; mode=$scheduledState.mode } } }
+        StopTask = { $scheduledState.stopTask++; $scheduledState.running=$false; $scheduledState.mode=$null }
+        StopRuntime = { param($runtime) $scheduledState.stopRuntime++; $scheduledState.running=$false; $scheduledState.mode=$null }
+        StartTask = {}; StartDetached = {}; InstallTask = {}; EnableTask = {}; DisableTask = {}
+        Sleep = { param($milliseconds) }
+    }
+    $scheduledStop = Invoke-CodexBridgeServiceAction -Action 'stop-temporary' -ToolDir $reviewRuntimeRoot -Operations $scheduledOps -PollAttempts 2 -PollMilliseconds 0
+    if (-not $scheduledStop.ok -or $scheduledState.stopTask -ne 1 -or $scheduledState.stopRuntime -ne 0 -or -not $scheduledState.enabled) {
+        throw 'temporary stop did not use the fixed scheduled task while preserving auto-start'
+    }
+
+    $timeoutState = @{ installed=$true; enabled=$false; running=$false; starts=0 }
+    $timeoutOps = @{
+        GetTask = { [pscustomobject]@{ installed=$timeoutState.installed; enabled=$timeoutState.enabled; running=$timeoutState.running } }
+        GetRuntime = { $null }
+        StartDetached = { param($path,$mode) $timeoutState.starts++ }
+        StartTask = { $timeoutState.starts++ }
+        StopTask = {}; StopRuntime = {}; InstallTask = {}; EnableTask = {}; DisableTask = {}
+        Sleep = { param($milliseconds) }
+    }
+    $timedOutStart = Invoke-CodexBridgeServiceAction -Action 'start-temporary' -ToolDir $reviewRuntimeRoot -Operations $timeoutOps -PollAttempts 2 -PollMilliseconds 0
+    if ($timedOutStart.ok -or $timedOutStart.errorCategory -ne 'service-action-incomplete' -or $timeoutState.starts -ne 1 -or $timedOutStart.service.running) {
+        throw 'an unpublished asynchronous start was reported as successful'
+    }
+
+    $publicationState = @{ installed=$true; enabled=$false; running=$false; pending=$false; starts=0 }
+    $publicationOps = @{
+        GetTask = { [pscustomobject]@{ installed=$publicationState.installed; enabled=$publicationState.enabled; running=$publicationState.running } }
+        GetRuntime = { if ($publicationState.running) { [pscustomobject]@{ processId=705; creationTimeUtc='2026-09-01T13:00:00.0000000Z'; mode='temporary' } } }
+        StartDetached = { param($path,$mode) $publicationState.starts++; $publicationState.pending=$true }
+        StartTask = {}; StopTask = {}; StopRuntime = {}; InstallTask = {}; EnableTask = {}; DisableTask = {}
+        Sleep = { param($milliseconds) if ($publicationState.pending) { $publicationState.pending=$false; $publicationState.running=$true } }
+    }
+    $publishedStart = Invoke-CodexBridgeServiceAction -Action 'start-temporary' -ToolDir $reviewRuntimeRoot -Operations $publicationOps -PollAttempts 3 -PollMilliseconds 0
+    if (-not $publishedStart.ok -or -not $publicationState.running -or $publicationState.starts -ne 1) {
+        throw 'a delayed temporary runtime publication was not observed by the bounded status poll'
+    }
+
+    $idempotentState = @{ installed=$true; enabled=$true; running=$true; enables=0; starts=0 }
+    $idempotentOps = @{
+        GetTask = { [pscustomobject]@{ installed=$idempotentState.installed; enabled=$idempotentState.enabled; running=$idempotentState.running } }
+        GetRuntime = { [pscustomobject]@{ processId=704; creationTimeUtc='2026-09-01T13:00:00.0000000Z'; mode='scheduled' } }
+        EnableTask = { $idempotentState.enables++ }; StartTask = { $idempotentState.starts++ }
+        InstallTask = {}; DisableTask = {}; StopTask = {}; StopRuntime = {}; StartDetached = {}; Sleep = { param($milliseconds) }
+    }
+    $idempotentEnable = Invoke-CodexBridgeServiceAction -Action 'enable-long-term' -ToolDir $reviewRuntimeRoot -Operations $idempotentOps -PollAttempts 1 -PollMilliseconds 0
+    if (-not $idempotentEnable.ok -or $idempotentState.enables -ne 0 -or $idempotentState.starts -ne 0) {
+        throw 'repeating long-term enable was not idempotent for an already scheduled runtime'
+    }
+
+    $childEvents = [System.Collections.Generic.List[string]]::new()
+    $childBound = [pscustomobject]@{ ProcessId=706; StartTimeUtc='2026-09-01T13:00:00.0000000Z'; Process=[pscustomobject]@{} }
+    $childStop = Stop-CodexBridgeRuntime -Runtime ([pscustomobject]@{ processId=706; creationTimeUtc='2026-09-01T13:00:00.0000000Z'; mode='temporary' }) -Operations @{
+        OpenBridgeProcess = { param($id) $childBound }
+        GetBridgeDescendants = { param($bound) @([pscustomobject]@{ ProcessId=707; StartTimeUtc='2026-09-01T13:00:01.0000000Z'; Process=[pscustomobject]@{} }) }
+        StopRuntimeTree = { param($bound) $childEvents.Add('root') }
+        StopBoundProcess = { param($bound) $childEvents.Add("stop:$($bound.ProcessId)") }
+        WaitForRuntimeExit = { param($bound,$milliseconds) if ($bound.ProcessId -eq 707) { $false } else { $true } }
+        WaitForRuntimeRelease = { param($milliseconds) $true }
+    } -TimeoutMilliseconds 1
+    if ($childStop.ok -or $childStop.errorCategory -ne 'runtime-stop-timeout') { throw 'a live child after root exit was accepted as a complete stop' }
+
+    $jobEvents = [System.Collections.Generic.List[string]]::new()
+    $jobMismatch = Stop-CodexBridgeRuntime -Runtime ([pscustomobject]@{ processId=708; creationTimeUtc='2026-09-01T13:00:00.0000000Z'; mode='temporary' }) -Operations @{
+        OpenBridgeProcess = { param($id) [pscustomobject]@{ ProcessId=708; StartTimeUtc='2026-09-01T13:00:00.0000000Z'; Process=[pscustomobject]@{} } }
+        OpenBridgeJob = { param($toolDir) [pscustomobject]@{ Handle='job' } }
+        TestBridgeJobMembership = { param($job,$bound) $false }
+        TerminateBridgeJob = { param($job) $jobEvents.Add('terminate') }
+        GetBridgeJobActiveProcesses = { param($job) 0 }
+        WaitForRuntimeRelease = { param($milliseconds) $true }
+        CloseBridgeJob = { param($job) $jobEvents.Add('close') }
+        Sleep = { param($milliseconds) }
+    } -ToolDir $reviewRuntimeRoot -TimeoutMilliseconds 1
+    if ($jobMismatch.ok -or $jobMismatch.errorCategory -ne 'runtime-job-membership-failed' -or $jobEvents -contains 'terminate') { throw 'job membership mismatch did not fail before termination' }
+
+    $lateChildState = @{ active=1; starts=0 }
+    $lateChildOps = @{
+        OpenBridgeProcess = { param($id) [pscustomobject]@{ ProcessId=709; StartTimeUtc='2026-09-01T13:00:00.0000000Z'; Process=[pscustomobject]@{} } }
+        OpenBridgeJob = { param($toolDir) [pscustomobject]@{ Handle='job' } }
+        TestBridgeJobMembership = { param($job,$bound) $true }
+        TerminateBridgeJob = { param($job) }
+        GetBridgeJobActiveProcesses = { param($job) $lateChildState.active }
+        WaitForRuntimeRelease = { param($milliseconds) $true }
+        CloseBridgeJob = { param($job) }
+        Sleep = { param($milliseconds) }
+    }
+    $lateChildStop = Stop-CodexBridgeRuntime -Runtime ([pscustomobject]@{ processId=709; creationTimeUtc='2026-09-01T13:00:00.0000000Z'; mode='temporary' }) -Operations $lateChildOps -ToolDir $reviewRuntimeRoot -TimeoutMilliseconds 1
+    if ($lateChildStop.ok -or $lateChildStop.errorCategory -ne 'runtime-stop-timeout') { throw 'a child joining the job after validation did not block handoff' }
+}
+finally {
+    Remove-Item -LiteralPath $reviewRuntimeRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+$healthStatusRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('codex-bridge-health-status-' + [guid]::NewGuid().ToString('N'))
+try {
+    New-Item -ItemType Directory -Path $healthStatusRoot -Force | Out-Null
+    $healthPath = Join-Path $healthStatusRoot 'discord-bridge-health.json'
+    @{
+        version = 1
+        observedAt = '2026-09-01T13:10:00.000Z'
+        gateway = @{ state = 'ready' }
+        discordRest = @{ state = 'ok' }
+        queueCount = 3
+        startedAt = '2026-09-01T13:00:00.000Z'
+        lastActivityAt = '2026-09-01T13:09:00.000Z'
+        latestEventCategory = 'queue-retry-failed'
+    } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $healthPath -Encoding UTF8
+
+    $healthStatus = Get-CodexControlStatus -Operations @{
+        GetProcesses = { $processes }
+        GetTask = { [pscustomobject]@{ installed=$true; enabled=$true; running=$true } }
+        GetRuntime = { [pscustomobject]@{ processId=501; creationTimeUtc='2026-09-01T13:00:00.0000000Z'; mode='scheduled' } }
+        Now = { [datetimeoffset]'2026-09-01T13:10:10.000Z' }
+    } -ToolDir $healthStatusRoot
+    if (-not $healthStatus.ok -or -not $healthStatus.service.running -or -not $healthStatus.service.autoStartEnabled -or $healthStatus.service.mode -ne 'scheduled' -or $healthStatus.discord.state -ne 'ready' -or $healthStatus.queueCount -ne 3 -or -not $healthStatus.desktop.running) {
+        throw 'status did not merge the validated runtime, fixed task, health snapshot, queue, and desktop plan'
+    }
+    Set-Content -LiteralPath $healthPath -Value '{not-json' -Encoding UTF8
+    $corruptHealthStatus = Get-CodexControlStatus -Operations @{
+        GetProcesses = { $processes }
+        GetTask = { [pscustomobject]@{ installed=$true; enabled=$true; running=$false } }
+        GetRuntime = { $null }
+        Now = { [datetimeoffset]'2026-09-01T13:10:10.000Z' }
+    } -ToolDir $healthStatusRoot
+    if ($corruptHealthStatus.discord.state -ne 'unknown' -or $corruptHealthStatus.queueCount -ne 0) { throw 'corrupt health did not fail closed as unknown' }
+}
+finally {
+    Remove-Item -LiteralPath $healthStatusRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+$entrypoint = Join-Path $sourceRoot 'codex-control.ps1'
+$invalidJson = @(& pwsh -NoProfile -File $entrypoint -Action 'arbitrary-action' 2>$null)
+if ($LASTEXITCODE -eq 0) { throw 'entrypoint accepted an arbitrary action' }
+if ($invalidJson.Count -ne 1) { throw 'entrypoint did not emit exactly one stdout JSON object' }
+if ($invalidJson[0].TrimStart().StartsWith('[')) { throw 'entrypoint emitted a JSON array instead of one top-level object' }
+$invalidResult = $invalidJson[0] | ConvertFrom-Json
+if ($invalidResult.ok -or $invalidResult.errorCategory -ne 'invalid-action') { throw 'entrypoint did not emit a fixed-action JSON error' }
+
+Write-Output 'PASS: Codex desktop control boundaries'

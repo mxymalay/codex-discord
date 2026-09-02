@@ -6,6 +6,7 @@ import {
   assertValidInboxStateV2,
   assertValidLegacyInboxState,
   cancelContinuationPersisted,
+  claimContinuationTakeover,
   classifyReply,
   commitInboxState,
   createContinuationRequest,
@@ -25,6 +26,7 @@ import {
   readJsonFile,
   recordInboxMessage,
   recoverContinuationAttempts,
+  releaseContinuationTakeoverClaim,
   resolveCodexExecutable,
   resolvePowerShellExecutable,
   sendDiscordReply,
@@ -47,16 +49,19 @@ import {
   createNewTaskOnce,
   createProjectCatalog,
   listCodexProjects,
+  recordTaskCreationReceiptOutcome,
   recoverInterruptedTaskCreations,
 } from './discord-task-create-lib.mjs';
 import { probeTemporaryAtomicWrite } from './discord-health-lib.mjs';
 import {
   dispatchNotificationViaPowerShell,
   initializeRolloutWatcherState,
+  pollDiscordOriginEvents,
   pollRolloutCompletions,
   readRolloutWatcherState,
   writeRolloutWatcherState,
 } from './rollout-completion-watcher-lib.mjs';
+import { runCodexControlAction, writeBridgeHealthAtomic } from './discord-control-client.mjs';
 
 const toolDir = path.dirname(fileURLToPath(import.meta.url));
 const configPath = path.join(toolDir, 'config.json');
@@ -68,6 +73,8 @@ const sessionsRoot = path.join(codexRoot, 'sessions');
 const rolloutWatcherStatePath = path.join(toolDir, 'rollout-watcher-state.json');
 const taskIndexPath = path.join(toolDir, 'discord-task-index.json');
 const quotaStatePath = path.join(toolDir, 'quota-state.json');
+const bridgeHealthPath = path.join(toolDir, 'discord-bridge-health.json');
+const controlPath = path.join(toolDir, 'codex-control.ps1');
 const sessionIndexPath = path.join(codexRoot, 'session_index.jsonl');
 const pollIntervalMs = 4000;
 const pendingRetryIntervalMs = 30_000;
@@ -85,6 +92,14 @@ function isoTimestamp(value) {
   return Number.isFinite(candidate.getTime()) ? candidate.toISOString() : new Date().toISOString();
 }
 
+function latestTimestamp(timestamps) {
+  const valid = Object.values(timestamps ?? {})
+    .map((value) => ({ value, milliseconds: Date.parse(String(value ?? '')) }))
+    .filter((item) => Number.isFinite(item.milliseconds))
+    .sort((left, right) => right.milliseconds - left.milliseconds);
+  return valid[0]?.value ?? null;
+}
+
 function exactCommandNames(commands) {
   const names = (Array.isArray(commands) ? commands : []).map((item) => String(item?.name ?? ''));
   if (names.length !== COMMAND_NAMES.length || names.some((name, index) => name !== COMMAND_NAMES[index])) {
@@ -96,6 +111,22 @@ function exactCommandNames(commands) {
 function boundedShutdownTimeout(value) {
   const milliseconds = Number(value);
   return Number.isFinite(milliseconds) ? Math.max(0, Math.min(60_000, Math.floor(milliseconds))) : 10_000;
+}
+
+function boundedHealthTimeout(value) {
+  const milliseconds = Number(value);
+  return Number.isFinite(milliseconds) ? Math.max(1, Math.min(10_000, Math.floor(milliseconds))) : 2_000;
+}
+
+export async function trackDiscordRest(context, operation) {
+  try {
+    const result = await operation();
+    context.setDiscordRestStatus('ok');
+    return result;
+  } catch (error) {
+    context.setDiscordRestStatus('failed');
+    throw error;
+  }
 }
 
 /** Compose the bridge lifecycle from injectable components. */
@@ -112,7 +143,10 @@ export function createBridgeApplication(dependencies = {}) {
     gateway: null,
     legacyPollers: null,
     gatewayStatus: { state: 'idle' },
+    discordRestStatus: { state: 'unknown', lastSuccessAt: null },
     latestErrorCategory: null,
+    startedAt: null,
+    isStopping: false,
     activeResources: new Set(),
     timestamps: Object.fromEntries([...activityFields].map((field) => [field, null])),
   };
@@ -120,6 +154,13 @@ export function createBridgeApplication(dependencies = {}) {
   let prepared = false;
   let acceptingResources = true;
   let stopPromise = null;
+  let healthTimer = null;
+  let healthPublication = Promise.resolve();
+  let healthGeneration = 0;
+  let healthController = null;
+  let healthLifecycle = 'inactive';
+  let healthFinalAllowed = false;
+  let startupCleanupComplete = false;
   const idleWaiters = new Set();
 
   const notifyIdle = () => {
@@ -165,17 +206,138 @@ export function createBridgeApplication(dependencies = {}) {
   };
   context.trackActiveResource = trackActiveResource;
 
+  const reportHealthFailure = (generation) => {
+    if (generation === healthGeneration) context.latestErrorCategory = 'bridge-health-write-failed';
+    try { Promise.resolve(dependencies.logHealthFailure?.('bridge-health-write-failed')).catch(() => {}); } catch {}
+  };
+  const healthIsCurrent = (generation, controller, forceFinal) => generation === healthGeneration && controller === healthController && !controller.signal.aborted &&
+    (forceFinal ? healthLifecycle === 'stopping' && healthFinalAllowed : ['starting', 'running'].includes(healthLifecycle));
+  const safePublishHealth = ({ forceFinal = false } = {}) => {
+    if (typeof dependencies.publishHealth !== 'function') return Promise.resolve(false);
+    const generation = healthGeneration;
+    const lifecycleController = healthController;
+    if (!lifecycleController || !healthIsCurrent(generation, lifecycleController, forceFinal)) return Promise.resolve(false);
+    const previous = healthPublication;
+    const run = async () => {
+      try {
+        await previous.catch(() => {});
+        if (!healthIsCurrent(generation, lifecycleController, forceFinal)) return false;
+        const publicationController = new AbortController();
+        const abort = () => publicationController.abort();
+        lifecycleController.signal.addEventListener('abort', abort, { once: true });
+        const operation = Promise.resolve().then(() => dependencies.publishHealth(context, {
+          signal: publicationController.signal, generation, forceFinal,
+          shouldCommit: () => healthIsCurrent(generation, lifecycleController, forceFinal) && !publicationController.signal.aborted,
+        }));
+        operation.catch(() => {});
+        let timeoutId;
+        let outcome = 'failed';
+        try {
+          outcome = await Promise.race([
+            operation.then(() => 'ok', () => 'failed'),
+            new Promise((resolve) => { timeoutId = setTimeout(() => resolve('timeout'), boundedHealthTimeout(dependencies.healthPublishTimeoutMs)); }),
+          ]);
+        } finally {
+          clearTimeout(timeoutId);
+          lifecycleController.signal.removeEventListener('abort', abort);
+        }
+        if (outcome === 'ok') return true;
+        publicationController.abort();
+        reportHealthFailure(generation);
+        return false;
+      } catch {
+        reportHealthFailure(generation);
+        return false;
+      }
+    };
+    healthPublication = run().catch(() => false);
+    return healthPublication;
+  };
+
+  const safeInvalidateHealth = async () => {
+    if (typeof dependencies.invalidateHealth !== 'function') return false;
+    const generation = healthGeneration;
+    const operation = Promise.resolve().then(() => dependencies.invalidateHealth());
+    operation.catch(() => {});
+    let timeoutId;
+    let outcome = 'failed';
+    try {
+      outcome = await Promise.race([
+        operation.then(() => 'ok', () => 'failed'),
+        new Promise((resolve) => { timeoutId = setTimeout(() => resolve('timeout'), boundedHealthTimeout(dependencies.healthPublishTimeoutMs)); }),
+      ]);
+    } catch {}
+    clearTimeout(timeoutId);
+    if (outcome !== 'ok') reportHealthFailure(generation);
+    return outcome === 'ok';
+  };
+
+  const reportStartupCleanupFailure = () => {
+    try { Promise.resolve(dependencies.logHealthFailure?.('startup-cleanup-failed')).catch(() => {}); } catch {}
+  };
+  const stopPartialResources = async (resources) => {
+    const stops = resources.map((resource) => {
+      const stop = Promise.resolve().then(() => resource?.stop?.());
+      stop.catch(() => { reportStartupCleanupFailure(); });
+      return stop;
+    });
+    let timeoutId;
+    const completed = await Promise.race([
+      Promise.allSettled(stops).then(() => true),
+      new Promise((resolve) => {
+        timeoutId = setTimeout(() => resolve(false), boundedShutdownTimeout(dependencies.shutdownTimeoutMs ?? 10_000));
+      }),
+    ]);
+    clearTimeout(timeoutId);
+    if (!completed) reportStartupCleanupFailure();
+  };
+  const cleanupFailedStart = async () => {
+    if (startupCleanupComplete) return;
+    startupCleanupComplete = true;
+    const gateway = context.gateway;
+    const legacyPollers = context.legacyPollers;
+    context.gateway = null;
+    context.legacyPollers = null;
+    acceptingResources = false;
+    started = false;
+    context.isStopping = true;
+    context.latestErrorCategory = 'startup-failed';
+    context.gatewayStatus = { state: 'failed' };
+    const clearHealthInterval = dependencies.clearInterval ?? globalThis.clearInterval;
+    if (healthTimer != null) {
+      try { clearHealthInterval(healthTimer); } catch { reportStartupCleanupFailure(); }
+      healthTimer = null;
+    }
+    await stopPartialResources([gateway, legacyPollers]);
+    healthController?.abort();
+    healthGeneration++;
+    healthController = new AbortController();
+    healthLifecycle = 'stopping';
+    healthFinalAllowed = true;
+    healthPublication = Promise.resolve();
+    let terminalCommitted = false;
+    try {
+      terminalCommitted = await safePublishHealth({ forceFinal: true });
+      if (!terminalCommitted) {
+        healthController?.abort();
+        await safeInvalidateHealth();
+      }
+    } finally {
+      healthFinalAllowed = false;
+      healthLifecycle = 'stopped';
+    }
+  };
+
+  const publishHealthSoon = () => { void safePublishHealth(); };
   const recordActivity = (field, at = dependencies.now?.() ?? Date.now()) => {
     if (!activityFields.has(field)) throw new Error(`Unknown bridge activity field: ${field}`);
     context.timestamps[field] = isoTimestamp(at);
+    if (started) publishHealthSoon();
   };
 
   const getSystemStatus = () => ({
-    gateway: context.gateway?.getStatus?.() ?? context.gatewayStatus,
-    discordRest: {
-      state: context.timestamps.lastRegistrationAt ? 'ok' : 'unknown',
-      lastSuccessAt: context.timestamps.lastRegistrationAt,
-    },
+    gateway: context.isStopping ? context.gatewayStatus : (context.gateway?.getStatus?.() ?? context.gatewayStatus),
+    discordRest: { ...context.discordRestStatus },
     notificationListener: {
       state: context.legacyPollers ? 'running' : 'stopped',
       lastSuccessAt: context.timestamps.lastNotificationSentAt,
@@ -194,6 +356,22 @@ export function createBridgeApplication(dependencies = {}) {
   });
   context.recordActivity = recordActivity;
   context.getSystemStatus = getSystemStatus;
+  context.publishHealth = safePublishHealth;
+  context.trackDiscordRest = (operation) => trackDiscordRest(context, operation);
+  context.setGatewayStatus = (status) => {
+    context.gatewayStatus = status && typeof status === 'object' ? status : { state: 'unknown' };
+    if (status?.lastEventAt != null) recordActivity('lastGatewayEventAt', status.lastEventAt);
+    if (status?.lastError) context.setLatestErrorCategory(status.lastError);
+    else if (started) publishHealthSoon();
+  };
+  context.setDiscordRestStatus = (state) => {
+    context.discordRestStatus = { state: String(state ?? 'unknown'), lastSuccessAt: state === 'ok' ? isoTimestamp() : context.discordRestStatus.lastSuccessAt };
+    if (started) publishHealthSoon();
+  };
+  context.setLatestErrorCategory = (category) => {
+    context.latestErrorCategory = String(category ?? 'unknown');
+    if (started) publishHealthSoon();
+  };
 
   async function prepare(registrationOnly) {
     if (prepared) return;
@@ -205,8 +383,8 @@ export function createBridgeApplication(dependencies = {}) {
   }
 
   async function registerAndVerify() {
-    await dependencies.registerCommands(context);
-    const commands = await dependencies.fetchRegisteredCommands(context);
+    await context.trackDiscordRest(() => dependencies.registerCommands(context));
+    const commands = await context.trackDiscordRest(() => dependencies.fetchRegisteredCommands(context));
     const commandNames = exactCommandNames(commands);
     recordActivity('lastRegistrationAt');
     return commandNames;
@@ -224,23 +402,35 @@ export function createBridgeApplication(dependencies = {}) {
     async start() {
       if (started) return;
       acceptingResources = true;
+      context.isStopping = false;
       stopPromise = null;
-      await prepare(false);
+      startupCleanupComplete = false;
+      healthController?.abort();
+      healthGeneration++;
+      healthController = new AbortController();
+      healthLifecycle = 'starting';
+      healthFinalAllowed = false;
+      context.healthGeneration = healthGeneration;
       try {
+        await prepare(false);
         await registerAndVerify();
-        context.taskIndex = await dependencies.loadTaskIndex(context);
-        recordActivity('lastIndexUpdateAt');
         context.inboxState = await dependencies.loadInboxState(context);
         await dependencies.recoverTaskCreations(context);
         context.projectCatalog = await dependencies.warmProjectCatalog(context);
+        context.taskIndex = await dependencies.loadTaskIndex(context);
+        recordActivity('lastIndexUpdateAt');
         context.interactionHandler = await dependencies.createInteractionHandler(context);
         context.gateway = await dependencies.startGateway(context);
-        context.gatewayStatus = context.gateway?.getStatus?.() ?? { state: 'connecting' };
+        context.setGatewayStatus(context.gateway?.getStatus?.() ?? { state: 'connecting' });
         context.legacyPollers = await dependencies.startLegacyPollers(context);
         started = true;
+        healthLifecycle = 'running';
+        context.startedAt = isoTimestamp(dependencies.now?.() ?? Date.now());
+        await safePublishHealth();
+        const setHealthInterval = dependencies.setInterval ?? globalThis.setInterval;
+        healthTimer = setHealthInterval(() => { publishHealthSoon(); }, 10_000);
       } catch (error) {
-        context.latestErrorCategory = 'startup-failed';
-        await context.gateway?.stop?.().catch(() => {});
+        await cleanupFailedStart();
         throw error;
       }
     },
@@ -249,8 +439,21 @@ export function createBridgeApplication(dependencies = {}) {
     },
     async stop() {
       if (stopPromise) return stopPromise;
-      if (!started && !context.gateway && !context.legacyPollers) return undefined;
+      if (!started && !context.gateway && !context.legacyPollers && ['inactive', 'stopped'].includes(healthLifecycle)) return undefined;
       acceptingResources = false;
+      context.isStopping = true;
+      healthController?.abort();
+      healthGeneration++;
+      healthController = new AbortController();
+      healthLifecycle = 'stopping';
+      healthFinalAllowed = true;
+      context.healthGeneration = healthGeneration;
+      healthPublication = Promise.resolve();
+      const clearHealthInterval = dependencies.clearInterval ?? globalThis.clearInterval;
+      if (healthTimer !== null) {
+        clearHealthInterval(healthTimer);
+        healthTimer = null;
+      }
       stopPromise = (async () => {
         const failures = [];
         const invoke = (category, operation) => {
@@ -289,6 +492,10 @@ export function createBridgeApplication(dependencies = {}) {
           notifyIdle();
         }
         started = false;
+        context.gatewayStatus = { state: 'stopped' };
+        await safePublishHealth({ forceFinal: true });
+        healthFinalAllowed = false;
+        healthLifecycle = 'stopped';
         if (failures.length > 0) {
           throw new Error(`Discord bridge shutdown failed: ${[...new Set(failures)].join(',')}`);
         }
@@ -308,6 +515,7 @@ const persistentLogCategories = new Set([
   'bridge-event', 'bridge-started', 'bridge-fatal', 'continuation-state-corrupt',
   'completion-watcher-started', 'rollout-poll-failed', 'rollout-state-save-failed',
   'queue-retry-failed', 'channel-poll-failed', 'index-refresh-failed', 'message-ignored',
+  'bridge-health-write-failed',
   'turn-completed', 'turn-failed', 'turn-cancelled', 'turn-finished',
   'turn-completion-connection-lost', 'continuation-started', 'continuation-queued',
   'continuation-uncertain', 'continuation-failed', 'continuation-result',
@@ -465,7 +673,7 @@ async function saveState(state) {
   await writeJsonAtomic(inboxStatePath, state);
 }
 
-function trackContinuationCompletion(started, request, token, trackActiveResource) {
+function trackContinuationCompletion(started, request, token, trackActiveResource, sendReply = (payload) => sendDiscordReply({ token, ...payload })) {
   const tracked = started.completion
       .then(async (params) => {
         const status = String(params?.turn?.status ?? 'unknown');
@@ -477,7 +685,7 @@ function trackContinuationCompletion(started, request, token, trackActiveResourc
         })[status] ?? 'turn-finished';
         await log(category, { threadId: request.threadId, turnId: started.turnId });
         if (status === 'failed' && request.source === 'reply') {
-          await sendDiscordReply({
+          await sendReply({
             token,
             channelId: request.channelId,
             replyToMessageId: request.replyToMessageId,
@@ -559,7 +767,16 @@ export async function finalizeContinuationOutcome({
   return { ...result, durable, stopChannelScan: !durable };
 }
 
-async function startContinuation({ token, config, state, request, trackActiveResource }) {
+async function startContinuation({
+  token,
+  config,
+  state,
+  request,
+  trackActiveResource,
+  takeoverClaimId,
+  persistState = saveState,
+  sendReply = (payload) => sendDiscordReply({ token, ...payload }),
+}) {
   const mappedCwd = await existingDirectory(String(request.cwd ?? ''));
   const input = { ...request, cwd: mappedCwd ?? undefined };
   const result = await dispatchContinuation(input, {
@@ -568,13 +785,14 @@ async function startContinuation({ token, config, state, request, trackActiveRes
     processCwd: mappedCwd ?? toolDir,
     encryptText: (text) => encryptPendingReplyText({ toolDir, powershellPath: config.discordPowerShellPath, text }),
     decryptText: (encryptedText) => decryptPendingReplyText({ toolDir, powershellPath: config.discordPowerShellPath, ciphertext: encryptedText }),
-    persistState: saveState,
-    sendReply: (payload) => sendDiscordReply({ token, ...payload }),
+    persistState,
+    takeoverClaimId,
+    sendReply,
     trackCompletion: (started, normalized) => trackContinuationCompletion(
-      started, normalized, token, trackActiveResource,
+      started, normalized, token, trackActiveResource, sendReply,
     ),
   });
-  const outcome = await finalizeContinuationOutcome({ result, state, request, token });
+  const outcome = await finalizeContinuationOutcome({ result, state, request, token, sendReply });
   const category = ({
     started: 'continuation-started',
     queued: 'continuation-queued',
@@ -589,12 +807,12 @@ async function startContinuation({ token, config, state, request, trackActiveRes
   return outcome;
 }
 
-async function retryPendingTurns({ token, config, state, onRetry = () => {}, trackActiveResource }) {
+async function retryPendingTurns({ token, config, state, onRetry = () => {}, trackActiveResource, sendReply }) {
   const now = Date.now();
   for (const pending of listRetryableContinuations(state)) {
     const lastAttempt = Date.parse(String(pending.lastAttemptAt ?? ''));
     if (Number.isFinite(lastAttempt) && now - lastAttempt < pendingRetryIntervalMs) continue;
-    await startContinuation({ token, config, state, request: pending, trackActiveResource });
+    await startContinuation({ token, config, state, request: pending, trackActiveResource, sendReply });
     onRetry();
   }
 }
@@ -626,6 +844,7 @@ export async function pollChannel({
           cwd: accepted.mapping.cwd,
           text: accepted.text,
           channelId: accepted.channelId,
+          guildId: config.discordGuildId,
           replyToMessageId: accepted.messageId,
         });
         const outcome = await continueRequest({ token, config, state, request });
@@ -669,8 +888,58 @@ function replaceIndex(target, source) {
   return target;
 }
 
-function createProductionBridgeDependencies({ runOnce = false } = {}) {
+export function createProductionBridgeDependencies({
+  runOnce = false,
+  buildTaskIndexImpl = buildTaskIndex,
+  writeTaskIndexAtomicImpl = writeTaskIndexAtomic,
+  runCodexControlActionImpl = runCodexControlAction,
+  createInteractionRestClientImpl = createInteractionRestClient,
+  createInteractionRouterImpl = createInteractionRouter,
+  startContinuationImpl = startContinuation,
+  sendDiscordReplyImpl = sendDiscordReply,
+  persistInboxStateImpl = saveState,
+  readRolloutWatcherStateImpl = readRolloutWatcherState,
+  initializeRolloutWatcherStateImpl = initializeRolloutWatcherState,
+  writeRolloutWatcherStateImpl = writeRolloutWatcherState,
+  pollRolloutCompletionsImpl = pollRolloutCompletions,
+  logImpl = log,
+} = {}) {
+  let taskIndexCommitTail = Promise.resolve();
+  const enqueueTaskIndexOperation = (operation) => {
+    const current = taskIndexCommitTail.then(operation);
+    taskIndexCommitTail = current.then(() => undefined, () => undefined);
+    return current;
+  };
+  const rebuildTaskIndex = (context, {
+    previousIndex = context.taskIndex,
+    nowMs = Date.now(),
+    installShared = true,
+    recordActivity = true,
+  } = {}) => enqueueTaskIndexOperation(async () => {
+    const rebuilt = await buildTaskIndexImpl({
+      sessionsRoot,
+      sessionIndexPath,
+      messageMapPath: mappingPath,
+      previousIndex,
+      discordWorktreeRoot: context.config.discordWorktreeRoot,
+      projects: context.projectCatalog?.snapshot?.() ?? [],
+      createdTasksByInteraction: context.inboxState?.createdTasksByInteraction ?? {},
+      nowMs,
+    });
+    const stableSnapshot = structuredClone(rebuilt);
+    if (installShared) replaceIndex(context.taskIndex, structuredClone(stableSnapshot));
+    await writeTaskIndexAtomicImpl(taskIndexPath, stableSnapshot);
+    if (recordActivity) context.recordActivity('lastIndexUpdateAt', stableSnapshot.generatedAt);
+    return stableSnapshot;
+  });
+  const refreshTaskIndex = (context, options = {}) => rebuildTaskIndex(context, options);
+  const persistCurrentTaskIndex = (context) => enqueueTaskIndexOperation(async () => {
+    const stableSnapshot = structuredClone(context.taskIndex);
+    await writeTaskIndexAtomicImpl(taskIndexPath, stableSnapshot);
+    return stableSnapshot;
+  });
   return {
+    refreshTaskIndex,
     async loadConfig() {
       return readJsonFile(configPath);
     },
@@ -699,15 +968,11 @@ function createProductionBridgeDependencies({ runOnce = false } = {}) {
     },
     async loadTaskIndex(context) {
       const previousIndex = await readTaskIndex(taskIndexPath);
-      const index = await buildTaskIndex({
-        sessionsRoot,
-        sessionIndexPath,
-        messageMapPath: mappingPath,
+      return rebuildTaskIndex(context, {
         previousIndex,
-        discordWorktreeRoot: context.config.discordWorktreeRoot,
+        installShared: false,
+        recordActivity: false,
       });
-      await writeTaskIndexAtomic(taskIndexPath, index);
-      return index;
     },
     async loadInboxState(context) {
       const loaded = await loadInboxStateWithRecovery({
@@ -717,10 +982,10 @@ function createProductionBridgeDependencies({ runOnce = false } = {}) {
           powershellPath: context.executables.powershellPath,
           text,
         }),
-        persistState: saveState,
+        persistState: persistInboxStateImpl,
       });
       context.inboxReadOnly = loaded.readOnly;
-      if (loaded.errorCategory) context.latestErrorCategory = loaded.errorCategory;
+      if (loaded.errorCategory) context.setLatestErrorCategory(loaded.errorCategory);
       return loaded.state;
     },
     async recoverTaskCreations(context) {
@@ -728,7 +993,8 @@ function createProductionBridgeDependencies({ runOnce = false } = {}) {
       await recoverInterruptedTaskCreations({
         state: context.inboxState,
         worktreeRoot: context.config.discordWorktreeRoot,
-        persistState: saveState,
+        sessionsRoot,
+        persistState: persistInboxStateImpl,
       });
     },
     async warmProjectCatalog(context) {
@@ -742,9 +1008,23 @@ function createProductionBridgeDependencies({ runOnce = false } = {}) {
       return catalog;
     },
     async createInteractionHandler(context) {
-      const rest = createInteractionRestClient({ applicationId: context.config.discordApplicationId });
+      const rest = createInteractionRestClientImpl({ applicationId: context.config.discordApplicationId });
       const readQuota = () => readJsonFile(quotaStatePath, { observedAt: null, limits: [] });
-      const api = (route) => discordRequest({ token: context.token, route });
+      const api = (route) => context.trackDiscordRest(() => discordRequest({ token: context.token, route }));
+      const trackedReply = (payload) => context.trackDiscordRest(() => sendDiscordReplyImpl({
+        token: context.token,
+        ...payload,
+      }));
+      const continuePersistedRequest = (request, { takeoverClaimId } = {}) => startContinuationImpl({
+        token: context.token,
+        config: context.config,
+        state: context.inboxState,
+        request,
+        takeoverClaimId,
+        persistState: persistInboxStateImpl,
+        trackActiveResource: context.trackActiveResource,
+        sendReply: trackedReply,
+      });
       const healthDependencies = {
         config: context.config,
         loadToken: () => loadDiscordToken({ toolDir, powershellPath: context.executables.powershellPath }),
@@ -761,7 +1041,7 @@ function createProductionBridgeDependencies({ runOnce = false } = {}) {
         powershellPath: context.executables.powershellPath,
         dispatcherPath: path.join(toolDir, 'dispatcher.ps1'),
       };
-      const router = createInteractionRouter({
+      const router = createInteractionRouterImpl({
         config: context.config,
         taskIndex: context.taskIndex,
         projectCatalog: context.projectCatalog,
@@ -769,8 +1049,8 @@ function createProductionBridgeDependencies({ runOnce = false } = {}) {
         worktreeRoot: context.config.discordWorktreeRoot,
         creationState: context.inboxState,
         continuationState: context.inboxState,
-        persistCreationState: context.inboxReadOnly ? undefined : saveState,
-        persistContinuationState: context.inboxReadOnly ? undefined : saveState,
+        persistCreationState: context.inboxReadOnly ? undefined : persistInboxStateImpl,
+        persistContinuationState: context.inboxReadOnly ? undefined : persistInboxStateImpl,
         mutationDisabledCategory: context.inboxReadOnly ? 'continuation-state-corrupt' : null,
         codexPath: context.executables.codexPath,
         processCwd: toolDir,
@@ -782,6 +1062,15 @@ function createProductionBridgeDependencies({ runOnce = false } = {}) {
           }
           return result;
         },
+        recordCreationReceiptOutcome: (interactionId, outcome) => recordTaskCreationReceiptOutcome({
+          state: context.inboxState,
+          interactionId,
+          status: outcome?.status,
+          messageId: outcome?.messageId,
+          errorCategory: outcome?.errorCategory,
+          now: new Date(),
+          persistState: persistInboxStateImpl,
+        }),
         readTaskDetail,
         searchTasks,
         getQuotaState: readQuota,
@@ -790,22 +1079,76 @@ function createProductionBridgeDependencies({ runOnce = false } = {}) {
           quota: await readQuota(),
         }),
         getQueue: () => listContinuations(context.inboxState),
-        dispatchContinuation: (request) => startContinuation({
-          token: context.token,
-          config: context.config,
-          state: context.inboxState,
-          request,
-          trackActiveResource: context.trackActiveResource,
+        refreshTaskIndex: () => refreshTaskIndex(context),
+        getCodexControlStatus: () => runCodexControlActionImpl({
+          action: 'status',
+          powershellPath: context.executables.powershellPath,
+          controlPath,
         }),
-        cancelContinuationPersisted: (queueId, now) => cancelContinuationPersisted({
-          state: context.inboxState,
-          queueId,
-          now,
-          persistState: saveState,
+        stopCodexDesktop: () => runCodexControlActionImpl({
+          action: 'stop-codex',
+          powershellPath: context.executables.powershellPath,
+          controlPath,
         }),
+        dispatchContinuation: async (request) => {
+          try {
+            return await continuePersistedRequest(request);
+          } finally {
+            context.publishHealth?.();
+          }
+        },
+        claimContinuationTakeover: async ({ queueId, targetThreadId }) => {
+          try {
+            return await claimContinuationTakeover({
+              state: context.inboxState,
+              queueId,
+              targetThreadId,
+              persistState: persistInboxStateImpl,
+            });
+          } finally {
+            context.publishHealth?.();
+          }
+        },
+        releaseContinuationTakeoverClaim: async (claim) => {
+          try {
+            return await releaseContinuationTakeoverClaim({
+              state: context.inboxState,
+              claim,
+              persistState: persistInboxStateImpl,
+            });
+          } finally {
+            context.publishHealth?.();
+          }
+        },
+        retryContinuation: async (claim) => {
+          const item = listContinuations(context.inboxState).find((entry) =>
+            entry.queueId === String(claim?.queueId ?? '') &&
+            entry.threadId === String(claim?.targetThreadId ?? '') &&
+            entry.status === 'takeover-claimed' &&
+            entry.takeoverClaimId === String(claim?.claimId ?? ''));
+          if (!item) return { status: 'failed', reason: 'not-found' };
+          try {
+            return await continuePersistedRequest(item, { takeoverClaimId: claim.claimId });
+          } finally {
+            context.publishHealth?.();
+          }
+        },
+        cancelContinuationPersisted: async (queueId, now) => {
+          try {
+            return await cancelContinuationPersisted({
+              state: context.inboxState,
+              queueId,
+              now,
+              persistState: persistInboxStateImpl,
+            });
+          } finally {
+            context.publishHealth?.();
+          }
+        },
         healthDependencies,
-        respond: (body, interaction) => rest.callback(interaction, body),
-        editOriginal: (body, interaction) => rest.editOriginal(interaction, body),
+        respond: (body, interaction) => context.trackDiscordRest(() => rest.callback(interaction, body)),
+        editOriginal: (body, interaction) => context.trackDiscordRest(() => rest.editOriginal(interaction, body)),
+        followup: (body, interaction) => context.trackDiscordRest(() => rest.followup(interaction, body)),
       });
       return (interaction) => router.handle(interaction);
     },
@@ -814,9 +1157,7 @@ function createProductionBridgeDependencies({ runOnce = false } = {}) {
         token: context.token,
         onInteraction: (interaction) => context.interactionHandler(interaction),
         onStatus: (status) => {
-          context.gatewayStatus = status;
-          if (status?.lastEventAt != null) context.recordActivity('lastGatewayEventAt', status.lastEventAt);
-          if (status?.lastError) context.latestErrorCategory = status.lastError;
+          context.setGatewayStatus(status);
         },
       });
       await gateway.start();
@@ -826,21 +1167,22 @@ function createProductionBridgeDependencies({ runOnce = false } = {}) {
       const config = context.config;
       const token = context.token;
       const state = context.inboxState;
+      const trackedReply = (payload) => context.trackDiscordRest(() => sendDiscordReply({ token, ...payload }));
       const channelIds = [String(config.discordTaskChannelId), String(config.discordConfirmationChannelId)];
-      const rolloutState = await readRolloutWatcherState(rolloutWatcherStatePath, { sessionsRoot });
+      const rolloutState = await readRolloutWatcherStateImpl(rolloutWatcherStatePath, { sessionsRoot });
       context.rolloutState = rolloutState;
       if (!context.inboxReadOnly) {
         await initializeInboxCursors({
           state,
           channelIds,
-          getLatest: (channelId) => getLatestDiscordMessageId({ token, channelId }),
+          getLatest: (channelId) => context.trackDiscordRest(() => getLatestDiscordMessageId({ token, channelId })),
         });
-        await commitInboxState({ state, persistState: saveState });
+        await commitInboxState({ state, persistState: persistInboxStateImpl });
       }
-      await initializeRolloutWatcherState({ sessionsRoot, state: rolloutState });
-      await writeRolloutWatcherState(rolloutWatcherStatePath, rolloutState);
-      await log('bridge-started');
-      await log('completion-watcher-started');
+      await initializeRolloutWatcherStateImpl({ sessionsRoot, state: rolloutState, inboxState: state });
+      await writeRolloutWatcherStateImpl(rolloutWatcherStatePath, rolloutState);
+      await logImpl('bridge-started');
+      await logImpl('completion-watcher-started');
 
       let stopping = false;
       let wake = null;
@@ -853,9 +1195,24 @@ function createProductionBridgeDependencies({ runOnce = false } = {}) {
         do {
           const progressBefore = rolloutProgressFingerprint(rolloutState);
           try {
-            await pollRolloutCompletions({
+            if (!context.inboxReadOnly) {
+              try {
+                await pollDiscordOriginEvents({
+                  sessionsRoot,
+                  inboxState: state,
+                  persistInboxState: persistInboxStateImpl,
+                  dispatchMessage: trackedReply,
+                });
+              } catch {
+                context.setLatestErrorCategory('origin-progress-failed');
+                await log('origin-progress-failed');
+              }
+            }
+            await pollRolloutCompletionsImpl({
               sessionsRoot,
               state: rolloutState,
+              inboxState: context.inboxReadOnly ? undefined : state,
+              persistInboxState: context.inboxReadOnly ? undefined : persistInboxStateImpl,
               dispatchNotification: async (notification) => {
                 await dispatchNotificationViaPowerShell({
                   notification,
@@ -870,11 +1227,11 @@ function createProductionBridgeDependencies({ runOnce = false } = {}) {
               rolloutState.lastProgressAt = context.timestamps.lastRolloutProgressAt;
             }
           } catch {
-            context.latestErrorCategory = 'rollout-poll-failed';
-            await log('rollout-poll-failed');
+              context.setLatestErrorCategory('rollout-poll-failed');
+            await logImpl('rollout-poll-failed');
           } finally {
-            await writeRolloutWatcherState(rolloutWatcherStatePath, rolloutState).catch(async () => {
-              await log('rollout-state-save-failed');
+            await writeRolloutWatcherStateImpl(rolloutWatcherStatePath, rolloutState).catch(async () => {
+              await logImpl('rollout-state-save-failed');
             });
           }
           if (!context.inboxReadOnly) {
@@ -885,9 +1242,10 @@ function createProductionBridgeDependencies({ runOnce = false } = {}) {
                 state,
                 onRetry: () => context.recordActivity('lastQueueRetryAt'),
                 trackActiveResource: context.trackActiveResource,
+                sendReply: trackedReply,
               });
             } catch {
-              context.latestErrorCategory = 'queue-retry-failed';
+              context.setLatestErrorCategory('queue-retry-failed');
               await log('queue-retry-failed');
             }
             for (const channelId of channelIds) {
@@ -898,13 +1256,21 @@ function createProductionBridgeDependencies({ runOnce = false } = {}) {
                   config,
                   state,
                   channelId,
-                  continueRequest: (payload) => startContinuation({
-                    ...payload,
-                    trackActiveResource: context.trackActiveResource,
-                  }),
+                  getMessages: (options) => context.trackDiscordRest(() => getDiscordMessagesAfter(options)),
+                continueRequest: async (payload) => {
+                  try {
+                    return await startContinuation({
+                      ...payload,
+                      trackActiveResource: context.trackActiveResource,
+                      sendReply: trackedReply,
+                    });
+                  } finally {
+                    context.publishHealth?.();
+                  }
+                },
                 });
               } catch {
-                context.latestErrorCategory = 'channel-poll-failed';
+                context.setLatestErrorCategory('channel-poll-failed');
                 await log('channel-poll-failed', { channelId });
               }
             }
@@ -912,19 +1278,9 @@ function createProductionBridgeDependencies({ runOnce = false } = {}) {
           const now = Date.now();
           if (!stopping && now - lastIndexRefresh >= indexRefreshIntervalMs) {
             try {
-              const rebuilt = await buildTaskIndex({
-                sessionsRoot,
-                sessionIndexPath,
-                messageMapPath: mappingPath,
-                previousIndex: context.taskIndex,
-                discordWorktreeRoot: config.discordWorktreeRoot,
-                nowMs: now,
-              });
-              replaceIndex(context.taskIndex, rebuilt);
-              await writeTaskIndexAtomic(taskIndexPath, context.taskIndex);
-              context.recordActivity('lastIndexUpdateAt', rebuilt.generatedAt);
+              await refreshTaskIndex(context, { nowMs: now });
             } catch {
-              context.latestErrorCategory = 'index-refresh-failed';
+              context.setLatestErrorCategory('index-refresh-failed');
               await log('index-refresh-failed');
             }
             lastIndexRefresh = now;
@@ -941,9 +1297,22 @@ function createProductionBridgeDependencies({ runOnce = false } = {}) {
         },
       };
     },
-    persistTaskIndex: (context) => writeTaskIndexAtomic(taskIndexPath, context.taskIndex),
-    persistInboxState: (context) => context.inboxReadOnly ? undefined : saveState(context.inboxState),
+    persistTaskIndex: persistCurrentTaskIndex,
+    persistInboxState: (context) => context.inboxReadOnly ? undefined : persistInboxStateImpl(context.inboxState),
     persistRolloutState: (context) => writeRolloutWatcherState(rolloutWatcherStatePath, context.rolloutState),
+    publishHealth: async (context, { signal, shouldCommit, forceFinal } = {}) => {
+      const status = context.getSystemStatus();
+      await writeBridgeHealthAtomic(bridgeHealthPath, {
+        gateway: status.gateway,
+        discordRest: status.discordRest,
+        queueCount: status.queueCount,
+        startedAt: context.startedAt,
+        lastActivityAt: latestTimestamp(status.timestamps),
+        latestEventCategory: status.latestErrorCategory,
+      }, { signal, shouldCommit, bypassQueue: Boolean(forceFinal) });
+    },
+    logHealthFailure: (category) => log(category),
+    invalidateHealth: () => fs.rm(bridgeHealthPath, { force: true }),
   };
 }
 

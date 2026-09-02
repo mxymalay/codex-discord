@@ -1,6 +1,6 @@
 # Codex Discord 私有命令控制台
 
-这个工具把 Codex 的任务完成、待确认和周额度通知发送到三个独立的 Discord 频道，并在同一个私有 Bot 中提供 10 个中文 Slash Commands。桥接器只服务配置中的一个 Discord 服务器和一个授权用户；查询结果、按钮回执、Modal 回执和错误信息均为 Ephemeral，且禁用 mentions。
+这个工具把 Codex 的任务完成、待确认和周额度通知发送到三个独立的 Discord 频道，并在同一个私有 Bot 中提供 11 个中文 Slash Commands。桥接器只服务配置中的一个 Discord 服务器和一个授权用户；查询结果、按钮回执、Modal 回执和错误信息均为 Ephemeral，且禁用 mentions。
 
 所有能力运行在一个 `Codex Discord Bridge` 进程中：Discord Gateway、Slash Commands、任务索引、新建/继续任务、通知回复补收、继续队列重试和 rollout 完成补发共享同一份状态。无需公网地址或第二个命令服务。
 
@@ -32,7 +32,7 @@ Copy-Item .\config.example.json .\config.json
 node .\discord-bridge.mjs --register-commands --once
 ```
 
-成功输出应确认 10 个 Guild Commands。正常服务由计划任务启动：
+成功输出应确认 11 个 Guild Commands。正常服务由计划任务启动：
 
 ```powershell
 Get-ScheduledTask -TaskName 'Codex Discord Bridge'
@@ -49,6 +49,7 @@ Get-ScheduledTask -TaskName 'Codex Discord Bridge'
 - `/额度`：只读最后一份本机周额度快照，不伪造刷新。
 - `/系统状态`：显示 Gateway、REST、通知、rollout、索引、队列、额度和最近活动时间。
 - `/系统测试 [类型]`：`快速`只做本机和 REST 检查；`完整`额外向三个频道各发送一条明确标注的测试通知。
+- `/退出Codex`：先显示可能中断的桌面主任务，再通过五分钟内有效的一次性二次确认退出 Codex 桌面端。
 - `/帮助`：显示命令、隐私和离线限制。
 
 自动补全、命令、按钮和 Modal 每次都会重新校验 Guild 和授权用户。任务详情与继续操作只接受已索引的侧边栏主任务；子智能体、后台回合、心跳和内部任务不会进入索引。
@@ -67,9 +68,44 @@ Get-ScheduledTask -TaskName 'Codex Discord Bridge'
 
 任务完成和待确认通知仍支持直接回复任意文本。桥接器只接受授权用户对已映射 Bot 通知的回复，并续接原任务，不新建任务。额度频道回复一律忽略。
 
-任务被桌面端占用时，通知回复和 `/继续任务` 共用持久化队列，每 30 秒重试。电脑关机或 Bot 离线期间不能执行 Slash Commands；Discord 仍保留普通频道回复，下一次登录后桥接器会从持久游标补读。已进入本地队列的内容在重启后继续恢复。
+任务被桌面端占用时，通知回复和 `/继续任务` 共用持久化队列，每 30 秒重试。遇到 `active-writer`（写入者占用）时，内容一定先安全落入队列；如果占用者是受信的 Codex 桌面端，回执会显示活动主任务，并提供明确的接管确认。桥接器不会让桌面端和 Discord 同时写同一任务。
+
+`/退出Codex` 不会直接结束程序。它先刷新活动主任务并显示风险预览，用户按下二次确认后还会复核清单；出现新活动任务时旧确认失效。退出范围只限于已验证的 Microsoft Store Codex 桌面进程树，不会按名称结束其他 `codex.exe`。确认退出后，绑定的继续请求才会优先重试。
+
+从 Discord `/新建任务` 或 `/继续任务` 发起的工作，其 commentary、脱敏后的工具开始/完成/失败进度、待确认和最终结果都发送回发起任务的原频道；多项任务不会串频道。Codex 桌面端自己发起的任务仍整理到固定的“任务完成”或“任务待确认”频道，额度变化仍只发额度频道。原始命令、完整工具输出、代码、密钥和本机路径不会作为工具进度转发。
+
+桥接服务驻留在本机，Codex 桌面端可以关闭，不会因此让 Bot 下线。电脑仍必须开机、保持 Windows 用户已登录、处于唤醒状态并已联网；关机、休眠、注销或 Bot 离线期间不能执行 Slash Commands。Discord 会保留普通频道回复，下一次电脑恢复、登录并联网后，桥接器从持久游标补读；已进入本地队列的内容会在重启后继续恢复。
 
 Codex 原生 `notify` 仍是快速通知通道。桥接器同时监听 rollout 的 `task_complete`，在原生通知未送达时补发，并通过 turn ID 去重。两条旧路径都由单进程集成保留。
+
+## Windows 控制台与四种运行方式
+
+桌面的 `Codex Discord 控制台` 每两秒刷新桥接服务、开机自启、Discord、Codex 桌面端、继续队列和最后活动状态。四个按钮的含义是：
+
+- `临时开启`：立即运行桥接，但不改变长期自启设置；若长期处于停用，下一次登录不会自动恢复。
+- `临时停止`：立即停止桥接，但不改变长期自启设置；若长期开启，下次登录仍会自动运行。
+- `长期开启`：立即运行桥接，并启用当前 Windows 用户登录时自动启动。
+- `长期停用`：停止桥接并禁用登录自启；通知 guard 不会越权重新安装或拉起它。Token、队列和历史状态均保留。
+
+临时操作只改变“现在是否运行”，不会偷偷改变长期选择。要重新运行，打开控制台选择对应的开启按钮；要长期停用，使用按钮并确认，也可以执行：
+
+```powershell
+pwsh -NoProfile -File .\codex-control.ps1 -Action disable-long-term
+```
+
+## 安全部署、更新与恢复
+
+在仓库根目录执行下面一条部署命令，可更新受控运行文件、重建 EXE、更新桌面快捷方式和恢复服务。部署只复制固定白名单，先完整暂存并校验 SHA-256，再把将被覆盖的旧文件放入时间戳备份；不会复制或覆盖配置、Token、队列、额度、任务索引、健康状态、日志或其他未知文件。
+
+```powershell
+.\deploy.ps1 -SourceRoot (Resolve-Path .).Path -LiveRoot (Join-Path $env:CODEX_HOME 'mobile-notify') -DesktopPath ([Environment]::GetFolderPath('Desktop'))
+```
+
+如果只删除了桌面快捷方式或 `CodexDiscordControl.exe`，从仓库再次执行同一条命令即可重建并恢复。若只想验证安全文件部署和 EXE 构建，可向一个隔离目录使用 `-SkipLiveActions`；它不会停止/启动服务、注册 Discord 命令或改桌面快捷方式。
+
+部署失败会以非零状态退出，已提交的文件自动回滚；输出中的备份目录会保留，可人工恢复。部署不会调用 `/退出Codex`，也不会结束 Codex 桌面端。长期停用的用户选择会保留，不会因更新而擅自改成长期开启。
+
+Markdown 标题、字段名和列表结构由 Bot 生成；来自任务或用户的值会先转义、截断并禁用 mentions。`config.json`、`discord-token.dpapi`、运行时 JSON、日志、备份、EXE 和快捷方式属于 live 状态或生成物，不进入 Git、不提交到仓库。
 
 ## 系统测试
 
@@ -104,6 +140,7 @@ git diff --check
 - `task-delivery-state.json`：原生通知与补发通知的 turn 去重状态。
 - `quota-state.json`：`/额度` 只读的最后已知额度快照。
 - `discord-bridge.log`：脱敏的组件类别和短 ID，不记录 Token 或完整用户输入。
+- `discord-bridge-runtime.json`、`discord-bridge-health.json`：当前 supervisor 身份和脱敏健康快照；可重建，不提交。
 
 索引丢失或损坏时从 `sessions` 与侧边栏索引重建。继续队列和任务创建 journal 不会根据不完整数据猜测重放外部操作。Token、配置、日志和运行时 JSON 不应提交、发布或用示例文件覆盖。
 

@@ -3,7 +3,12 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 
-import { AppServerClient, commitInboxState, initializeAppServerClient } from './discord-bridge-lib.mjs';
+import {
+  AppServerClient,
+  commitInboxState,
+  createDiscordTurnOriginRecord,
+  initializeAppServerClient,
+} from './discord-bridge-lib.mjs';
 
 export const NO_PROJECT = '__projectless__';
 
@@ -150,6 +155,9 @@ export function createProjectCatalog({ loader, ttlMs = 60_000, now = Date.now } 
       return snapshotChoices(focused);
     },
     snapshotChoices,
+    snapshot() {
+      return projects.map((item) => structuredClone(item));
+    },
     refresh() {
       return startRefresh();
     },
@@ -598,21 +606,70 @@ function persistenceError() {
   return error;
 }
 
-async function persistInteractionRecord({ state, interactionId, record, persistState }) {
+async function persistInteractionRecord({ state, interactionId, record, persistState, discordTurnOrigin }) {
   try {
+    const origin = discordTurnOrigin ? createDiscordTurnOriginRecord(discordTurnOrigin) : null;
     await commitInboxState({
       state,
       persistState,
-      entries: { createdTasksByInteraction: [interactionId] },
+      entries: {
+        createdTasksByInteraction: [interactionId],
+        discordTurnOrigins: origin ? [origin.turnId] : [],
+      },
       mutate: () => {
         state.createdTasksByInteraction ??= {};
         state.createdTasksByInteraction[interactionId] = record;
+        if (origin) {
+          state.discordTurnOrigins ??= {};
+          const { turnId, ...value } = origin;
+          const existing = state.discordTurnOrigins[turnId];
+          if (existing && (existing.threadId !== value.threadId || existing.guildId !== value.guildId ||
+              existing.channelId !== value.channelId)) {
+            throw new Error('Discord turn origin conflicts with an existing binding');
+          }
+          state.discordTurnOrigins[turnId] ??= value;
+        }
       },
       errorMessage: 'Task creation state persistence failed',
     });
   } catch {
     throw persistenceError();
   }
+}
+
+export async function recordTaskCreationReceiptOutcome({
+  state,
+  interactionId,
+  status,
+  messageId,
+  errorCategory,
+  now = new Date(),
+  persistState,
+} = {}) {
+  if (!state || typeof state !== 'object') throw new TypeError('Task creation state is required');
+  if (!interactionId) throw new Error('Interaction ID is required');
+  if (!['original-edited', 'followup-sent', 'failed'].includes(String(status ?? ''))) {
+    throw new Error('Invalid creation receipt status');
+  }
+  const current = state.createdTasksByInteraction?.[interactionId];
+  if (!current) return false;
+  const observedNow = typeof now === 'function' ? now() : now;
+  const updatedAt = new Date(observedNow instanceof Date ? observedNow.getTime() : Number(observedNow)).toISOString();
+  const record = {
+    ...current,
+    receiptStatus: status,
+    receiptUpdatedAt: updatedAt,
+  };
+  delete record.receiptMessageId;
+  delete record.receiptErrorCategory;
+  if (messageId) record.receiptMessageId = String(messageId).slice(0, 128);
+  if (status === 'failed') {
+    record.receiptErrorCategory = errorCategory === 'creation-receipt-delivery-failed'
+      ? errorCategory
+      : 'creation-receipt-delivery-failed';
+  }
+  await persistInteractionRecord({ state, interactionId, record, persistState });
+  return true;
 }
 
 async function sourceMatchesProof({ proof, gitRunner }) {
@@ -795,6 +852,7 @@ export async function createNewTaskOnce({
   fileSystem = fs,
   persistState,
   now = new Date(),
+  discordOrigin,
 } = {}) {
   if (!state || typeof state !== 'object') throw new TypeError('Task creation state is required');
   if (!interactionId) throw new Error('Interaction ID is required');
@@ -820,11 +878,23 @@ export async function createNewTaskOnce({
   });
   stateFlights.set(interactionId, operation);
   (async () => {
+    const projectIdentity = {
+      projectId: selection?.kind === 'project' ? selection.projectId : null,
+      projectName: selection?.projectName ?? (selection?.kind === 'project' ? selection.projectId : '无项目'),
+    };
+    const originIntent = discordOrigin ? {
+      guildId: discordOrigin.guildId,
+      channelId: discordOrigin.channelId,
+      source: 'new-task',
+      projectId: discordOrigin.projectId ?? null,
+      projectName: discordOrigin.projectName ?? null,
+      createdAt: now.toISOString(),
+    } : undefined;
     let prepared = null;
     let started = null;
     try {
       await persistInteractionRecord({
-        state, interactionId, record: { status: 'creating' }, persistState,
+        state, interactionId, record: { status: 'creating', ...projectIdentity }, persistState,
       });
       prepared = await prepareTaskWorkspace({
         selection,
@@ -836,7 +906,7 @@ export async function createNewTaskOnce({
         onWorkspacePlanned: async (workspace) => persistInteractionRecord({
           state,
           interactionId,
-          record: { status: 'creating', workspace: persistableWorkspace(workspace) },
+          record: { status: 'creating', ...projectIdentity, workspace: persistableWorkspace(workspace) },
           persistState,
         }),
       });
@@ -844,7 +914,7 @@ export async function createNewTaskOnce({
       await persistInteractionRecord({
         state,
         interactionId,
-        record: { status: 'workspace-ready', workspace: persistentWorkspace },
+        record: { status: 'workspace-ready', ...projectIdentity, workspace: persistentWorkspace },
         persistState,
       });
       started = await startNewCodexTask({
@@ -859,7 +929,7 @@ export async function createNewTaskOnce({
           await persistInteractionRecord({
             state,
             interactionId,
-            record: { status: 'thread-starting', workspace: persistentWorkspace },
+            record: { status: 'thread-starting', ...projectIdentity, workspace: persistentWorkspace },
             persistState,
           });
         },
@@ -869,9 +939,11 @@ export async function createNewTaskOnce({
             interactionId,
             record: {
               status: 'thread-created',
+              ...projectIdentity,
               threadId,
               taskName,
               workspace: persistentWorkspace,
+              ...(originIntent ? { originIntent } : {}),
             },
             persistState,
           });
@@ -883,9 +955,21 @@ export async function createNewTaskOnce({
         threadId: started.threadId,
         turnId: started.turnId,
         taskName: started.taskName,
+        ...projectIdentity,
         workspace: persistentWorkspace,
       };
-      await persistInteractionRecord({ state, interactionId, record, persistState });
+      await persistInteractionRecord({
+        state,
+        interactionId,
+        record,
+        persistState,
+        discordTurnOrigin: discordOrigin ? {
+          ...discordOrigin,
+          turnId: started.turnId,
+          threadId: started.threadId,
+          createdAt: now.toISOString(),
+        } : null,
+      });
       return {
         ...record,
         completion: started.completion,
@@ -900,6 +984,16 @@ export async function createNewTaskOnce({
       }
       const current = state.createdTasksByInteraction[interactionId];
       if (error?.persistenceFailure) {
+        if (started) {
+          return {
+            status: 'start-uncertain',
+            threadId: started.threadId,
+            turnId: started.turnId,
+            taskName: started.taskName,
+            ...projectIdentity,
+            workspace: persistableWorkspace(started.workspace),
+          };
+        }
         throw error;
       }
       if (error?.threadId || current?.threadId) {
@@ -907,6 +1001,7 @@ export async function createNewTaskOnce({
           status: 'first-turn-failed',
           threadId: error?.threadId ?? current.threadId,
           taskName: error?.taskName ?? current.taskName ?? '生成中',
+          ...projectIdentity,
           workspace: persistableWorkspace(error?.workspace ?? prepared ?? current.workspace),
           errorCategory: taskCreationErrorCategory(error),
         };
@@ -926,6 +1021,7 @@ export async function createNewTaskOnce({
         persistState,
         finalRecord: {
           status: 'failed-before-thread',
+          ...projectIdentity,
           workspace,
           errorCategory: taskCreationErrorCategory(error),
         },
@@ -940,9 +1036,63 @@ export async function createNewTaskOnce({
   }
 }
 
+function isExactRootSessionMeta(payload, threadId) {
+  if (!payload || typeof payload !== 'object' || String(payload.id ?? '') !== threadId) return false;
+  if (String(payload.thread_source ?? '').trim() && payload.thread_source !== 'user') return false;
+  if (String(payload.parent_thread_id ?? '').trim()) return false;
+  if (String(payload.session_id ?? '').trim() && String(payload.session_id) !== threadId) return false;
+  if (payload.source && typeof payload.source === 'object' && Object.entries(payload.source).some(
+    ([key, value]) => key.toLocaleLowerCase() === 'subagent' && value != null,
+  )) return false;
+  return true;
+}
+
+async function listRegularRollouts(root) {
+  if (!root || !path.isAbsolute(root)) return [];
+  const found = [];
+  const visit = async (directory) => {
+    let entries;
+    try { entries = await fs.readdir(directory, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      const candidate = path.join(directory, entry.name);
+      if (entry.isDirectory()) await visit(candidate);
+      else if (entry.isFile() && entry.name.endsWith('.jsonl')) found.push(candidate);
+    }
+  };
+  await visit(root);
+  return found;
+}
+
+async function findUniqueRootTurn(sessionsRoot, threadId) {
+  const candidates = [];
+  for (const filePath of await listRegularRollouts(sessionsRoot)) {
+    let info;
+    try { info = await fs.stat(filePath); } catch { continue; }
+    if (!info.isFile() || info.size <= 0 || info.size > 16 * 1024 * 1024) continue;
+    let content;
+    try { content = await fs.readFile(filePath, 'utf8'); } catch { continue; }
+    const entries = [];
+    let invalid = false;
+    for (const line of content.split(/\r?\n/u)) {
+      if (!line) continue;
+      try { entries.push(JSON.parse(line)); } catch { invalid = true; break; }
+    }
+    if (invalid) continue;
+    const metas = entries.filter((entry) => entry?.type === 'session_meta');
+    if (metas.length !== 1 || !isExactRootSessionMeta(metas[0].payload, threadId)) continue;
+    const turnIds = entries
+      .filter((entry) => entry?.type === 'event_msg' && entry.payload?.type === 'task_started')
+      .map((entry) => String(entry.payload?.turn_id ?? ''))
+      .filter(Boolean);
+    if (turnIds.length === 1) candidates.push(turnIds[0]);
+  }
+  return candidates.length === 1 ? candidates[0] : null;
+}
+
 export async function recoverInterruptedTaskCreations({
   state,
   worktreeRoot,
+  sessionsRoot,
   gitRunner = runGitWithSpawn,
   persistState,
   nowMs = Date.now(),
@@ -952,6 +1102,20 @@ export async function recoverInterruptedTaskCreations({
   state.createdTasksByInteraction ??= {};
   const results = [];
   for (const [interactionId, record] of Object.entries(state.createdTasksByInteraction)) {
+    if (record?.status === 'thread-created' && record.threadId && record.originIntent) {
+      const turnId = await findUniqueRootTurn(sessionsRoot, record.threadId);
+      if (!turnId) continue;
+      const { originIntent, ...rest } = record;
+      await persistInteractionRecord({
+        state,
+        interactionId,
+        record: { ...rest, status: 'started', turnId },
+        persistState,
+        discordTurnOrigin: { ...originIntent, threadId: record.threadId, turnId },
+      });
+      results.push({ interactionId, status: 'started', recoveredTurnId: turnId });
+      continue;
+    }
     if (!['creating', 'workspace-ready', 'recovering', 'cleanup-proven', 'worktree-removed'].includes(record?.status)
       || record?.threadId) continue;
     if (!['cleanup-proven', 'worktree-removed'].includes(record.status)) {

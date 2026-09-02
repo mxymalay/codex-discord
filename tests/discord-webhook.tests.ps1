@@ -96,7 +96,7 @@ try {
         $failures += "[complete color] expected green 3066993, got $($completed.payload.embeds[0].color)"
     }
     $completedFields = @($completed.payload.embeds[0].fields)
-    if (($completedFields | Where-Object { $_.name -eq '项目名' }).value -ne 'demo-project') {
+    if (($completedFields | Where-Object { $_.name -eq '项目名' }).value -ne 'demo\-project') {
         $failures += '[complete fields] project field is missing or incorrect'
     }
     if (($completedFields | Where-Object { $_.name -eq '任务名' }).value -ne 'Discord 格式测试任务') {

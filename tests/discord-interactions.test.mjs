@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
+import * as interactionModule from '../discord-interactions.mjs';
+
 import { COMMAND_NAMES } from '../discord-commands-lib.mjs';
 import {
   cancelContinuationPersisted,
@@ -50,6 +52,7 @@ function commandInteraction(name, options = {}, overrides = {}) {
     token: overrides.token ?? 'interaction-token-must-not-be-stored',
     application_id: '111',
     type: 2,
+    channel_id: overrides.channelId ?? '777777777777777777',
     ...identity(overrides.userId, overrides.guildId),
     data: {
       name,
@@ -64,6 +67,7 @@ function autocompleteInteraction(name, focused, overrides = {}) {
     id: overrides.id ?? `autocomplete-${name}`,
     token: overrides.token ?? 'autocomplete-token-must-not-be-stored',
     type: 4,
+    channel_id: overrides.channelId ?? '777777777777777777',
     ...identity(overrides.userId, overrides.guildId),
     data: { name, options: [{ name: optionName, type: 3, value: focused, focused: true }] },
   };
@@ -74,6 +78,7 @@ function modalSubmit(customId, text, overrides = {}) {
     id: overrides.id ?? 'modal-submit-1',
     token: overrides.token ?? 'modal-token-must-not-be-stored',
     type: 5,
+    channel_id: overrides.channelId ?? '777777777777777777',
     ...identity(overrides.userId, overrides.guildId),
     data: {
       custom_id: customId,
@@ -87,7 +92,9 @@ function componentInteraction(customId, overrides = {}) {
     id: overrides.id ?? 'component-1',
     token: overrides.token ?? 'component-token-must-not-be-stored',
     type: 3,
+    channel_id: overrides.channelId ?? '777777777777777777',
     ...identity(overrides.userId, overrides.guildId),
+    message: { id: overrides.messageId ?? 'takeover-message-1' },
     data: { custom_id: customId, component_type: 2 },
   };
 }
@@ -128,6 +135,8 @@ function deterministicRandom() {
 function makeDependencies(overrides = {}) {
   const responses = [];
   const edits = [];
+  const followups = [];
+  const receiptOutcomes = [];
   const projects = overrides.projects ?? [{ id: 'project-1', name: 'POS', roots: ['C:\\saved\\POS'] }];
   const events = overrides.events ?? [];
   const taskIndex = overrides.taskIndex ?? { generatedAt: new Date(NOW).toISOString(), tasks: [task(1), task(2)] };
@@ -160,17 +169,46 @@ function makeDependencies(overrides = {}) {
     runQuickHealthChecks: overrides.runQuickHealthChecks ?? (async () => [{ key: 'quick', label: '快速检查', ok: true, latencyMs: 1, detail: '正常' }]),
     runFullHealthChecks: overrides.runFullHealthChecks ?? (async () => [{ key: 'full', label: '完整检查', ok: true, latencyMs: 1, detail: '正常' }]),
     getQueue: overrides.getQueue ?? (() => []),
+    refreshTaskIndex: overrides.refreshTaskIndex ?? (async () => taskIndex),
+    getCodexControlStatus: overrides.getCodexControlStatus ?? (async () => ({ ok: true, desktop: { running: false } })),
+    stopCodexDesktop: overrides.stopCodexDesktop ?? (async () => ({ ok: true, alreadyStopped: false, stoppedProcessCount: 1 })),
     dispatchContinuation: overrides.dispatchContinuation ?? (async () => ({ status: 'started', turnId: 'turn-continued' })),
+    claimContinuationTakeover: overrides.claimContinuationTakeover ?? (async ({ queueId, targetThreadId }) => ({
+      status: 'claimed', queueId, targetThreadId, claimId: 'claim-1234567890',
+    })),
+    releaseContinuationTakeoverClaim: overrides.releaseContinuationTakeoverClaim ?? (async (claim) => ({
+      status: 'queued', queueId: claim.queueId, reason: 'active-writer',
+    })),
+    retryContinuation: overrides.retryContinuation ?? (async (claim) => ({
+      status: 'started', queueId: claim.queueId, turnId: 'turn-continued',
+    })),
     cancelContinuation: overrides.cancelContinuation ?? (() => ({ status: 'cancelled' })),
     persistContinuationState: overrides.persistContinuationState ?? (async () => {}),
     respond: overrides.respond ?? (async (body) => { responses.push(body); }),
-    editOriginal: overrides.editOriginal ?? (async (body) => { edits.push(body); }),
+    editOriginal: overrides.editOriginal ?? (async (body) => { edits.push(body); return { id: 'takeover-message-1' }; }),
+    followup: overrides.followup ?? (async (body) => { followups.push(body); return { id: 'creation-followup-1' }; }),
+    recordCreationReceiptOutcome: overrides.recordCreationReceiptOutcome ?? (async (interactionId, outcome) => {
+      receiptOutcomes.push({ interactionId, outcome: structuredClone(outcome) });
+    }),
     randomBytes: overrides.randomBytes ?? deterministicRandom(),
     now: overrides.now ?? (() => NOW),
     uiState: overrides.uiState ?? new Map(),
     ...overrides,
   };
-  return { dependencies, responses, edits, events, taskIndex };
+  return { dependencies, responses, edits, followups, receiptOutcomes, events, taskIndex };
+}
+
+async function submitContinuationModal(router, responses, {
+  threadId = 'root-1', text = '继续处理该任务', interactionId = 'continue-submit-active-writer',
+} = {}) {
+  await router.handle(commandInteraction('继续任务', { 任务: threadId }));
+  const modal = responses.shift();
+  assert.equal(modal.type, 9);
+  await router.handle(modalSubmit(modal.data.custom_id, text, {
+    fieldId: '继续内容', id: interactionId,
+  }));
+  const deferred = responses.shift();
+  assert.equal(deferred.type, 5);
 }
 
 test('task autocomplete returns at most 25 authorized in-memory root tasks without detail reads', async () => {
@@ -360,8 +398,11 @@ test('list, search, receipts, and detail metadata cannot inject structural Markd
   assert.equal(list.includes('\n```js'), false);
   assert.equal(list.includes('**bold**'), false);
   const detail = renderTaskDetail(hostile);
-  assert.match(detail, /# full task Markdown\n```js\nconst ok = true;/);
-  assert.match(detail, /\*\*full result Markdown\*\*/);
+  assert.equal(detail.includes('\n# full task Markdown'), false);
+  assert.equal(detail.includes('\n```js'), false);
+  assert.equal(detail.includes('**full result Markdown**'), false);
+  assert.match(detail, /\\# full task Markdown/u);
+  assert.match(detail, /\\\*\\\*full result Markdown\\\*\\\*/u);
   assert.equal(detail.includes('\n# injected'), false);
 
   const huge = 'X\n# injected **bold**'.repeat(1_000);
@@ -823,6 +864,435 @@ test('continue UI reports an uncertain external start without claiming failure',
   assert.equal(rendered.includes('状态：失败'), false);
 });
 
+test('active-writer continuation shows a five-minute message-bound takeover recommendation', async () => {
+  const uiState = new Map();
+  const currentIndex = { tasks: [
+    task(1, { status: 'running', rolloutPath: 'C:\\private\\root-1.jsonl' }),
+    task(2, { status: 'confirmation-required', rolloutPath: 'C:\\private\\root-2.jsonl' }),
+  ] };
+  const { dependencies, responses, edits } = makeDependencies({
+    uiState,
+    refreshTaskIndex: async () => currentIndex,
+    getCodexControlStatus: async () => ({
+      ok: true, desktop: { running: true, path: 'C:\\private\\ChatGPT.exe' },
+    }),
+    dispatchContinuation: async () => ({
+      status: 'queued', reason: 'active-writer', queueId: 'queue-private-1',
+    }),
+  });
+  const router = createInteractionRouter(dependencies);
+
+  await submitContinuationModal(router, responses);
+
+  assert.match(edits[0].content, /已安全排队/);
+  assert.match(edits[0].embeds[0].description, /门店任务 1（正在执行，目标任务）/);
+  assert.deepEqual(edits[0].components[0].components.map((button) => [button.label, button.style]), [
+    ['退出 Codex 并立即继续', 4], ['保持排队', 2],
+  ]);
+  const takeoverState = [...uiState.values()].find((state) => state.kind === 'takeover-continue');
+  assert.equal(takeoverState.queueId, 'queue-private-1');
+  assert.equal(takeoverState.targetThreadId, 'root-1');
+  assert.equal(takeoverState.userId, '333');
+  assert.equal(takeoverState.guildId, '222');
+  assert.equal(takeoverState.messageId, 'takeover-message-1');
+  assert.equal(takeoverState.expiresAt, NOW + 5 * 60_000);
+  const serialized = JSON.stringify(edits[0]);
+  assert.equal(serialized.includes('queue-private-1'), false);
+  assert.equal(serialized.includes('root-1'), false);
+  assert.equal(serialized.includes('private\\'), false);
+});
+
+test('untrusted desktop or task state keeps active-writer work queued without destructive controls', async (t) => {
+  const cases = [
+    {
+      name: 'desktop stopped',
+      refreshTaskIndex: async () => ({ tasks: [task(1, { status: 'running' })] }),
+      getCodexControlStatus: async () => ({ ok: true, desktop: { running: false } }),
+    },
+    {
+      name: 'desktop status unavailable',
+      refreshTaskIndex: async () => ({ tasks: [task(1, { status: 'running' })] }),
+      getCodexControlStatus: async () => { throw new Error('private status detail'); },
+    },
+    {
+      name: 'task index unavailable',
+      refreshTaskIndex: async () => { throw new Error('C:\\private\\sessions'); },
+      getCodexControlStatus: async () => ({ ok: true, desktop: { running: true } }),
+    },
+  ];
+  for (const entry of cases) {
+    await t.test(entry.name, async () => {
+      const uiState = new Map();
+      const { dependencies, responses, edits } = makeDependencies({
+        uiState,
+        refreshTaskIndex: entry.refreshTaskIndex,
+        getCodexControlStatus: entry.getCodexControlStatus,
+        dispatchContinuation: async () => ({
+          status: 'queued', reason: 'active-writer', queueId: 'queue-hidden',
+        }),
+      });
+
+      await submitContinuationModal(createInteractionRouter(dependencies), responses, {
+        interactionId: `continue-${entry.name}`,
+      });
+
+      assert.match(edits[0].content, /已安全排队/);
+      assert.match(edits[0].content, /其他 CLI|插件/);
+      assert.match(edits[0].content, /保持排队|继续排队/);
+      assert.equal(edits[0].components?.length ?? 0, 0);
+      assert.equal([...uiState.values()].some((state) => state.kind === 'takeover-continue'), false);
+      assert.equal(JSON.stringify(edits[0]).includes('private'), false);
+    });
+  }
+});
+
+test('keep queued consumes only its exact takeover state through a deferred component update', async () => {
+  const uiState = new Map();
+  let stopCalls = 0;
+  let retryCalls = 0;
+  const currentIndex = { tasks: [task(1, { status: 'running' })] };
+  const { dependencies, responses, edits } = makeDependencies({
+    uiState,
+    refreshTaskIndex: async () => currentIndex,
+    getCodexControlStatus: async () => ({ ok: true, desktop: { running: true } }),
+    stopCodexDesktop: async () => { stopCalls += 1; return { ok: true }; },
+    retryContinuation: async () => { retryCalls += 1; return { status: 'started' }; },
+    dispatchContinuation: async () => ({ status: 'queued', reason: 'active-writer', queueId: 'queue-keep' }),
+  });
+  const router = createInteractionRouter(dependencies);
+  await submitContinuationModal(router, responses);
+  const keepId = edits[0].components[0].components[1].custom_id;
+
+  await router.handle(componentInteraction(keepId, { id: 'keep-queued' }));
+
+  assert.equal(responses[0].type, 6);
+  assert.equal(Object.hasOwn(responses[0], 'data'), false);
+  assert.match(edits.at(-1).content, /保持排队/);
+  assert.match(edits.at(-1).content, /继续队列/);
+  assert.equal(edits.at(-1).components.length, 0);
+  assert.equal(stopCalls, 0);
+  assert.equal(retryCalls, 0);
+  assert.equal([...uiState.values()].some((state) => state.kind === 'takeover-continue'), false);
+});
+
+test('confirmed takeover is tenant and message bound, stops once, and retries only its queue id once', async () => {
+  const uiState = new Map();
+  const stopped = [];
+  const claims = [];
+  const retriedClaims = [];
+  const currentIndex = { tasks: [task(1, { status: 'running' })] };
+  const { dependencies, responses, edits } = makeDependencies({
+    uiState,
+    refreshTaskIndex: async () => currentIndex,
+    getCodexControlStatus: async () => ({ ok: true, desktop: { running: true } }),
+    stopCodexDesktop: async () => { stopped.push('stop'); return { ok: true, stoppedProcessCount: 1 }; },
+    claimContinuationTakeover: async (target) => {
+      claims.push(target);
+      return { status: 'claimed', ...target, claimId: 'claim-exact-once' };
+    },
+    retryContinuation: async (claim) => {
+      retriedClaims.push(claim);
+      return { status: 'started', queueId: claim.queueId, turnId: 'turn-private-12345678' };
+    },
+    dispatchContinuation: async () => ({ status: 'queued', reason: 'active-writer', queueId: 'queue-exact' }),
+  });
+  const router = createInteractionRouter(dependencies);
+  await submitContinuationModal(router, responses);
+  const continueId = edits[0].components[0].components[0].custom_id;
+
+  await router.handle(componentInteraction(continueId, { userId: '444' }));
+  await router.handle(componentInteraction(continueId, { messageId: 'wrong-message' }));
+  assert.deepEqual(stopped, []);
+  assert.deepEqual(claims, []);
+  assert.deepEqual(retriedClaims, []);
+  assert.equal([...uiState.values()].some((state) => state.kind === 'takeover-continue'), true);
+
+  await Promise.all([
+    router.handle(componentInteraction(continueId, { id: 'takeover-valid' })),
+    router.handle(componentInteraction(continueId, { id: 'takeover-redelivery' })),
+  ]);
+
+  assert.deepEqual(stopped, ['stop']);
+  assert.deepEqual(claims, [{ queueId: 'queue-exact', targetThreadId: 'root-1' }]);
+  assert.equal(retriedClaims.length, 1);
+  assert.equal(retriedClaims[0].queueId, 'queue-exact');
+  assert.equal(retriedClaims[0].targetThreadId, 'root-1');
+  assert.equal(retriedClaims[0].claimId, 'claim-exact-once');
+  assert.equal(responses.some((body) => body.type === 6), true);
+  assert.match(edits.at(-1).content, /已开始继续执行/);
+  assert.match(edits.at(-1).content, /…12345678/);
+  assert.equal(edits.at(-1).content.includes('turn-private'), false);
+  assert.equal([...uiState.values()].some((state) => state.kind === 'takeover-continue'), false);
+});
+
+test('a desktop that exits after preview is idempotent success and still retries the bound queue once', async () => {
+  let desktopRunning = true;
+  let stopCalls = 0;
+  const retriedQueueIds = [];
+  const currentIndex = { tasks: [task(1, { status: 'running' })] };
+  const { dependencies, responses, edits } = makeDependencies({
+    refreshTaskIndex: async () => currentIndex,
+    getCodexControlStatus: async () => ({ ok: true, desktop: { running: desktopRunning } }),
+    stopCodexDesktop: async () => { stopCalls += 1; return { ok: true }; },
+    retryContinuation: async (claim) => {
+      retriedQueueIds.push(claim.queueId);
+      return { status: 'started', queueId: claim.queueId, turnId: 'turn-after-exit' };
+    },
+    dispatchContinuation: async () => ({ status: 'queued', reason: 'active-writer', queueId: 'queue-after-exit' }),
+  });
+  const router = createInteractionRouter(dependencies);
+  await submitContinuationModal(router, responses);
+  const continueId = edits[0].components[0].components[0].custom_id;
+  desktopRunning = false;
+
+  await router.handle(componentInteraction(continueId, { id: 'desktop-already-gone' }));
+
+  assert.equal(stopCalls, 0);
+  assert.deepEqual(retriedQueueIds, ['queue-after-exit']);
+  assert.match(edits.at(-1).content, /已开始继续执行/);
+});
+
+test('a cancelled queue item or background claim after preview fails closed before desktop stop', async (t) => {
+  for (const status of ['cancelled', 'resuming']) {
+    await t.test(status, async () => {
+      let queueStatus = 'queued';
+      let stopCalls = 0;
+      let retryCalls = 0;
+      const { dependencies, responses, edits } = makeDependencies({
+        refreshTaskIndex: async () => ({ tasks: [task(1, { status: 'running' })] }),
+        getCodexControlStatus: async () => ({ ok: true, desktop: { running: true } }),
+        dispatchContinuation: async () => ({ status: 'queued', reason: 'active-writer', queueId: `queue-${status}` }),
+        claimContinuationTakeover: async () => queueStatus === 'queued'
+          ? { status: 'claimed', queueId: `queue-${status}`, targetThreadId: 'root-1', claimId: 'claim-race-safe' }
+          : { status: 'unavailable', reason: 'queue-state-changed' },
+        stopCodexDesktop: async () => { stopCalls += 1; return { ok: true }; },
+        retryContinuation: async () => { retryCalls += 1; return { status: 'started' }; },
+      });
+      const router = createInteractionRouter(dependencies);
+      await submitContinuationModal(router, responses, { interactionId: `queue-race-${status}` });
+      const continueId = edits[0].components[0].components[0].custom_id;
+      queueStatus = status;
+
+      await router.handle(componentInteraction(continueId, { id: `queue-race-confirm-${status}` }));
+
+      assert.equal(stopCalls, 0);
+      assert.equal(retryCalls, 0);
+      assert.match(edits.at(-1).content, /队列状态已变化|保持排队/);
+    });
+  }
+});
+
+test('takeover claim thread mismatch or persistence failure never stops desktop', async (t) => {
+  for (const entry of [
+    { name: 'thread mismatch', result: { status: 'unavailable', reason: 'queue-state-changed' } },
+    { name: 'persist failed', result: { status: 'failed', reason: 'state-persist-failed' } },
+  ]) {
+    await t.test(entry.name, async () => {
+      let stopCalls = 0;
+      let retryCalls = 0;
+      const { dependencies, responses, edits } = makeDependencies({
+        refreshTaskIndex: async () => ({ tasks: [task(1, { status: 'running' })] }),
+        getCodexControlStatus: async () => ({ ok: true, desktop: { running: true } }),
+        dispatchContinuation: async () => ({ status: 'queued', reason: 'active-writer', queueId: 'queue-exact' }),
+        claimContinuationTakeover: async ({ queueId, targetThreadId }) => {
+          assert.equal(queueId, 'queue-exact');
+          assert.equal(targetThreadId, 'root-1');
+          return entry.result;
+        },
+        stopCodexDesktop: async () => { stopCalls += 1; return { ok: true }; },
+        retryContinuation: async () => { retryCalls += 1; return { status: 'started' }; },
+      });
+      const router = createInteractionRouter(dependencies);
+      await submitContinuationModal(router, responses, { interactionId: `claim-${entry.name}` });
+
+      await router.handle(componentInteraction(edits[0].components[0].components[0].custom_id));
+
+      assert.equal(stopCalls, 0);
+      assert.equal(retryCalls, 0);
+      assert.match(edits.at(-1).content, /未退出 Codex|保持排队/);
+    });
+  }
+});
+
+test('a failed takeover component defer consumes that state and releases the shared exit lock', async () => {
+  const uiState = new Map();
+  let failNextComponentDefer = true;
+  let stopCalls = 0;
+  let retryCalls = 0;
+  const currentIndex = { tasks: [task(1, { status: 'running' })] };
+  const { dependencies, responses, edits } = makeDependencies({
+    uiState,
+    refreshTaskIndex: async () => currentIndex,
+    getCodexControlStatus: async () => ({ ok: true, desktop: { running: true } }),
+    stopCodexDesktop: async () => { stopCalls += 1; return { ok: true }; },
+    retryContinuation: async () => { retryCalls += 1; return { status: 'started' }; },
+    dispatchContinuation: async (_request) => ({
+      status: 'queued', reason: 'active-writer', queueId: `queue-defer-${edits.length}`,
+    }),
+  });
+  dependencies.respond = async (body) => {
+    responses.push(body);
+    if (body.type === 6 && failNextComponentDefer) {
+      failNextComponentDefer = false;
+      throw new Error('offline callback failure');
+    }
+  };
+  const router = createInteractionRouter(dependencies);
+  await submitContinuationModal(router, responses, { interactionId: 'defer-failure-first' });
+  const failedId = edits[0].components[0].components[0].custom_id;
+
+  await assert.rejects(
+    router.handle(componentInteraction(failedId, { id: 'failed-component-defer' })),
+    /offline callback failure/u,
+  );
+  assert.equal(stopCalls, 0);
+  assert.equal(retryCalls, 0);
+  assert.equal([...uiState.values()].some((state) => state.kind === 'takeover-continue'), false);
+
+  responses.length = 0;
+  await submitContinuationModal(router, responses, { interactionId: 'defer-failure-recovery' });
+  const recoveredId = edits.at(-1).components[0].components[0].custom_id;
+  await router.handle(componentInteraction(recoveredId, { id: 'valid-after-defer-failure' }));
+  assert.equal(stopCalls, 1);
+  assert.equal(retryCalls, 1);
+});
+
+test('takeover does not stop or retry when fresh safety inspection or desktop exit is unconfirmed', async (t) => {
+  for (const mode of ['status-unavailable', 'index-unavailable', 'stop-failed']) {
+    await t.test(mode, async () => {
+      let phase = 'preview';
+      let stopCalls = 0;
+      let retryCalls = 0;
+      const currentIndex = { tasks: [task(1, { status: 'running' })] };
+      const { dependencies, responses, edits } = makeDependencies({
+        refreshTaskIndex: async () => {
+          if (phase === 'confirm' && mode === 'index-unavailable') throw new Error('private index error');
+          return currentIndex;
+        },
+        getCodexControlStatus: async () => {
+          if (phase === 'confirm' && mode === 'status-unavailable') throw new Error('private status error');
+          return { ok: true, desktop: { running: true } };
+        },
+        stopCodexDesktop: async () => {
+          stopCalls += 1;
+          return { ok: mode !== 'stop-failed' };
+        },
+        retryContinuation: async () => { retryCalls += 1; return { status: 'started' }; },
+        dispatchContinuation: async () => ({
+          status: 'queued', reason: 'active-writer', queueId: `queue-${mode}`,
+        }),
+      });
+      const router = createInteractionRouter(dependencies);
+      await submitContinuationModal(router, responses, { interactionId: `safety-${mode}` });
+      const continueId = edits[0].components[0].components[0].custom_id;
+      phase = 'confirm';
+
+      await router.handle(componentInteraction(continueId, { id: `safety-confirm-${mode}` }));
+
+      assert.equal(stopCalls, mode === 'stop-failed' ? 1 : 0);
+      assert.equal(retryCalls, 0);
+      assert.match(edits.at(-1).content, /保持排队|已安全排队|不会提供强制退出/);
+      assert.equal(edits.at(-1).components.length, 0);
+      assert.equal(JSON.stringify(edits.at(-1)).includes('private'), false);
+    });
+  }
+});
+
+test('a failed desktop stop releases the exact durable claim back to active-writer queue', async () => {
+  const released = [];
+  let retryCalls = 0;
+  const claim = {
+    status: 'claimed', queueId: 'queue-stop-failed', targetThreadId: 'root-1', claimId: 'claim-stop-fail',
+  };
+  const { dependencies, responses, edits } = makeDependencies({
+    refreshTaskIndex: async () => ({ tasks: [task(1, { status: 'running' })] }),
+    getCodexControlStatus: async () => ({ ok: true, desktop: { running: true } }),
+    dispatchContinuation: async () => ({ status: 'queued', reason: 'active-writer', queueId: claim.queueId }),
+    claimContinuationTakeover: async () => claim,
+    stopCodexDesktop: async () => ({ ok: false }),
+    releaseContinuationTakeoverClaim: async (received) => {
+      released.push(received);
+      return { status: 'queued', queueId: received.queueId, reason: 'active-writer' };
+    },
+    retryContinuation: async () => { retryCalls += 1; return { status: 'started' }; },
+  });
+  const router = createInteractionRouter(dependencies);
+  await submitContinuationModal(router, responses, { interactionId: 'stop-release' });
+
+  await router.handle(componentInteraction(edits[0].components[0].components[0].custom_id));
+
+  assert.deepEqual(released, [claim]);
+  assert.equal(retryCalls, 0);
+  assert.match(edits.at(-1).content, /恢复为保持排队/);
+});
+
+test('a new active task blocks takeover and republishes a fresh exact-queue preview', async () => {
+  const uiState = new Map();
+  let currentIndex = { tasks: [task(1, { status: 'running' })] };
+  let stopCalls = 0;
+  let retryCalls = 0;
+  const { dependencies, responses, edits } = makeDependencies({
+    uiState,
+    refreshTaskIndex: async () => currentIndex,
+    getCodexControlStatus: async () => ({ ok: true, desktop: { running: true } }),
+    stopCodexDesktop: async () => { stopCalls += 1; return { ok: true }; },
+    retryContinuation: async () => { retryCalls += 1; return { status: 'started' }; },
+    dispatchContinuation: async () => ({ status: 'queued', reason: 'active-writer', queueId: 'queue-snapshot' }),
+  });
+  const router = createInteractionRouter(dependencies);
+  await submitContinuationModal(router, responses);
+  const oldId = edits[0].components[0].components[0].custom_id;
+
+  currentIndex = { tasks: [
+    task(1, { status: 'running' }),
+    task(9, { status: 'confirmation-required', taskName: '刚出现的任务' }),
+  ] };
+  await router.handle(componentInteraction(oldId, { id: 'stale-snapshot' }));
+
+  assert.equal(stopCalls, 0);
+  assert.equal(retryCalls, 0);
+  assert.equal(responses[0].type, 6);
+  assert.match(edits.at(-1).embeds[0].description, /检测到新活动任务/);
+  assert.match(edits.at(-1).embeds[0].description, /刚出现的任务/);
+  const replacement = [...uiState.values()].find((state) => state.kind === 'takeover-continue');
+  assert.equal(replacement.queueId, 'queue-snapshot');
+  assert.equal(replacement.targetThreadId, 'root-1');
+  assert.equal(replacement.messageId, 'takeover-message-1');
+  assert.notEqual(edits.at(-1).components[0].components[0].custom_id, oldId);
+});
+
+test('takeover reports queued, uncertain, and failed exact retries without claiming completion', async (t) => {
+  const cases = [
+    { result: { status: 'queued', reason: 'active-writer' }, expected: /仍被占用|继续排队/ },
+    { result: { status: 'uncertain', reason: 'start-outcome-uncertain' }, expected: /结果不确定|不会自动重试/ },
+    { result: { status: 'failed', reason: 'resume-failed' }, expected: /立即继续失败|没有成功/ },
+  ];
+  for (const [index, entry] of cases.entries()) {
+    await t.test(entry.result.status, async () => {
+      const currentIndex = { tasks: [task(1, { status: 'running' })] };
+      const { dependencies, responses, edits } = makeDependencies({
+        refreshTaskIndex: async () => currentIndex,
+        getCodexControlStatus: async () => ({ ok: true, desktop: { running: true } }),
+        stopCodexDesktop: async () => ({ ok: true }),
+        retryContinuation: async () => entry.result,
+        dispatchContinuation: async () => ({
+          status: 'queued', reason: 'active-writer', queueId: `queue-outcome-${index}`,
+        }),
+      });
+      const router = createInteractionRouter(dependencies);
+      await submitContinuationModal(router, responses, { interactionId: `outcome-${index}` });
+      const continueId = edits[0].components[0].components[0].custom_id;
+
+      await router.handle(componentInteraction(continueId, { id: `outcome-click-${index}` }));
+
+      assert.match(edits.at(-1).content, entry.expected);
+      assert.equal(edits.at(-1).content.includes('resume-failed'), false);
+      assert.equal(edits.at(-1).content.includes('queue-outcome'), false);
+      assert.equal(edits.at(-1).components.length, 0);
+    });
+  }
+});
+
 test('continue queue renders safe summaries and atomically cancels then refreshes', async () => {
   const queue = [{
     queueId: 'queue-abcdef12345678',
@@ -1039,7 +1509,7 @@ test('continuation queue renderer does not mark a short summary as truncated', (
   const rendered = renderContinuationQueue([{
     queueId: 'queue-short123', source: 'slash', threadId: 'root-1', summary: '短摘要', status: 'queued',
   }]);
-  assert.match(rendered, /内容：短摘要\n/);
+  assert.match(rendered, /\*\*内容：\*\* 短摘要\n/);
   assert.equal(rendered.includes('短摘…'), false);
 });
 
@@ -1108,6 +1578,10 @@ test('modal submission defers before authoritative refresh and creation, passes 
   assert.equal(creationInput.state, dependencies.creationState);
   assert.equal(creationInput.selection.projectId, 'project-1');
   assert.equal(creationInput.text, '检查支付流程');
+  assert.deepEqual(creationInput.discordOrigin, {
+    guildId: '222', channelId: '777777777777777777', source: 'new-task',
+    projectId: 'project-1', projectName: 'POS',
+  });
   assert.equal(responses[0].type, 5);
   assert.equal(responses[0].data.flags & 64, 64);
   assert.deepEqual(responses[0].data.allowed_mentions, { parse: [] });
@@ -1117,6 +1591,70 @@ test('modal submission defers before authoritative refresh and creation, passes 
   assert.equal(taskIndex.tasks.length, 1);
   assert.equal(taskIndex.tasks[0].threadId, 'thread-created-1');
   assert.equal(taskIndex.tasks[0].worktreeBranch, 'codex/discord-test');
+});
+
+test('20:56 creation receipt falls back once to a private follow-up when original edit fails', async () => {
+  const calls = [];
+  const { dependencies, responses, followups, receiptOutcomes } = makeDependencies({
+    editOriginal: async () => { calls.push('edit'); throw new Error('secret Discord error C:\\private\\path'); },
+    followup: async (body) => { calls.push('followup'); followups.push(body); return { id: 'followup-2056' }; },
+  });
+  const router = createInteractionRouter(dependencies);
+  await router.handle(commandInteraction('新建任务', { 项目: 'project-1' }));
+  const customId = responses.shift().data.custom_id;
+
+  await router.handle(modalSubmit(customId, '20:56 从 Discord 新建任务', { id: 'interaction-2056' }));
+
+  assert.deepEqual(calls, ['edit', 'followup']);
+  assert.equal(followups.length, 1);
+  assert.equal(followups[0].flags & 64, 64);
+  assert.deepEqual(followups[0].allowed_mentions, { parse: [] });
+  assert.match(followups[0].content, /任务创建成功/u);
+  assert.equal(JSON.stringify(followups).includes('secret Discord error'), false);
+  assert.deepEqual(receiptOutcomes, [{
+    interactionId: 'interaction-2056',
+    outcome: { status: 'followup-sent', messageId: 'followup-2056' },
+  }]);
+});
+
+test('creation receipt records a fixed failure category when original and follow-up delivery both fail', async () => {
+  const calls = [];
+  const { dependencies, responses, receiptOutcomes } = makeDependencies({
+    editOriginal: async () => { calls.push('edit'); throw new Error('edit token should stay private'); },
+    followup: async () => { calls.push('followup'); throw new Error('followup token should stay private'); },
+  });
+  const router = createInteractionRouter(dependencies);
+  await router.handle(commandInteraction('新建任务', { 项目: 'project-1' }));
+  const customId = responses.shift().data.custom_id;
+
+  const returned = await router.handle(modalSubmit(customId, '创建后回执失败', { id: 'interaction-no-receipt' }));
+
+  assert.deepEqual(calls, ['edit', 'followup']);
+  assert.deepEqual(receiptOutcomes, [{
+    interactionId: 'interaction-no-receipt',
+    outcome: { status: 'failed', errorCategory: 'creation-receipt-delivery-failed' },
+  }]);
+  assert.equal(JSON.stringify(returned).includes('token should stay private'), false);
+});
+
+test('an externally-started task with uncertain persistence never claims that no task was created', async () => {
+  const { dependencies, responses, edits } = makeDependencies({
+    createNewTaskOnce: async () => ({
+      status: 'start-uncertain', threadId: 'thread-uncertain-1', turnId: 'turn-uncertain-1',
+      taskName: '远程任务', workspace: { mode: 'local', cwd: 'C:\\safe\\POS' },
+    }),
+  });
+  const router = createInteractionRouter(dependencies);
+  await router.handle(commandInteraction('新建任务', { 项目: 'project-1' }));
+  const customId = responses.shift().data.custom_id;
+
+  await router.handle(modalSubmit(customId, '外部已启动但状态提交未知', { id: 'interaction-uncertain' }));
+
+  const content = edits.at(-1).content;
+  assert.match(content, /可能已经启动/u);
+  assert.match(content, /请勿重复提交/u);
+  assert.doesNotMatch(content, /未创建可继续/u);
+  assert.doesNotMatch(content, /任务创建成功/u);
 });
 
 test('duplicate modal delivery creates and inserts exactly once', async () => {
@@ -1268,6 +1806,10 @@ test('task detail continue button is protected and opens the shared continuation
   assert.equal(responses.shift().type, 5);
   assert.equal(requests.length, 1);
   assert.equal(requests[0].threadId, 'root-1');
+  assert.equal(requests[0].guildId, '222');
+  assert.equal(requests[0].channelId, '777777777777777777');
+  assert.equal(requests[0].projectId, 'project-1');
+  assert.equal(requests[0].projectName, 'POS');
 });
 
 test('sweep removes UI state at the exact fifteen-minute boundary', async () => {
@@ -1303,6 +1845,47 @@ test('quota renderer handles no snapshot, stale data, trends, reset, and both pr
   assert.match(text, /当前速度/);
   assert.match(text, /平均速度/);
   assert.match(text, /快照时间/);
+});
+
+test('task, quota, status, and help renderers own consistent Markdown labels around escaped values', () => {
+  const hostile = task(1, { projectName: '**项目** @everyone', taskName: '# 任务' });
+  const list = renderTaskList([hostile]);
+  const detail = renderTaskDetail({ ...hostile, taskText: '正文', resultText: '结果' });
+  const search = renderSearchResults([hostile], '# 条件');
+  const queue = renderContinuationQueue([{
+    queueId: 'queue-markdown1', source: 'slash', threadId: hostile.threadId,
+    projectName: hostile.projectName, taskName: hostile.taskName, summary: '@everyone # 继续', status: 'queued',
+  }]);
+  const quota = renderQuota({
+    observedAt: new Date(NOW).toISOString(),
+    limits: [{
+      windowMinutes: 10_080, remainingPercent: 42, previousRemainingPercent: 45,
+      lastChangeAt: new Date(NOW - 60_000).toISOString(), resetsAt: Math.floor((NOW + 86_400_000) / 1_000),
+      usedPercent: 58, lastUsageRatePerHour: 2,
+    }],
+  }, { nowMs: NOW });
+  const status = renderSystemStatus({ gateway: { state: 'ready' }, index: { count: 1 } });
+  const help = renderHelp();
+
+  for (const rendered of [list, detail, search]) {
+    assert.match(rendered, /\*\*项目：\*\*/u);
+    assert.match(rendered, /\*\*任务：\*\*/u);
+    assert.match(rendered, /\*\*状态：\*\*/u);
+    assert.equal(rendered.includes('@everyone'), false);
+    assert.equal(rendered.includes('\n# 任务'), false);
+  }
+  for (const label of ['额度', '距上次变化', '距下次更新还有']) {
+    assert.match(quota, new RegExp(`\\*\\*${label}：\\*\\*`, 'u'));
+  }
+  for (const label of ['项目', '任务', '内容', '状态']) {
+    assert.match(queue, new RegExp(`\\*\\*${label}：\\*\\*`, 'u'));
+  }
+  assert.equal(queue.includes('@everyone'), false);
+  for (const label of ['Gateway', '任务索引', '继续队列', '最近错误类别']) {
+    assert.match(status, new RegExp(`\\*\\*${label}：\\*\\*`, 'u'));
+  }
+  assert.match(help, /^# Codex Discord 命令帮助/mu);
+  assert.match(help, /\*\*\/任务列表\*\*/u);
 });
 
 test('quota renderer uses the persisted acceleration when no previous rate sample remains', () => {
@@ -1380,10 +1963,244 @@ test('system status uses a component sanitized error category when no aggregate 
   assert.match(text, /heartbeat-timeout/);
 });
 
-test('help names all ten commands and explains workspace routing and offline limitation', () => {
+test('takeover preview shows only escaped task names and statuses without local identifiers', () => {
+  assert.equal(typeof interactionModule.renderTakeoverPreview, 'function');
+  const payload = interactionModule.renderTakeoverPreview({
+    items: [
+      { threadId: 'secret-thread-id', taskName: '门店_*盘点*_', status: 'running', target: false },
+      { threadId: 'another-secret-id', taskName: '支付确认', status: 'confirmation-required', target: true },
+    ],
+    remaining: 2,
+  }, { desktopRunning: true });
+  const output = JSON.stringify(payload);
+  assert.match(payload.embeds[0].description, /Codex 正在运行/);
+  assert.match(payload.embeds[0].description, /门店\\_\\\*盘点\\\*\\_/);
+  assert.match(payload.embeds[0].description, /支付确认（待确认，目标任务）/);
+  assert.match(payload.embeds[0].description, /另有 2 个任务未列出/);
+  assert.match(payload.embeds[0].description, /可能中断以上桌面任务/);
+  assert.equal(output.includes('secret-thread-id'), false);
+  assert.equal(output.includes('another-secret-id'), false);
+  assert.equal(output.includes('C:\\'), false);
+});
+
+test('/退出Codex defers before inspection and publishes a private five-minute bound preview', async () => {
+  const uiState = new Map();
+  const events = [];
+  const taskIndex = { generatedAt: new Date(NOW).toISOString(), tasks: [
+    task(1, { status: 'running', rolloutPath: 'C:\\private\\root-1.jsonl' }),
+    task(2, { status: 'confirmation-required', rolloutPath: 'C:\\private\\root-2.jsonl' }),
+  ] };
+  const { dependencies, responses, edits } = makeDependencies({
+    uiState,
+    taskIndex,
+    refreshTaskIndex: async () => { events.push('refresh'); return taskIndex; },
+    getCodexControlStatus: async () => {
+      events.push('status');
+      return { ok: true, desktop: { running: true, processCount: 3, path: 'C:\\private\\ChatGPT.exe' } };
+    },
+  });
+  dependencies.respond = async (body) => { events.push(`respond-${body.type}`); responses.push(body); };
+
+  await createInteractionRouter(dependencies).handle(commandInteraction('退出Codex'));
+
+  assert.equal(events[0], 'respond-5');
+  assert.equal(responses[0].type, 5);
+  assert.equal(responses[0].data.flags, 64);
+  assert.match(edits[0].embeds[0].description, /Codex 正在运行/);
+  assert.match(edits[0].embeds[0].description, /门店任务 1（正在执行）/);
+  assert.match(edits[0].embeds[0].description, /门店任务 2（待确认）/);
+  assert.deepEqual(edits[0].components[0].components.map((button) => [button.label, button.style]), [
+    ['确认强制退出', 4], ['取消', 2],
+  ]);
+  assert.equal(uiState.size, 1);
+  const state = [...uiState.values()][0];
+  assert.equal(state.kind, 'takeover-exit');
+  assert.equal(state.userId, '333');
+  assert.equal(state.guildId, '222');
+  assert.equal(state.messageId, 'takeover-message-1');
+  assert.equal(state.expiresAt, NOW + 5 * 60_000);
+  assert.equal(JSON.stringify(edits[0]).includes('root-1'), false);
+  assert.equal(JSON.stringify(edits[0]).includes('private'), false);
+});
+
+test('/退出Codex does not create a confirmation when desktop is stopped or task refresh fails', async () => {
+  {
+    const uiState = new Map();
+    const { dependencies, edits } = makeDependencies({
+      uiState,
+      getCodexControlStatus: async () => ({ ok: true, desktop: { running: false } }),
+    });
+    await createInteractionRouter(dependencies).handle(commandInteraction('退出Codex', {}, { id: 'exit-stopped' }));
+    assert.match(edits[0].content, /未运行/);
+    assert.equal(edits[0].components?.length ?? 0, 0);
+    assert.equal(uiState.size, 0);
+  }
+
+  {
+    const uiState = new Map();
+    const { dependencies, edits } = makeDependencies({
+      uiState,
+      refreshTaskIndex: async () => { throw new Error('C:\\private\\sessions'); },
+      getCodexControlStatus: async () => ({ ok: true, desktop: { running: true } }),
+    });
+    await createInteractionRouter(dependencies).handle(commandInteraction('退出Codex', {}, { id: 'exit-no-index' }));
+    assert.match(edits[0].embeds[0].description, /任务清单不可用/);
+    assert.match(edits[0].embeds[0].description, /不会退出|未提供退出/);
+    assert.equal(edits[0].components?.length ?? 0, 0);
+    assert.equal(uiState.size, 0);
+    assert.equal(JSON.stringify(edits[0]).includes('private'), false);
+  }
+});
+
+test('takeover confirmation is message-bound, tenant-bound, atomically one-use, and stops exactly once', async () => {
+  const uiState = new Map();
+  let stopCalls = 0;
+  const taskIndex = { tasks: [task(1, { status: 'running' })] };
+  const { dependencies, responses, edits } = makeDependencies({
+    uiState,
+    taskIndex,
+    refreshTaskIndex: async () => taskIndex,
+    getCodexControlStatus: async () => ({ ok: true, desktop: { running: true } }),
+    stopCodexDesktop: async () => { stopCalls += 1; return { ok: true, stoppedProcessCount: 2 }; },
+  });
+  const router = createInteractionRouter(dependencies);
+  await router.handle(commandInteraction('退出Codex'));
+  const confirmId = edits[0].components[0].components[0].custom_id;
+
+  await router.handle(componentInteraction(confirmId, { userId: '444' }));
+  await router.handle(componentInteraction(confirmId, { guildId: '999' }));
+  await router.handle(componentInteraction(confirmId, { messageId: 'wrong-message' }));
+  assert.equal(stopCalls, 0);
+  assert.equal(uiState.size, 1);
+
+  await Promise.all([
+    router.handle(componentInteraction(confirmId, { id: 'confirm-valid' })),
+    router.handle(componentInteraction(confirmId, { id: 'confirm-redelivery' })),
+  ]);
+  assert.equal(stopCalls, 1);
+  assert.equal(uiState.size, 0);
+  assert.match(edits.at(-1).content, /已退出/);
+  assert.match(responses.at(-1).data.content, /已使用|过期|无效/);
+});
+
+test('a failed component defer consumes only that confirmation and always releases the takeover lock', async () => {
+  const uiState = new Map();
+  let stopCalls = 0;
+  let failNextUpdate = true;
+  const taskIndex = { tasks: [task(1, { status: 'running' })] };
+  const { dependencies, responses, edits } = makeDependencies({
+    uiState,
+    taskIndex,
+    refreshTaskIndex: async () => taskIndex,
+    getCodexControlStatus: async () => ({ ok: true, desktop: { running: true } }),
+    stopCodexDesktop: async () => { stopCalls += 1; return { ok: true, stoppedProcessCount: 1 }; },
+  });
+  dependencies.respond = async (body) => {
+    responses.push(body);
+    if (body.type === 6 && failNextUpdate) {
+      failNextUpdate = false;
+      throw new Error('offline callback failure');
+    }
+  };
+  const router = createInteractionRouter(dependencies);
+  await router.handle(commandInteraction('退出Codex', {}, { id: 'exit-before-callback-failure' }));
+  const failedConfirmId = edits[0].components[0].components[0].custom_id;
+
+  await assert.rejects(
+    router.handle(componentInteraction(failedConfirmId, { id: 'failed-component-defer' })),
+    /offline callback failure/u,
+  );
+  assert.equal(stopCalls, 0);
+  assert.equal(uiState.size, 0);
+
+  await router.handle(commandInteraction('退出Codex', {}, { id: 'exit-after-callback-failure' }));
+  const validConfirmId = edits.at(-1).components[0].components[0].custom_id;
+  await router.handle(componentInteraction(validConfirmId, { id: 'valid-after-callback-failure' }));
+  assert.equal(stopCalls, 1);
+  assert.match(edits.at(-1).content, /已退出/);
+});
+
+test('expired takeover and cancellation consume the state without stopping desktop', async () => {
+  let clock = NOW;
+  let stopCalls = 0;
+  const uiState = new Map();
+  const taskIndex = { tasks: [task(1, { status: 'running' })] };
+  const { dependencies, responses, edits } = makeDependencies({
+    now: () => clock,
+    uiState,
+    taskIndex,
+    refreshTaskIndex: async () => taskIndex,
+    getCodexControlStatus: async () => ({ ok: true, desktop: { running: true } }),
+    stopCodexDesktop: async () => { stopCalls += 1; return { ok: true }; },
+  });
+  const router = createInteractionRouter(dependencies);
+  await router.handle(commandInteraction('退出Codex'));
+  const expiredConfirm = edits[0].components[0].components[0].custom_id;
+  clock += 5 * 60_000;
+  await router.handle(componentInteraction(expiredConfirm));
+  assert.match(responses.at(-1).data.content, /过期/);
+  assert.equal(uiState.size, 0);
+
+  clock = NOW;
+  await router.handle(commandInteraction('退出Codex', {}, { id: 'exit-cancel' }));
+  const cancelId = edits.at(-1).components[0].components[1].custom_id;
+  await router.handle(componentInteraction(cancelId, { id: 'cancel-valid' }));
+  assert.equal(stopCalls, 0);
+  assert.equal(uiState.size, 0);
+  assert.match(responses.at(-1).data.content, /已取消/);
+});
+
+test('a newly active main task invalidates the old confirmation and requires a fresh one', async () => {
+  let currentIndex = { tasks: [task(1, { status: 'running' })] };
+  let stopCalls = 0;
+  const uiState = new Map();
+  const { dependencies, responses, edits } = makeDependencies({
+    uiState,
+    taskIndex: currentIndex,
+    refreshTaskIndex: async () => currentIndex,
+    getCodexControlStatus: async () => ({ ok: true, desktop: { running: true } }),
+    stopCodexDesktop: async () => { stopCalls += 1; return { ok: true, stoppedProcessCount: 1 }; },
+  });
+  const editMessageIds = ['original-risk-message', 'type5-would-create-a-different-message', 'original-risk-message'];
+  dependencies.editOriginal = async (body) => {
+    edits.push(body);
+    return { id: editMessageIds.shift() };
+  };
+  const router = createInteractionRouter(dependencies);
+  await router.handle(commandInteraction('退出Codex'));
+  const oldConfirmId = edits[0].components[0].components[0].custom_id;
+
+  currentIndex = { tasks: [
+    task(1, { status: 'running' }),
+    task(9, { status: 'confirmation-required', taskName: '新任务' }),
+  ] };
+  await router.handle(componentInteraction(oldConfirmId, { messageId: 'original-risk-message' }));
+  assert.equal(stopCalls, 0);
+  assert.equal(responses[1].type, 6);
+  assert.equal(Object.hasOwn(responses[1], 'data'), false);
+  assert.equal(uiState.size, 1);
+  assert.match(edits.at(-1).embeds[0].description, /检测到新活动任务/);
+  assert.match(edits.at(-1).embeds[0].description, /新任务（待确认）/);
+  const newConfirmId = edits.at(-1).components[0].components[0].custom_id;
+  assert.notEqual(newConfirmId, oldConfirmId);
+  assert.equal([...uiState.values()][0].messageId, 'original-risk-message');
+
+  await router.handle(componentInteraction(newConfirmId, { id: 'fresh-confirm', messageId: 'original-risk-message' }));
+  assert.equal(responses[2].type, 6);
+  assert.equal(stopCalls, 1);
+  assert.match(edits.at(-1).content, /已退出/);
+});
+
+test('help names all eleven commands and explains takeover, routing, control modes, and offline limits', () => {
   const help = renderHelp();
   for (const commandName of COMMAND_NAMES) assert.match(help, new RegExp(`/${commandName}`));
   assert.match(help, /工作树/);
   assert.match(help, /无项目/);
-  assert.match(help, /电脑.*离线.*不可执行|离线.*命令.*不可执行/);
+  assert.match(help, /退出Codex[\s\S]{0,300}(?:中断|风险)[\s\S]{0,300}确认/);
+  assert.match(help, /active-writer|写入者占用/);
+  assert.match(help, /临时开启[\s\S]{0,500}临时停止[\s\S]{0,500}长期开启[\s\S]{0,500}长期停用/);
+  assert.match(help, /临时(?:开启|停止)[\s\S]{0,300}不改变[\s\S]{0,300}长期/);
+  assert.match(help, /Discord[\s\S]{0,300}(?:新建|继续)[\s\S]{0,300}原频道[\s\S]{0,300}(?:commentary|工具进度|进度)/i);
+  assert.match(help, /登录[\s\S]{0,200}(?:唤醒|休眠)[\s\S]{0,200}(?:联网|网络)/);
+  assert.match(help, /Codex 桌面端[\s\S]{0,200}(?:关闭|退出)/);
 });

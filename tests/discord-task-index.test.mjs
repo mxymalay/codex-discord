@@ -6,6 +6,7 @@ import test from 'node:test';
 
 import {
   buildTaskIndex,
+  inferSavedProject,
   isUserRootSession,
   readTaskDetail,
   readTaskIndex,
@@ -107,6 +108,123 @@ test('root eligibility fails closed on empty IDs and compares dispatcher identit
   assert.equal(isUserRootSession({ id: 'ROOT-A', session_id: 'root-a', thread_source: 'USER' }, { id: 'root-a' }), true);
   assert.equal(isUserRootSession({ id: 'ROOT-A', session_id: 'other', thread_source: 'USER' }, { id: 'root-a' }), false);
   assert.equal(isUserRootSession({ id: 'ROOT-A', thread_source: 'SUBAGENT' }, { id: 'root-a' }), false);
+});
+
+test('saved project inference prefers valid identity then the longest canonical Windows containing root', () => {
+  const projects = [
+    { id: 'parent', name: 'Workspace', roots: [{ path: 'C:\\Users\\operator\\Desktop' }] },
+    { id: 'example-project', name: 'example-project', roots: ['c:/users/operator/desktop/example-project/'] },
+    { id: 'other', name: 'Other', roots: ['C:\\Users\\operator\\Desktop\\example-project-old'] },
+  ];
+
+  assert.deepEqual(inferSavedProject({
+    cwd: 'C:\\Users\\operator\\Desktop\\EXAMPLE-PROJECT\\apps\\cashier',
+    projectId: 'parent',
+    projectName: 'stale name',
+  }, projects), { projectId: 'parent', projectName: 'Workspace' });
+  assert.deepEqual(inferSavedProject({
+    cwd: 'C:/Users/operator/Desktop/EXAMPLE-PROJECT/apps/cashier',
+  }, projects), { projectId: 'example-project', projectName: 'example-project' });
+  assert.deepEqual(inferSavedProject({
+    cwd: 'C:\\Users\\operator\\Desktop\\example-project-old-sibling\\app',
+  }, projects), { projectId: 'parent', projectName: 'Workspace' });
+  assert.deepEqual(inferSavedProject({
+    cwd: 'D:\\outside\\task',
+  }, projects), { projectId: null, projectName: null });
+
+  assert.deepEqual(inferSavedProject({
+    cwd: 'D:\\generated\\outside',
+    worktreePath: 'C:\\Users\\operator\\Desktop\\example-project\\.codex\\worktree',
+  }, projects), { projectId: 'example-project', projectName: 'example-project' });
+
+  assert.deepEqual(inferSavedProject({
+    cwd: 'C:\\Users\\operator\\Desktop\\example-project\\manually-projectless',
+    projectId: null,
+    projectName: '无项目',
+  }, projects), { projectId: null, projectName: null });
+
+  assert.deepEqual(inferSavedProject({
+    cwd: 'D:\\generated\\outside',
+    projectId: 'deleted-project-id',
+    projectName: 'example-project',
+  }, projects), { projectId: 'example-project', projectName: 'example-project' });
+});
+
+test('Discord managed worktree project provenance wins over generated path matching', () => {
+  const projects = [
+    { id: 'example-project', name: 'example-project', roots: ['C:\\Users\\operator\\Desktop\\example-project'] },
+    { id: 'worktrees', name: 'Generated', roots: ['D:\\codex-data\\.codex\\worktrees'] },
+  ];
+  assert.deepEqual(inferSavedProject({
+    cwd: 'D:\\codex-data\\.codex\\worktrees\\discord\\operation',
+    worktreePath: 'D:\\codex-data\\.codex\\worktrees\\discord\\operation',
+    projectId: 'example-project',
+    projectName: 'example-project',
+  }, projects), { projectId: 'example-project', projectName: 'example-project' });
+});
+
+test('indexes a persisted Discord-created root absent from sidebar but never promotes its child rollout', async () => {
+  const paths = await fixture();
+  const rootId = '01a05d0a-5a8f-71f2-b5e1-96fe962224b5';
+  const childId = '01a05d0a-aaaa-71f2-b5e1-96fe962224b5';
+  const mismatchedFilenameId = '01a05d0a-bbbb-71f2-b5e1-96fe962224b5';
+  const mismatchedMetadataId = '01a05d0a-cccc-71f2-b5e1-96fe962224b5';
+  try {
+    await fs.writeFile(paths.sessionIndexPath, '', 'utf8');
+    await writeJsonl(paths.rollout(`2026-09-01T20-55-55-${rootId}`), [
+      meta(rootId, { cwd: 'C:\\Users\\operator\\Desktop\\example-project\\app' }),
+      event('2026-09-01T20:55:56.000Z', 'task_started', { turn_id: 'turn-root' }),
+      event('2026-09-01T21:08:15.000Z', 'task_complete', { turn_id: 'turn-root', last_agent_message: '完成' }),
+    ]);
+    await writeJsonl(paths.rollout(`2026-09-01T20-56-00-${childId}`), [
+      meta(childId, {
+        thread_source: 'subagent', parent_thread_id: rootId,
+        source: { subagent: { name: 'worker' } },
+      }),
+      event('2026-09-01T20:56:01.000Z', 'task_started', { turn_id: 'turn-child' }),
+      event('2026-09-01T20:57:00.000Z', 'task_complete', { turn_id: 'turn-child', last_agent_message: '内部结果' }),
+    ]);
+    await writeJsonl(paths.rollout(`2026-09-01T20-58-00-${mismatchedFilenameId}`), [
+      meta(mismatchedMetadataId),
+      event('2026-09-01T20:58:01.000Z', 'task_started', { turn_id: 'turn-mismatched' }),
+      event('2026-09-01T20:59:00.000Z', 'task_complete', { turn_id: 'turn-mismatched', last_agent_message: '不可信结果' }),
+    ]);
+
+    const index = await buildTaskIndex({
+      ...paths,
+      nowMs: Date.parse('2026-09-01T21:08:16.000Z'),
+      projects: [{ id: 'example-project', name: 'example-project', roots: ['C:\\Users\\operator\\Desktop\\example-project'] }],
+      createdTasksByInteraction: {
+        '1544329941024374935': {
+          status: 'started', threadId: rootId, turnId: 'turn-root', taskName: 'Discord 新任务',
+          projectId: 'example-project', projectName: 'example-project',
+          workspace: {
+            mode: 'worktree', cwd: 'D:\\codex-data\\.codex\\worktrees\\discord\\incident',
+            worktreePath: 'D:\\codex-data\\.codex\\worktrees\\discord\\incident',
+            runtimeWorkspaceRoots: ['D:\\codex-data\\.codex\\worktrees\\discord\\incident'],
+            operationId: '1544329941024374935',
+          },
+        },
+        '1544329941024374936': {
+          status: 'started', threadId: mismatchedFilenameId, turnId: 'turn-mismatched', taskName: '不应提升的任务',
+          workspace: { mode: 'local', cwd: 'C:\\workspace\\mismatch', operationId: '1544329941024374936' },
+        },
+      },
+    });
+
+    assert.deepEqual(index.tasks.map((item) => item.threadId), [rootId]);
+    assert.equal(index.tasks[0].status, 'completed');
+    assert.equal(index.tasks[0].projectName, 'example-project');
+    assert.equal(index.tasks[0].taskName, 'Discord 新任务');
+    const detail = await readTaskDetail(index.tasks[0]);
+    assert.equal(detail.resultText, '完成');
+    assert.deepEqual(
+      (await searchTasks({ index, keyword: 'Discord 新任务' })).map((item) => item.threadId),
+      [rootId],
+    );
+  } finally {
+    await fs.rm(paths.root, { recursive: true, force: true });
+  }
 });
 
 test('indexes forced-large rollouts from bounded head and tail reads without claiming an exact runtime', async () => {
@@ -316,6 +434,86 @@ test('reuses an unchanged previous record without opening its rollout body and r
   } finally {
     await fs.rm(paths.root, { recursive: true, force: true });
   }
+});
+
+test('an unchanged historic null project is re-inferred from the latest example-project catalog', async () => {
+  const paths = await fixture();
+  const threadId = '019cdef0-4321-7890-abcd-1234567890ac';
+  const rolloutPath = paths.rollout(`2026-09-01T00-00-00-${threadId}`);
+  try {
+    await writeJsonl(paths.sessionIndexPath, [{ id: threadId, thread_name: 'example-project 历史任务' }]);
+    await writeJsonl(rolloutPath, [
+      meta(threadId, { cwd: 'C:\\Users\\operator\\Desktop\\example-project\\app' }),
+      event('2026-09-01T00:04:00.000Z', 'task_started', { turn_id: 'body-turn' }),
+      event('2026-09-01T00:05:00.000Z', 'task_complete', { turn_id: 'body-turn' }),
+    ]);
+    const size = (await fs.stat(rolloutPath)).size;
+    const previous = {
+      threadId, projectId: null, projectName: null, taskName: '旧标题', status: 'completed',
+      rolloutPath, offset: size, worktreePath: null, worktreeBranch: null,
+    };
+
+    const index = await buildTaskIndex({
+      ...paths,
+      previousIndex: { version: 1, generatedAt: null, tasks: [previous] },
+      projects: [{ id: 'example-project', name: 'example-project', roots: ['C:\\Users\\operator\\Desktop\\example-project'] }],
+    });
+
+    assert.equal(index.tasks[0].projectId, 'example-project');
+    assert.equal(index.tasks[0].projectName, 'example-project');
+  } finally {
+    await fs.rm(paths.root, { recursive: true, force: true });
+  }
+});
+
+test('an unchanged stale explicit project is re-inferred to the current longest saved root', async () => {
+  const paths = await fixture();
+  const threadId = '019cdef0-4321-7890-abcd-1234567890ad';
+  const rolloutPath = paths.rollout(`2026-09-01T00-00-00-${threadId}`);
+  try {
+    await writeJsonl(paths.sessionIndexPath, [{ id: threadId, thread_name: '迁移项目任务' }]);
+    await writeJsonl(rolloutPath, [meta(threadId, { cwd: 'C:\\work\\current\\nested\\app' })]);
+    const size = (await fs.stat(rolloutPath)).size;
+    const index = await buildTaskIndex({
+      ...paths,
+      previousIndex: { version: 1, generatedAt: null, tasks: [{
+        threadId, projectId: 'deleted-project', projectName: 'Deleted', taskName: '旧任务', status: 'completed',
+        rolloutPath, offset: size, worktreePath: null, worktreeBranch: null,
+      }] },
+      projects: [
+        { id: 'broad', name: 'Broad', roots: ['C:\\work\\current'] },
+        { id: 'nested', name: 'Nested', roots: ['C:\\work\\current\\nested'] },
+      ],
+    });
+    assert.equal(index.tasks[0].projectId, 'nested');
+    assert.equal(index.tasks[0].projectName, 'Nested');
+  } finally { await fs.rm(paths.root, { recursive: true, force: true }); }
+});
+
+test('unchanged managed worktree fast path applies its valid persisted creation project', async () => {
+  const paths = await fixture();
+  const threadId = '019cdef0-4321-7890-abcd-1234567890ae';
+  const rolloutPath = paths.rollout(`2026-09-01T00-00-00-${threadId}`);
+  try {
+    await writeJsonl(rolloutPath, [meta(threadId, { cwd: 'G:\\generated\\discord-worktree' })]);
+    const size = (await fs.stat(rolloutPath)).size;
+    await writeJsonl(paths.sessionIndexPath, [{ id: threadId, thread_name: '托管工作树任务' }]);
+    const index = await buildTaskIndex({
+      ...paths,
+      previousIndex: { version: 1, generatedAt: null, tasks: [{
+        threadId, projectId: null, projectName: null, taskName: '旧任务', status: 'running',
+        rolloutPath, offset: size, worktreePath: 'G:\\generated\\discord-worktree', worktreeBranch: 'codex/discord-test',
+      }] },
+      projects: [{ id: 'example-project', name: 'example-project', roots: ['C:\\Users\\operator\\Desktop\\example-project'] }],
+      createdTasksByInteraction: { create1: {
+        status: 'started', threadId, turnId: 'turn-1', projectId: 'example-project', projectName: 'example-project',
+        taskName: '托管工作树任务',
+        workspace: { mode: 'worktree', cwd: 'G:\\generated\\discord-worktree', runtimeWorkspaceRoots: ['G:\\generated\\discord-worktree'], operationId: 'create1' },
+      } },
+    });
+    assert.equal(index.tasks[0].projectId, 'example-project');
+    assert.equal(index.tasks[0].projectName, 'example-project');
+  } finally { await fs.rm(paths.root, { recursive: true, force: true }); }
 });
 
 test('streams sidebar lines and skips standard-filename rollouts absent from the current sidebar before body reads', async () => {
