@@ -6,6 +6,7 @@ import {
   buildGuildCommandDefinitions,
   ephemeral,
   registerGuildCommands,
+  validNewTaskModelEffort,
 } from '../discord-commands-lib.mjs';
 
 test('defines exactly the approved eleven Chinese guild commands', () => {
@@ -64,11 +65,11 @@ test('defines exactly the approved eleven Chinese guild commands', () => {
     autocomplete: true,
   });
   assert.deepEqual(create.options[1].choices, [
+    { name: 'GPT-6 Astra', value: 'gpt-6-astra' },
     { name: 'GPT-5.6 Sol', value: 'gpt-5.6-sol' },
     { name: 'GPT-5.6 Terra', value: 'gpt-5.6-terra' },
     { name: 'GPT-5.6 Luna', value: 'gpt-5.6-luna' },
     { name: 'GPT-5.5', value: 'gpt-5.5' },
-    { name: 'GPT-5.4', value: 'gpt-5.4' },
     { name: 'GPT-5.4 Mini', value: 'gpt-5.4-mini' },
     { name: 'GPT-5.3 Codex Spark', value: 'gpt-5.3-codex-spark' },
   ]);
@@ -84,6 +85,20 @@ test('defines exactly the approved eleven Chinese guild commands', () => {
   const systemTest = commands.find((item) => item.name === '系统测试');
   assert.equal(systemTest.options[0].required, false);
   assert.deepEqual(systemTest.options[0].choices.map((item) => item.name), ['快速', '完整']);
+});
+
+test('new-task validation matches the observed Astra catalog without changing default selection', () => {
+  for (const effort of ['', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']) {
+    assert.equal(validNewTaskModelEffort('gpt-6-astra', effort), true, `Astra should accept ${effort || 'unspecified effort'}`);
+  }
+  assert.equal(validNewTaskModelEffort('gpt-6-astra', 'none'), false);
+  assert.equal(validNewTaskModelEffort('gpt-5.4', ''), false);
+  assert.equal(validNewTaskModelEffort('gpt-5.4', 'high'), false);
+  assert.equal(validNewTaskModelEffort('gpt-5.6-luna', 'max'), true);
+  assert.equal(validNewTaskModelEffort('gpt-5.6-luna', 'ultra'), false);
+  assert.equal(validNewTaskModelEffort('gpt-5.5', 'xhigh'), true);
+  assert.equal(validNewTaskModelEffort('gpt-5.5', 'max'), false);
+  assert.equal(validNewTaskModelEffort('', ''), true);
 });
 
 test('registers commands with the guild PUT endpoint and sends definitions', async () => {

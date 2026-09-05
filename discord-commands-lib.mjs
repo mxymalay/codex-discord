@@ -13,11 +13,11 @@ const STRING_OPTION = 3;
 const CHAT_INPUT_COMMAND = 1;
 
 export const NEW_TASK_MODEL_CHOICES = Object.freeze([
+  { name: 'GPT-6 Astra', value: 'gpt-6-astra', efforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] },
   { name: 'GPT-5.6 Sol', value: 'gpt-5.6-sol', efforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] },
   { name: 'GPT-5.6 Terra', value: 'gpt-5.6-terra', efforts: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] },
   { name: 'GPT-5.6 Luna', value: 'gpt-5.6-luna', efforts: ['low', 'medium', 'high', 'xhigh', 'max'] },
   { name: 'GPT-5.5', value: 'gpt-5.5', efforts: ['low', 'medium', 'high', 'xhigh'] },
-  { name: 'GPT-5.4', value: 'gpt-5.4', efforts: ['low', 'medium', 'high', 'xhigh'] },
   { name: 'GPT-5.4 Mini', value: 'gpt-5.4-mini', efforts: ['low', 'medium', 'high', 'xhigh'] },
   { name: 'GPT-5.3 Codex Spark', value: 'gpt-5.3-codex-spark', efforts: ['low', 'medium', 'high', 'xhigh'] },
 ]);

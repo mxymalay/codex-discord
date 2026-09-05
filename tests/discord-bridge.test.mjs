@@ -214,6 +214,52 @@ test('production legacy watcher initialization receives the validated inbox orig
   assert.equal(context.rolloutState.pending['turn-existing-complete'].threadId, 'thread-existing-complete');
 });
 
+test('a failed rollout poll records and persists partial progress while retaining its failure', async (t) => {
+  for (const progressed of [true, false]) {
+    await t.test(progressed ? 'another completion succeeds' : 'only the failed retry timestamp changes', async () => {
+      const previousAt = '2026-09-01T00:00:00.000Z';
+      const progressedAt = '2026-09-01T00:00:20.000Z';
+      const rolloutState = {
+        version: 2, initialized: true, files: {}, lastProgressAt: previousAt,
+        pending: {
+          failed: { threadId: 'failed-root', lastAttemptAtMs: 0 },
+          delivered: { threadId: 'delivered-root', lastAttemptAtMs: 0 },
+        },
+      };
+      const saved = [], categories = [], activities = [], logs = [];
+      const production = bridgeModule.createProductionBridgeDependencies({
+        runOnce: true,
+        readRolloutWatcherStateImpl: async () => rolloutState,
+        initializeRolloutWatcherStateImpl: async () => {},
+        writeRolloutWatcherStateImpl: async (_target, state) => { saved.push(structuredClone(state)); },
+        pollRolloutCompletionsImpl: async ({ state }) => {
+          state.pending.failed.lastAttemptAtMs = Date.parse(progressedAt);
+          if (progressed) delete state.pending.delivered;
+          throw new Error('one completion remains unavailable');
+        },
+        logImpl: async (event) => { logs.push(event); },
+      });
+      const context = {
+        config, token: 'test-token', inboxState: createEmptyInboxState(), inboxReadOnly: true,
+        executables: { powershellPath: 'pwsh.exe' },
+        timestamps: { lastRolloutProgressAt: previousAt },
+        setLatestErrorCategory: (category) => { categories.push(category); },
+        recordActivity: (field) => { activities.push(field); context.timestamps[field] = progressedAt; },
+      };
+      const pollers = await production.startLegacyPollers(context);
+      await pollers.completion;
+
+      assert.equal(context.timestamps.lastRolloutProgressAt, progressed ? progressedAt : previousAt);
+      assert.equal(saved.at(-1).lastProgressAt, progressed ? progressedAt : previousAt);
+      assert.deepEqual(activities, progressed ? ['lastRolloutProgressAt'] : []);
+      assert.deepEqual(categories, ['rollout-poll-failed']);
+      assert.equal(logs.filter((event) => event === 'rollout-poll-failed').length, 1);
+      assert.equal(saved.at(-1).pending.failed.lastAttemptAtMs, Date.parse(progressedAt));
+      assert.equal(Object.hasOwn(saved.at(-1).pending, 'delivered'), !progressed);
+    });
+  }
+});
+
 test('Discord reply polling runs while a slow rollout scan is still pending', async () => {
   const slowRollout = deferred();
   const channelPolls = [];
@@ -3715,7 +3761,7 @@ test('resolves PowerShell 7 instead of legacy Windows PowerShell for UTF-8 notif
     await fs.writeFile(pwsh, 'pwsh');
 
     assert.equal(
-      await bridgeLib.resolvePowerShellExecutable({ programFiles: root }),
+      await bridgeLib.resolvePowerShellExecutable({ programFiles: root, platform: 'win32', environment: {} }),
       pwsh,
     );
   } finally {

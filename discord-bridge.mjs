@@ -1345,14 +1345,14 @@ export function createProductionBridgeDependencies({
                 context.recordActivity('lastNotificationSentAt');
               },
             });
+          } catch {
+            context.setLatestErrorCategory('rollout-poll-failed');
+            await logImpl('rollout-poll-failed');
+          } finally {
             if (rolloutProgressFingerprint(rolloutState) !== progressBefore) {
               context.recordActivity('lastRolloutProgressAt');
               rolloutState.lastProgressAt = context.timestamps.lastRolloutProgressAt;
             }
-          } catch {
-              context.setLatestErrorCategory('rollout-poll-failed');
-            await logImpl('rollout-poll-failed');
-          } finally {
             await writeRolloutWatcherStateImpl(rolloutWatcherStatePath, rolloutState).catch(async () => {
               await logImpl('rollout-state-save-failed');
             });

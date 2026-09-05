@@ -132,6 +132,21 @@ function isUserAuthoredMessage(payload, candidate) {
   return !/^\s*<(?:recommended_plugins|environment_context|codex_internal_context|heartbeat)(?:\s|>)/iu.test(candidate);
 }
 
+export function getUserAuthoredMessageText(payload) {
+  if (payload?.type === 'user_message') {
+    const candidate = cleanPageText(textValue(payload.message ?? payload.content));
+    return candidate && isUserAuthoredMessage(payload, candidate) ? candidate : '';
+  }
+  if (payload?.type !== 'message' || String(payload.role ?? '').toLocaleLowerCase() !== 'user') return '';
+  const kinds = payload.internal_chat_message_metadata_passthrough?.content_item_kinds;
+  const items = Array.isArray(payload.content) ? payload.content : [payload.content];
+  const authored = items.filter((item, index) =>
+    (!Array.isArray(kinds) || kinds[index] === 'user.text') &&
+    (typeof item === 'string' || ['input_text', 'text'].includes(item?.type)));
+  const candidate = cleanPageText(textValue(authored));
+  return candidate && isUserAuthoredMessage(payload, candidate) ? candidate : '';
+}
+
 function normalizeSearch(value) {
   return cleanPageText(value).normalize('NFKC').toLocaleLowerCase().replace(/\s+/gu, ' ').trim();
 }
@@ -669,8 +684,8 @@ export async function readTaskDetail(record, options = {}) {
     }
     if (entry?.type === 'event_msg') {
       if (payload.type === 'user_message' && !taskText) {
-        const candidate = cleanPageText(textValue(payload.message ?? payload.content));
-        if (candidate && isUserAuthoredMessage(payload, candidate)) taskText = candidate;
+        const candidate = getUserAuthoredMessageText(payload);
+        if (candidate) taskText = candidate;
         continue;
       }
       if (payload.type === 'agent_message') {
@@ -687,7 +702,7 @@ export async function readTaskDetail(record, options = {}) {
     if (entry?.type === 'response_item' && payload.type === 'message') {
       const role = String(payload.role ?? '').toLocaleLowerCase();
       const candidate = cleanPageText(textValue(payload.content));
-      if (role === 'user' && !taskText && candidate && isUserAuthoredMessage(payload, candidate)) taskText = candidate;
+      if (role === 'user' && !taskText) taskText = getUserAuthoredMessageText(payload);
       if (role === 'assistant' && candidate && (!payload.phase || payload.phase === 'final_answer')) resultText = candidate;
     }
   }
