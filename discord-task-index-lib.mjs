@@ -22,15 +22,24 @@ function emptyIndex() {
   return { version: indexVersion, generatedAt: null, tasks: [] };
 }
 
-function parseJsonLines(content) {
-  return String(content ?? '').split(/\r?\n/).flatMap((raw) => {
-    if (!raw.trim()) return [];
+function parseJsonLineRegion(content) {
+  const entries = [], titleEntries = [];
+  let titlePrefixReliable = true;
+  for (const raw of String(content ?? '').split(/\r?\n/)) {
+    if (!raw.trim()) continue;
     try {
-      return [JSON.parse(raw)];
+      const entry = JSON.parse(raw);
+      entries.push(entry);
+      if (titlePrefixReliable) titleEntries.push(entry);
     } catch {
-      return [];
+      titlePrefixReliable = false;
     }
-  });
+  }
+  return { entries, titleEntries };
+}
+
+function parseJsonLines(content) {
+  return parseJsonLineRegion(content).entries;
 }
 
 function boundedPositiveInteger(value, fallback) {
@@ -124,6 +133,33 @@ function textValue(value) {
 
 function cleanPageText(value) {
   return String(value ?? '').replaceAll('\u0000', '').replace(/\r\n?/g, '\n').trim();
+}
+
+/** Match the notification dispatcher's short input title without splitting surrogate pairs. */
+export function taskNameFromInput(value) {
+  const text = cleanPageText(value).replace(/\s+/gu, ' ');
+  const characters = [...text];
+  return characters.length > 30 ? `${characters.slice(0, 30).join('')}…` : text || '未命名任务';
+}
+
+function knownTaskName(sidebarEntry, createdRecord, previous) {
+  const sidebarName = stringOrNull(sidebarEntry?.thread_name ?? sidebarEntry?.threadName ?? sidebarEntry?.name);
+  if (sidebarName) return sidebarName;
+  const createdName = stringOrNull(createdRecord?.taskName);
+  if (createdName && createdName !== '生成中') return createdName;
+  const previousName = stringOrNull(previous?.taskName);
+  return previousName && !['生成中', '未命名任务'].includes(previousName) ? previousName : null;
+}
+
+function firstInputTaskName(entries) {
+  for (const entry of entries ?? []) {
+    // A compacted prefix or an input-free first turn cannot identify the original request.
+    if (entry?.type === 'compacted' || entry?.type === 'event_msg' && entry.payload?.type === 'task_complete') break;
+    if (!['event_msg', 'response_item'].includes(entry?.type)) continue;
+    const candidate = getUserAuthoredMessageText(entry.payload);
+    if (candidate) return taskNameFromInput(candidate);
+  }
+  return '未命名任务';
 }
 
 function isUserAuthoredMessage(payload, candidate) {
@@ -259,16 +295,16 @@ async function readBytes(filePath, start, length, fileSystem) {
 async function readHeadRegion(filePath, offset, limits, fileSystem) {
   const length = Math.min(offset, limits.headBytes);
   const raw = await readBytes(filePath, 0, length, fileSystem);
-  if (length >= offset) return { entries: parseJsonLines(raw.toString('utf8')), parsedEnd: raw.length };
+  if (length >= offset) return { ...parseJsonLineRegion(raw.toString('utf8')), parsedEnd: raw.length };
   const lastNewline = raw.lastIndexOf(0x0a);
   const parsedEnd = lastNewline < 0 ? 0 : lastNewline + 1;
-  return { entries: parseJsonLines(raw.subarray(0, parsedEnd).toString('utf8')), parsedEnd };
+  return { ...parseJsonLineRegion(raw.subarray(0, parsedEnd).toString('utf8')), parsedEnd };
 }
 
 async function readBoundedEntries(filePath, offset, limits, fileSystem, headRegion) {
   if (offset <= limits.wholeFileBytes) {
     const content = await readBytes(filePath, 0, offset, fileSystem);
-    return { entries: parseJsonLines(content.toString('utf8')), middleSkipped: false };
+    return { ...parseJsonLineRegion(content.toString('utf8')), middleSkipped: false };
   }
   const head = headRegion ?? await readHeadRegion(filePath, offset, limits, fileSystem);
   const nominalTailStart = Math.max(0, offset - limits.tailBytes);
@@ -282,7 +318,8 @@ async function readBoundedEntries(filePath, offset, limits, fileSystem, headRegi
     }
   }
   return {
-    entries: [...head.entries, ...parseJsonLines(tail.toString('utf8'))],
+    entries: [...head.entries, ...parseJsonLineRegion(tail.toString('utf8')).entries],
+    titleEntries: head.titleEntries,
     middleSkipped: true,
   };
 }
@@ -378,7 +415,7 @@ function worktreeMetadata(meta, worktreeRoot) {
   return { worktreePath: pathApi(candidatePath).resolve(candidatePath), worktreeBranch: branch };
 }
 
-function buildRecord({ entries, middleSkipped, rolloutPath, offset, expectedThreadId, sidebarEntry, createdRecord, previous, nowMs, worktreeRoot, latestMapping, projects }) {
+function buildRecord({ entries, titleEntries, middleSkipped, rolloutPath, offset, expectedThreadId, sidebarEntry, createdRecord, previous, nowMs, worktreeRoot, latestMapping, projects }) {
   const metadataEntry = entries.find((entry) => entry?.type === 'session_meta' && entry?.payload);
   const meta = metadataEntry?.payload;
   if (!isUserRootSession(meta, sidebarEntry) && !isTrustedCreatedRoot(meta, createdRecord, expectedThreadId)) return null;
@@ -472,8 +509,7 @@ function buildRecord({ entries, middleSkipped, rolloutPath, offset, expectedThre
     threadId: String(meta.id),
     projectId: displayProject.projectId,
     projectName: displayProject.projectName,
-    taskName: stringOrNull(sidebarEntry?.thread_name ?? sidebarEntry?.threadName ?? sidebarEntry?.name) ??
-      stringOrNull(createdRecord?.taskName) ?? previous?.taskName ?? '未命名任务',
+    taskName: knownTaskName(sidebarEntry, createdRecord, previous) ?? firstInputTaskName(titleEntries),
     status,
     createdAt: isoTime(createdMs),
     lastActivityAt: isoTime(lastActivityMs),
@@ -492,14 +528,13 @@ function durableRecord(record) {
     .map((field) => [field, record[field]]));
 }
 
-function refreshedPreviousRecord(previous, sidebarEntry, latestMapping, projectOverride = null) {
+function refreshedPreviousRecord(previous, sidebarEntry, latestMapping, projectOverride = null, createdRecord = null) {
   const retained = durableRecord(previous);
   const sidebarCreatedMs = validTime(sidebarEntry?.created_at ?? sidebarEntry?.createdAt);
   const sidebarUpdatedMs = validTime(sidebarEntry?.updated_at ?? sidebarEntry?.updatedAt);
   const previousCreatedMs = validTime(retained.createdAt);
   const previousActivityMs = validTime(retained.lastActivityAt);
-  retained.taskName = stringOrNull(sidebarEntry?.thread_name ?? sidebarEntry?.threadName ?? sidebarEntry?.name) ??
-    retained.taskName ?? '未命名任务';
+  retained.taskName = knownTaskName(sidebarEntry, createdRecord, retained) ?? '未命名任务';
   const project = projectMetadata(null, sidebarEntry, retained);
   retained.projectId = projectOverride ? projectOverride.projectId : project.projectId;
   retained.projectName = projectOverride ? projectOverride.projectName : project.projectName;
@@ -573,17 +608,18 @@ export async function buildTaskIndex({
         projects.some((project) => (record?.projectId != null && String(project?.id ?? '') === String(record.projectId)) ||
           (record?.projectId == null && record?.projectName != null && String(project?.name ?? '') === String(record.projectName)));
       const hasStableProjectProvenance = projects.length === 0 || stableProject(previous) || stableProject(createdRecord);
-      if (previous && sidebarEntry && hasStableProjectProvenance &&
+      if (previous && sidebarEntry && hasStableProjectProvenance && knownTaskName(sidebarEntry, createdRecord, previous) &&
           path.resolve(String(previous.rolloutPath ?? '')) === path.resolve(rolloutPath) && Number(previous.offset) === offset) {
         const createdProject = stableProject(createdRecord)
           ? inferSavedProject({ projectId: createdRecord.projectId, projectName: createdRecord.projectName }, projects)
           : null;
-        recordsById.set(key, refreshedPreviousRecord(previous, sidebarEntry, mappings.get(key), createdProject));
+        recordsById.set(key, refreshedPreviousRecord(previous, sidebarEntry, mappings.get(key), createdProject, createdRecord));
         continue;
       }
       const parsed = await readBoundedEntries(rolloutPath, offset, limits, fileSystem, headRegion);
       const record = buildRecord({
         entries: parsed.entries,
+        titleEntries: parsed.titleEntries,
         middleSkipped: parsed.middleSkipped,
         rolloutPath,
         offset,
@@ -609,6 +645,8 @@ export async function buildTaskIndex({
           previous,
           sidebarEntry,
           mappings.get(identityKey(previous.threadId)),
+          null,
+          createdRecord,
         ));
       } else if (previous && sidebarEntry) {
         unsafePreviousKeys.add(identityKey(previous.threadId));
@@ -622,6 +660,9 @@ export async function buildTaskIndex({
     if (!previous) continue;
     const retained = durableRecord(previous);
     if (!stringOrNull(retained.threadId)) continue;
+    if (!knownTaskName(null, null, retained)) {
+      retained.taskName = knownTaskName(sidebarEntries.get(key), createdRoots.get(key), retained) ?? '未命名任务';
+    }
     recordsById.set(key, retained);
   }
 

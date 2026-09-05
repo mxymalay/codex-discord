@@ -11,7 +11,8 @@
 | 新建任务、Git/非 Git/无项目 | journal、幂等与恢复回归；真实本机 Git 工作树创建、提交前失败清理 |
 | 回复续接、继续队列、停止当前回合 | bridge/takeover/router 回归；提交前回退、提交后不确定状态、防止重复发送 |
 | 完成、待确认、额度三个通知通道 | PowerShell 路由、来源频道、额度快照、消息映射、去重与长 JSON 测试 |
-| rollout 补发、离线补收 | watcher/gateway/inbox 回归；持久游标、失败重试、去重及损坏状态处理 |
+| rollout 补发、离线补收 | 新旧用户输入格式、内部续行识别、逐项失败重试、部分推进时间、归档精确定位与发送资格、去重及损坏状态处理 |
+| 未命名任务标题 | 首条真实输入摘要；保留真实名称与旧 inbox，过滤注入上下文，不用尾部续接作为原始标题，Unicode 安全截断 |
 | 系统状态和系统测试 | health、dispatcher synthetic tests；快速/完整检查边界 |
 | Windows 加密 | 原有 DPAPI 测试，在 Windows 原生 CI 执行 |
 | macOS 加密 | 真实临时 Keychain；AES-GCM 往返、跨进程读取、篡改拒绝和密文格式检查 |
@@ -29,13 +30,19 @@
 
 macOS 本机验证使用 Apple Silicon、Node.js 24 和 PowerShell 7.6。基线 Node 测试 400 项中 398 项通过，2 个关联失败来自 Windows 路径假设；新增回归覆盖了这些问题。
 
-本机还实际验证了独立 App Server 的初始化、`project/list`、`thread/list` 与 `model/list`；未创建模型任务。
+本机实际验证了独立 App Server 的初始化、`project/list`、`thread/list` 与 `model/list`。模型菜单按本机返回的目录补上 GPT-6 Astra，保留默认配置。随后经用户授权，通过真实 Discord 创建并续接了一个无项目验收任务。
 
-真实 Windows 配置迁移已成功：原账户导出密码加密包，Mac 导入后用 Keychain 重新加密 Token。Discord REST 验证了 Bot 身份、服务器成员与三频道权限，11 个现有命令定义全部匹配。Mac 原生控制台已安装到桌面，真实桥接服务以临时模式运行，Gateway、REST、队列均正常。用户授权的三条系统测试消息已通过 dispatcher 投递，并从各目标频道确认每条只有一份。用户随后在 Discord 实际执行 `/系统测试` 的快速检查，确认全部通过。
+真实 Windows 配置迁移已成功：原账户导出密码加密包，Mac 导入后用 Keychain 重新加密 Token。Discord REST 验证了 Bot 身份、服务器成员与三频道权限，11 个现有命令定义全部匹配。Mac 原生控制台已安装到桌面。用户授权的三条系统测试消息已通过 dispatcher 投递，并从各目标频道确认每条只有一份。用户随后在 Discord 实际执行 `/系统测试` 的快速检查，确认全部通过。后续部署保留了当前服务运行、开机自启、通知开启和所有其他配置及加密 Token。
 
 通知停用修复部署后，本机又实际执行临时停止：桥接退出、通知开关关闭；从另一个目录独立调用 dispatcher 的三类 dry-run 均被抑制。重新开启后服务与通知恢复，其他配置字段保持不变。新版原生 UI 已实际显示小圈及每两秒刷新，后台轮询时全部按钮可用。
 
-本机完整验收已通过：450 项 Node 测试，25 套适用于 macOS 的 PowerShell 测试，Node/PowerShell 语法检查和仓库隐私检查。四套 Windows API 专用测试由 Windows CI 运行。GitHub Actions 结果随交付提交更新。运行方法：
+真实 Discord 的七个只读命令以及任务列表详情按钮均已取得私有回执：任务列表、任务详情、任务搜索、继续队列、额度、系统状态和帮助。最初额度显示暂无快照；这次空态检查不代表已验证实际额度变化提醒。
+
+真实模型验收恰好创建一个任务并执行两轮，沿用 `gpt-6-astra / ultra`，原始结果分别为 `CODEX_DISCORD_CREATE_OK` 和 `CODEX_DISCORD_CONTINUE_OK。`。第二轮句号由模型产生，Discord 显示与原始结果一致。两条来源记录均为已投递，每轮观察到一条完成消息；没有工具调用或文件操作记录，工作目录为空。续接队列待发数为 0，保留一条“已送达”历史。
+
+这次实测暴露并修复了完成补发故障：新格式的用户输入未被识别、单项错误阻塞整批、归档后定位丢失及 PowerShell 归档资格检查遗漏。新版在真实状态副本上完整解释了 15 条积压，其中 13 条是用户通知、2 条有完整内部续行证据；部署后实际待处理数归零，推进时间继续更新，重启后观察窗口内未新增同类失败。已完成的验收任务也已显示首条输入摘要，不再停留在“生成中”。
+
+本次本机完整验收通过：497 项 Node 测试，26 套适用于 macOS 的 PowerShell 测试，Node/PowerShell 语法检查和仓库隐私检查。四套 Windows API 专用测试由 Windows CI 运行。[PR 的检查结果](https://github.com/mxymalay/codex-discord/pull/1/checks)对应每次提交；此前 `28dd479` 的双平台 CI 为 macOS 482 项 Node / 25 套 PowerShell、Windows 474 项 Node / 29 套 PowerShell，Windows 另跳过 8 项 macOS 专用测试。运行方法：
 
 ```sh
 pwsh -NoProfile -File ./tests/run-tests.ps1
@@ -44,7 +51,8 @@ pwsh -NoProfile -File ./tests/run-tests.ps1
 ## 未完成的真实环境验收
 
 - 当前 Mac 版 Codex 的内部桌面工具接口拒绝外部 Node 进程。Unix socket 实现与失败/排队路径已覆盖，直接接管现有桌面任务尚不具备该版本的真实通过证据；详情见 [macOS 指南](MACOS.md)。
-- Discord 登录与三频道出站投递已通过；11 个命令逐项真实交互，以及新建/继续任务的实际模型执行仍待验收。
+- 续接成功回执的“查看当前运行状态”按钮尚未取得浏览器可见回执，等待人工核对；不能仅凭单元测试宣称真实按钮验收通过。
+- 旧 Windows 机器仍需安装交付包中的更新并确认停用效果；Windows CI 的隔离验证不代表旧机器已经更新。
 - 主动退出用户 Codex、关机/休眠/重新登录及网络中断后的真实恢复，需要在目标机器上安排测试。
 
 这些项目没有被标成已通过。自动测试用于降低回归风险，不构成“零 bug”保证。

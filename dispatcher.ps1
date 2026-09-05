@@ -234,6 +234,139 @@ function Get-SessionMetadataForThread {
     return $null
 }
 
+function Read-ArchivedRootTurnCandidate {
+    param([string]$Path, [string]$ThreadId, [string]$TurnId)
+
+    $before = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if ($before.PSIsContainer -or ($before.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $before.Length -eq 0) {
+        throw 'Archive candidate is not a nonempty regular file.'
+    }
+    $initialLength = $before.Length
+    $initialWriteTicks = $before.LastWriteTimeUtc.Ticks
+    $stream = $null
+    $lineBuffer = New-Object IO.MemoryStream
+    $utf8 = New-Object Text.UTF8Encoding($false, $true)
+    $buffer = New-Object byte[] 65536
+    $maxLineBytes = 8 * 1024 * 1024
+    $lineNumber = 0
+    $currentMetadata = $null
+    $targetMetadata = $null
+    $sawMatchingMetadata = $false
+    $targetStarts = 0
+    $targetCompletes = 0
+    $targetOpen = $false
+    try {
+        $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+        while (($bytesRead = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            $offset = 0
+            while ($offset -lt $bytesRead) {
+                $newline = [Array]::IndexOf($buffer, [byte]10, $offset, $bytesRead - $offset)
+                $end = if ($newline -lt 0) { $bytesRead } else { $newline }
+                $count = $end - $offset
+                if ($lineBuffer.Length + $count -gt $maxLineBytes) { throw 'Archive JSONL line exceeds the size limit.' }
+                $lineBuffer.Write($buffer, $offset, $count)
+                $offset = $end + 1
+                if ($newline -lt 0) { continue }
+
+                $lineNumber++
+                $line = $utf8.GetString($lineBuffer.GetBuffer(), 0, [int]$lineBuffer.Length)
+                $lineBuffer.SetLength(0)
+                if ($lineNumber -eq 1) { $line = $line.TrimStart([char]0xFEFF) }
+                if ([string]::IsNullOrWhiteSpace($line)) { continue }
+                $entry = $line | ConvertFrom-Json -ErrorAction Stop
+                $entryType = [string](Get-OptionalValue -Object $entry -Name 'type' -DefaultValue '')
+                if ($entry -isnot [System.Management.Automation.PSCustomObject] -or [string]::IsNullOrWhiteSpace($entryType)) {
+                    throw 'Archive JSONL entry cannot be classified.'
+                }
+                $payload = Get-OptionalValue -Object $entry -Name 'payload' -DefaultValue $null
+                if ($entryType -eq 'session_meta') {
+                    if ($targetOpen) { throw 'Session metadata changed inside the archived target turn.' }
+                    if ($payload -isnot [System.Management.Automation.PSCustomObject]) { throw 'Archive session metadata is invalid.' }
+                    $currentMetadata = $payload
+                    if ([string](Get-OptionalValue -Object $payload -Name 'id' -DefaultValue '') -ieq $ThreadId) { $sawMatchingMetadata = $true }
+                    continue
+                }
+                if ($entryType -ne 'event_msg') { continue }
+                if ($payload -isnot [System.Management.Automation.PSCustomObject]) { throw 'Archive event payload is invalid.' }
+                $eventType = [string](Get-OptionalValue -Object $payload -Name 'type' -DefaultValue '')
+                $eventTurnId = [string](Get-OptionalValue -Object $payload -Name 'turn_id' -DefaultValue '')
+                if ($eventType -eq 'task_started') {
+                    if ($targetOpen) { throw 'Another turn start interrupted the archived target turn.' }
+                    if ($eventTurnId -ine $TurnId) { continue }
+                    $targetStarts++
+                    if ($targetStarts -ne 1 -or [string](Get-OptionalValue -Object $currentMetadata -Name 'id' -DefaultValue '') -ine $ThreadId) {
+                        throw 'Archived target turn does not have unique matching session metadata.'
+                    }
+                    $targetMetadata = $currentMetadata
+                    $targetOpen = $true
+                }
+                elseif ($eventType -eq 'task_complete') {
+                    if ($targetOpen -and $eventTurnId -ine $TurnId) { throw 'Another completion interrupted the archived target turn.' }
+                    if ($eventTurnId -ine $TurnId) { continue }
+                    $targetCompletes++
+                    if (-not $targetOpen -or $targetCompletes -ne 1) { throw 'Archived target completion does not have a unique start.' }
+                    $targetOpen = $false
+                }
+            }
+        }
+        if ($lineBuffer.Length -ne 0 -or $targetOpen -or -not $sawMatchingMetadata) {
+            throw 'Archive candidate is incomplete or lacks matching session metadata.'
+        }
+        $after = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        if (($after.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $after.Length -ne $initialLength -or $after.LastWriteTimeUtc.Ticks -ne $initialWriteTicks) {
+            throw 'Archive candidate changed while being read.'
+        }
+        return [pscustomobject]@{ HasTurn = ($targetStarts -eq 1 -and $targetCompletes -eq 1); Metadata = $targetMetadata }
+    }
+    finally {
+        if ($null -ne $stream) { $stream.Dispose() }
+        $lineBuffer.Dispose()
+    }
+}
+
+function Get-ArchivedSessionMetadataForTurn {
+    param([string]$ThreadId, [string]$TurnId)
+
+    $uuidPattern = '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+    if ($ThreadId -notmatch $uuidPattern -or $TurnId -notmatch $uuidPattern) { return $null }
+    try {
+        # Only the controlled sibling of sessions is searched; notification paths are never trusted.
+        $archiveRoot = Join-Path (Split-Path -Parent $sessionsPath) 'archived_sessions'
+        $root = Get-Item -LiteralPath $archiveRoot -Force -ErrorAction Stop
+        if (-not $root.PSIsContainer -or ($root.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $null }
+        $directories = New-Object 'System.Collections.Generic.Stack[string]'
+        $directories.Push($root.FullName)
+        $metadata = $null
+        $claimants = 0
+        $candidatePattern = '(?i)(?:^|[-_])' + [regex]::Escape($ThreadId) + '$'
+        while ($directories.Count -gt 0) {
+            $directory = Get-Item -LiteralPath $directories.Pop() -Force -ErrorAction Stop
+            if (-not $directory.PSIsContainer -or ($directory.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $null }
+            foreach ($candidate in @(Get-ChildItem -LiteralPath $directory.FullName -Force -ErrorAction Stop)) {
+                if ($candidate.PSIsContainer) {
+                    # An unreadable or linked subtree could conceal a second claimant.
+                    if (($candidate.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $null }
+                    $directories.Push($candidate.FullName)
+                    continue
+                }
+                if ($candidate.Extension -ine '.jsonl' -or $candidate.BaseName -notmatch $candidatePattern) { continue }
+                $result = Read-ArchivedRootTurnCandidate -Path $candidate.FullName -ThreadId $ThreadId -TurnId $TurnId
+                if ($result.HasTurn) {
+                    $claimants++
+                    if ($claimants -gt 1) { return $null }
+                    $metadata = $result.Metadata
+                }
+            }
+        }
+        if ($claimants -eq 1) { return $metadata }
+    }
+    catch {
+        # Any candidate that cannot be classified leaves uniqueness unproven.
+        return $null
+    }
+    return $null
+}
+
 function Get-TaskNotificationEligibility {
     param([object]$Notification)
 
@@ -252,6 +385,10 @@ function Get-TaskNotificationEligibility {
     }
 
     $metadata = Get-SessionMetadataForThread -ThreadId $threadId
+    if ($null -eq $metadata) {
+        $turnId = [string](Get-OptionalValue -Object $Notification -Name 'turn-id' -DefaultValue '')
+        $metadata = Get-ArchivedSessionMetadataForTurn -ThreadId $threadId -TurnId $turnId
+    }
     if ($null -eq $metadata) {
         return [pscustomobject]@{ Allowed = $false; Reason = 'matching session metadata is unavailable' }
     }

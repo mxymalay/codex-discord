@@ -3,6 +3,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { expandPathVariables, isAbsolutePath, isPathDescendant, normalizePath, pathApi, pathsEqual } from './discord-paths-lib.mjs';
+import { taskNameFromInput } from './discord-task-index-lib.mjs';
 
 import {
   AppServerClient,
@@ -772,7 +773,7 @@ export async function startNewCodexTask({
   const client = createClient({ clientFactory, codexPath, processCwd });
   const resource = clientResource(client);
   let threadId = null;
-  let taskName = '生成中';
+  let taskName = taskNameFromInput(text);
   try {
     await initializeAppServerClient(client);
     await onThreadStarting?.({ workspace });
@@ -995,7 +996,7 @@ export async function createNewTaskOnce({
         const record = {
           status: 'first-turn-failed',
           threadId: error?.threadId ?? current.threadId,
-          taskName: error?.taskName ?? current.taskName ?? '生成中',
+          taskName: error?.taskName ?? current.taskName ?? taskNameFromInput(text),
           ...projectIdentity,
           workspace: persistableWorkspace(error?.workspace ?? prepared ?? current.workspace),
           errorCategory: taskCreationErrorCategory(error),

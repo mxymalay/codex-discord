@@ -792,7 +792,7 @@ test('starts a durable thread before its first turn with exact workspace metadat
   });
   assert.equal(result.threadId, 'thread-1');
   assert.equal(result.turnId, 'turn-1');
-  assert.equal(result.taskName, '生成中');
+  assert.equal(result.taskName, '检查支付流程');
   assert.equal(result.workspace.cwd, 'C:\\repo');
   assert.equal(typeof result.close, 'function');
   assert.equal(typeof result.cancel, 'function');
@@ -815,6 +815,43 @@ test('uses an explicit null project ID for projectless durable threads', async (
   assert.equal(messages[2].params.projectId, null);
   assert.equal(result.taskName, 'Named');
   await result.completion;
+});
+
+test('unnamed new tasks use a compact input title without another model or naming request', async (t) => {
+  for (const [text, expected] of [
+    ['  检查\n 支付\t流程  ', '检查 支付 流程'],
+    ['a'.repeat(29) + '😀😀', 'a'.repeat(29) + '😀…'],
+    ['😀'.repeat(30), '😀'.repeat(30)],
+    [' \n\t', '未命名任务'],
+  ]) {
+    await t.test(expected, async () => {
+      const methods = [];
+      const result = await startNewCodexTask({
+        selection: { kind: 'projectless', projectId: null },
+        workspace: { mode: 'projectless', cwd: 'C:\\tasks', runtimeWorkspaceRoots: ['C:\\tasks'] },
+        text, interactionId: 'title-test', codexPath: 'codex', processCwd: 'C:\\tasks',
+        clientFactory: () => fakeAppServer(methods, {
+          'thread/start': { thread: { id: 'thread-title', name: null } },
+          'turn/start': { turn: { id: 'turn-title' } },
+        }),
+      });
+      await result.completion;
+      assert.equal(result.taskName, expected);
+      assert.deepEqual(methods, ['initialize', 'initialized', 'thread/start', 'turn/start', 'close']);
+    });
+  }
+});
+
+test('a failed first turn keeps its input-derived title', async () => {
+  await assert.rejects(() => startNewCodexTask({
+    selection: { kind: 'projectless', projectId: null },
+    workspace: { mode: 'projectless', cwd: 'C:\\tasks', runtimeWorkspaceRoots: ['C:\\tasks'] },
+    text: '检查支付流程', interactionId: 'failed-title', codexPath: 'codex', processCwd: 'C:\\tasks',
+    clientFactory: () => fakeAppServer([], {
+      'thread/start': { thread: { id: 'thread-title', name: null } },
+      'turn/start': new Error('first turn unavailable'),
+    }),
+  }), (error) => error.taskName === '检查支付流程');
 });
 
 test('persists each creation state before the corresponding external mutation and deduplicates the Interaction', async () => {
