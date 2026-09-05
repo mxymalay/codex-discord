@@ -28,9 +28,11 @@
 
 macOS 本机验证使用 Apple Silicon、Node.js 24 和 PowerShell 7.6。基线 Node 测试 400 项中 398 项通过，2 个关联失败来自 Windows 路径假设；新增回归覆盖了这些问题。
 
-本机还实际验证了独立 App Server 的初始化、`project/list`、`thread/list` 与 `model/list`；未创建收费任务、未向 Discord 发测试消息。
+本机还实际验证了独立 App Server 的初始化、`project/list`、`thread/list` 与 `model/list`；未创建模型任务。
 
-本机完整验收已通过：437 项 Node 测试，21 套适用于 macOS 的 PowerShell 测试，Node/PowerShell 语法检查和仓库隐私检查。四套 Windows API 专用测试由 Windows CI 运行。GitHub Actions 结果随交付提交更新。运行方法：
+真实 Windows 配置迁移已成功：原账户导出密码加密包，Mac 导入后用 Keychain 重新加密 Token。Discord REST 验证了 Bot 身份、服务器成员与三频道权限，11 个现有命令定义全部匹配。Mac 原生控制台已安装到桌面，真实桥接服务以临时模式运行，Gateway、REST、队列均正常。用户授权的三条系统测试消息已通过 dispatcher 投递，并从各目标频道确认每条只有一份。用户随后在 Discord 实际执行 `/系统测试` 的快速检查，确认全部通过。
+
+本机完整验收已通过：437 项 Node 测试，22 套适用于 macOS 的 PowerShell 测试，Node/PowerShell 语法检查和仓库隐私检查。四套 Windows API 专用测试由 Windows CI 运行。GitHub Actions 结果随交付提交更新。运行方法：
 
 ```sh
 pwsh -NoProfile -File ./tests/run-tests.ps1
@@ -39,8 +41,7 @@ pwsh -NoProfile -File ./tests/run-tests.ps1
 ## 未完成的真实环境验收
 
 - 当前 Mac 版 Codex 的内部桌面工具接口拒绝外部 Node 进程。Unix socket 实现与失败/排队路径已覆盖，直接接管现有桌面任务尚不具备该版本的真实通过证据；详情见 [macOS 指南](MACOS.md)。
-- 旧 Windows 账户已实际导出加密迁移包，本机已成功导入真实配置并将 Token 用 Keychain 重新加密。自动回归使用合成 Token，真实凭据不进入仓库。
-- Discord 实际登录、11 个命令的真实交互、三频道消息投递，以及新建/继续任务的实际模型执行，需要导入真实配置后验收。
+- Discord 登录与三频道出站投递已通过；11 个命令逐项真实交互，以及新建/继续任务的实际模型执行仍待验收。
 - 主动退出用户 Codex、关机/休眠/重新登录及网络中断后的真实恢复，需要在目标机器上安排测试。
 
 这些项目没有被标成已通过。自动测试用于降低回归风险，不构成“零 bug”保证。

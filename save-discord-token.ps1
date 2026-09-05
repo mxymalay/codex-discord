@@ -55,6 +55,9 @@ if ($UseEncryptedToken) {
     $configuredTokenPath = Get-DiscordConfigProperty -Config $config -Name 'discordTokenPath'
     if (-not [string]::IsNullOrWhiteSpace($configuredTokenPath)) { $tokenPath = $configuredTokenPath }
 }
+if (-not [System.IO.Path]::IsPathRooted($tokenPath)) {
+    $tokenPath = [System.IO.Path]::GetFullPath((Join-Path $toolDir $tokenPath))
+}
 
 $token = if ($FromClipboard) {
     [string](Get-Clipboard -Raw)

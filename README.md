@@ -6,6 +6,8 @@
 
 ## 安装
 
+首次安装或把源码交给别人，请从 [中文新手指南：Windows / macOS 完整流程](docs/GETTING-STARTED.md) 开始，包含自己的 Discord Bot 配置、桌面控制台安装和真实通知测试。
+
 支持 Windows 和 macOS，要求 PowerShell 7、Node.js 24，以及可从当前环境启动的 Codex。macOS 的安装、旧 Windows 配置迁移和当前桌面接口限制见 [macOS 指南](docs/MACOS.md)。以下为 Windows 安装步骤。克隆仓库后，在仓库目录执行：
 
 ```powershell
