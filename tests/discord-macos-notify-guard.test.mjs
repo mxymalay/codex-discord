@@ -16,7 +16,25 @@ async function waitForUnloaded(target) {
   }
   throw Error('Isolated test job did not finish unloading');
 }
-async function waitForWatcherReady({marker,log,pid,codexHome}) {
+async function watcherDiagnostics({target,marker,phases,log,powerShellPath,firstPathExecutable,execCommand=exec}) {
+  const read=async file=>(await fs.readFile(file,'utf8').catch(error=>`unavailable (${error.code})`)).slice(-12000);
+  let launchd;
+  try {
+    const output=(await execCommand('/bin/launchctl',['print',target],{timeout:5000})).stdout;
+    // launchctl also prints inherited environment variables. Keep only this
+    // fixture's lifecycle fields and executable, never its full environment.
+    launchd=output.split(/\r?\n/).filter(line=>/^\s*(?:path|program|state|pid|runs|last exit code|last terminating signal|reason|active count|spawn type|minimum runtime|exit timeout) = /.test(line)).join('\n');
+    const args=output.match(/^\s*arguments = \{\r?\n\s*([^\r\n]+)/m);
+    if(args)launchd+=`\narguments[0] = ${args[1].trim()}`;
+    const currentPid=output.match(/^\s*pid = (\d+)$/m)?.[1];
+    if(currentPid) {
+      const processInfo=await execCommand('/bin/ps',['-p',currentPid,'-o','pid=,ppid=,uid=,state=,etime=,comm='],{timeout:5000}).then(result=>result.stdout.trim(),error=>`unavailable (${error.code})`);
+      launchd+=`\nprocess (pid ppid uid state elapsed executable): ${processInfo}`;
+    }
+  } catch(error) { launchd=`unavailable (${error.code}): ${String(error.stderr||'').slice(-2000)}`; }
+  return `Selected PowerShell: ${powerShellPath}\nResolved PowerShell: ${await fs.realpath(powerShellPath).catch(error=>`unavailable (${error.code})`)}\nFirst pwsh on PATH: ${firstPathExecutable}\nlaunchd:\n${launchd}\nReadiness marker:\n${await read(marker)}\nDummy watcher phases:\n${await read(phases)}\nDummy watcher log:\n${await read(log)}`;
+}
+async function waitForWatcherReady({marker,pid,codexHome,...diagnostics}) {
   const deadline=Date.now()+20000;
   while(Date.now()<deadline) {
     let value;
@@ -28,12 +46,24 @@ async function waitForWatcherReady({marker,log,pid,codexHome}) {
     }
     await new Promise(resolve=>setTimeout(resolve,50));
   }
-  // Only the isolated dummy watcher writes this log. Preserve its startup
-  // diagnostics before finally removes the fixture, instead of losing the
-  // cause behind a generic missing-marker assertion on hosted runners.
-  const output=await fs.readFile(log,'utf8').catch(error=>`log unavailable (${error.code})`);
-  assert.fail(`Isolated watcher did not become ready for its reported PID within 20 seconds. Dummy watcher log:\n${output.slice(-12000)}`);
+  assert.fail(`Isolated watcher did not become ready for reported PID ${pid} within 20 seconds.\n${await watcherDiagnostics({marker,...diagnostics})}`);
 }
+
+test('watcher failure diagnostics retain restart and executable evidence without inherited environment', async()=>{
+  const root=await fs.mkdtemp(path.join(os.tmpdir(),'codex-guard-diagnostics-'));
+  try {
+    const marker=path.join(root,'marker'),phases=path.join(root,'phases'),log=path.join(root,'log');
+    await fs.writeFile(marker,JSON.stringify({pid:502,codexHome:root}));
+    await fs.writeFile(phases,'pid=502 phase=entered\n');await fs.writeFile(log,'');
+    const output=await watcherDiagnostics({target:'gui/501/isolated',marker,phases,log,powerShellPath:process.execPath,firstPathExecutable:'/first/runtime/pwsh',execCommand:async(command,args)=>{
+      if(command==='/bin/ps') { assert.deepEqual(args,['-p','502','-o','pid=,ppid=,uid=,state=,etime=,comm=']);return {stdout:'502 1 501 S 00:01 /actual/runtime/pwsh\n'}; }
+      assert.deepEqual(args,['print','gui/501/isolated']);
+      return {stdout:'state = running\npid = 502\nruns = 2\nlast exit code = 1\nprogram = /actual/runtime/pwsh\narguments = {\n /actual/runtime/pwsh\n -NoProfile\n}\nenvironment = {\n SECRET = must-not-appear\n}\n'};
+    }});
+    for(const evidence of ['pid = 502','runs = 2','last exit code = 1','arguments[0] = /actual/runtime/pwsh','First pwsh on PATH: /first/runtime/pwsh','phase=entered','Dummy watcher log:'])assert.ok(output.includes(evidence),evidence);
+    assert.ok(!output.includes('SECRET'));assert.ok(!output.includes('must-not-appear'));
+  } finally { await fs.rm(root,{recursive:true,force:true}); }
+});
 
 test('notification guard targets only the PowerShell watcher and persists its native environment', () => {
   const toolDir=path.resolve('/tmp/a & b/mobile-notify'),powerShellPath=path.resolve('/opt/pwsh');
@@ -54,23 +84,28 @@ test('real launchd guard enables, repairs, and disables only an isolated dummy w
   const root=await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(),'codex-notify-guard-')));
   const toolDir=path.join(root,'mobile-notify'),home=path.join(root,'test-home');
   const powerShellPath=await findExecutable(process.env.CODEX_DISCORD_PWSH_PATH||'pwsh');
+  const firstPathExecutable=await findExecutable('pwsh');
   assert.ok(powerShellPath,'PowerShell 7 is required for the real guard test');
   await fs.mkdir(toolDir);await fs.mkdir(home);
   const options={toolDir,home,powerShellPath,environment:{PATH:process.env.PATH,CODEX_HOME:root},pollMs:50,pollAttempts:100};
   const spec=makeMacNotifyGuardAgent({...options,uid:process.getuid()});
   const plist=path.join(home,'Library','LaunchAgents',`${spec.label}.plist`),target=`gui/${process.getuid()}/${spec.label}`;
   const marker=path.join(toolDir,'dummy-guard.json');
-  const ready=pid=>waitForWatcherReady({marker,log:path.join(toolDir,'notify-guard.log'),pid,codexHome:options.environment.CODEX_HOME});
+  const ready=pid=>waitForWatcherReady({marker,phases:path.join(toolDir,'dummy-guard-phases.log'),log:path.join(toolDir,'notify-guard.log'),target,powerShellPath,firstPathExecutable,pid,codexHome:options.environment.CODEX_HOME});
   try {
     // launchctl bootout returns before a terminating process disappears. A
     // deliberate delay makes that real lifecycle boundary deterministic.
     // Cold PowerShell/Add-Type initialization may also outlast five seconds;
     // exercise that boundary independently of the host's actual startup speed.
-    await fs.writeFile(path.join(toolDir,'watch-notify.ps1'),`$firstStart = Join-Path $PSScriptRoot 'first-start'
+    await fs.writeFile(path.join(toolDir,'watch-notify.ps1'),`$ErrorActionPreference = 'Stop'
+function Write-Phase([string]$phase) { [IO.File]::AppendAllText((Join-Path $PSScriptRoot 'dummy-guard-phases.log'), ('{0:o} pid={1} phase={2}' -f [DateTime]::UtcNow, $PID, $phase) + [Environment]::NewLine) }
+Write-Phase 'entered'
+$firstStart = Join-Path $PSScriptRoot 'first-start'
 if (-not (Test-Path -LiteralPath $firstStart)) {
   [IO.File]::WriteAllText($firstStart, 'started')
   Start-Sleep -Milliseconds 6000
 }
+Write-Phase 'delay-complete'
 Add-Type @'
 using System;using System.Runtime.InteropServices;using System.Threading;
 public static class DelayedGuardExit {
@@ -78,7 +113,9 @@ public static class DelayedGuardExit {
   public static void Install(){handler=PosixSignalRegistration.Create(PosixSignal.SIGTERM, context=>{context.Cancel=true;new Thread(()=>{Thread.Sleep(1200);Environment.Exit(0);}).Start();});}
 }
 '@
+Write-Phase 'compiled'
 [DelayedGuardExit]::Install()
+Write-Phase 'signal-handler-installed'
 [IO.File]::WriteAllText((Join-Path $PSScriptRoot "dummy-guard.json"),(@{pid=$PID;codexHome=$env:CODEX_HOME} | ConvertTo-Json))
 while ($true) { Start-Sleep 1 }
 `);
