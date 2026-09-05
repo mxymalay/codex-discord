@@ -6,7 +6,7 @@ import path from 'node:path';
 import { invokeMacControlAction, makeLaunchAgent, validateLaunchAgent, readMacHealth, validateRuntimeIdentity } from '../discord-macos-control-lib.mjs';
 
 function machine({ enabled = false, running = false, mode = 'temporary', installed = true } = {}) {
-  const state = { taskInstalled: installed, taskDefinitionCurrent: true, autoStartEnabled: enabled, running, taskRunning: running && mode === 'scheduled', runtime: running ? { mode } : null };
+  const state = { taskInstalled: installed, taskDefinitionCurrent: true, autoStartEnabled: enabled, running, taskRunning: running && mode === 'scheduled', runtime: running ? { mode } : null, notificationsEnabled:true };
   return { state, operations: {
     serviceStatus: async () => structuredClone(state),
     install: async () => { state.taskInstalled = true; state.taskDefinitionCurrent = true; },
@@ -14,6 +14,8 @@ function machine({ enabled = false, running = false, mode = 'temporary', install
     stop: async () => { state.running = false; state.taskRunning = false; state.runtime = null; },
     start: async (mode) => { state.running = true; state.taskRunning = mode === 'scheduled'; state.runtime = { mode }; },
     desktopStatus: async () => ({ running: false, processCount: 0 }),
+    setNotificationsEnabled: async value => {const previous=state.notificationsEnabled;state.notificationsEnabled=value;return previous;},
+    restoreNotificationsEnabled: async value => {state.notificationsEnabled=value;},
   } };
 }
 
@@ -23,6 +25,102 @@ test('temporary lifecycle never changes disabled login choice or installs a miss
   assert.deepEqual([state.running, state.autoStartEnabled, state.taskInstalled, state.runtime.mode], [true, false, false, 'temporary']);
   assert.equal((await invokeMacControlAction('stop-temporary', { operations })).ok, true);
   assert.deepEqual([state.running, state.autoStartEnabled, state.taskInstalled], [false, false, false]);
+});
+
+test('both stop modes disable notifications before stopping and again after the startup race settles',async()=>{
+  for(const action of ['stop-temporary','disable-long-term']) {
+    const {state,operations}=machine({enabled:true,running:true,mode:'scheduled'});
+    const changes=[];
+    const original=operations.setNotificationsEnabled;
+    operations.setNotificationsEnabled=async value=>{changes.push(value);return original(value);};
+    const stop=operations.stop;
+    operations.stop=async()=>{assert.equal(state.notificationsEnabled,false);state.notificationsEnabled=true;await stop();};
+    const result=await invokeMacControlAction(action,{operations});
+    assert.equal(result.ok,true);
+    assert.equal(state.notificationsEnabled,false);
+    assert.deepEqual(changes,[false,false]);
+    assert.equal(state.autoStartEnabled,action==='stop-temporary');
+  }
+});
+
+test('both start modes enable notifications and failed starts restore the prior setting',async()=>{
+  for(const action of ['start-temporary','enable-long-term'])for(const failure of [false,'throw','timeout']) {
+    const {state,operations}=machine();state.notificationsEnabled=false;
+    const start=operations.start;
+    operations.start=async mode=>{
+      assert.equal(state.notificationsEnabled,true);
+      if(failure==='throw')throw Error('fixture start failed');
+      if(!failure)await start(mode);
+    };
+    const result=await invokeMacControlAction(action,{operations,pollAttempts:1});
+    assert.equal(result.ok,!failure);
+    assert.equal(state.notificationsEnabled,!failure);
+  }
+});
+
+test('failed or incomplete stops mute a raced supervisor again and report any final mute failure',async()=>{
+  for(const action of ['stop-temporary','disable-long-term'])for(const failure of ['throw','timeout'])for(const muteFails of [false,true]) {
+    const {state,operations}=machine({enabled:true,running:true,mode:'scheduled'});
+    const set=operations.setNotificationsEnabled;let writes=0;
+    operations.setNotificationsEnabled=async value=>{
+      writes++;
+      if(writes===2&&muteFails)throw Error('fixture mute failed');
+      return set(value);
+    };
+    operations.stop=async()=>{
+      assert.equal(state.notificationsEnabled,false);
+      state.notificationsEnabled=true;
+      if(failure==='throw')throw Error('fixture stop failed');
+    };
+    const result=await invokeMacControlAction(action,{operations,pollAttempts:1});
+    assert.equal(result.ok,false);
+    assert.equal(result.errorCategory,muteFails?'notification-disable-failed':failure==='throw'?'control-action-failed':'service-action-incomplete');
+    assert.equal(state.notificationsEnabled,muteFails);
+    assert.equal(writes,2);
+  }
+});
+
+test('an initial notification gate failure still stops the owned service and retries muting',async()=>{
+  for(const action of ['stop-temporary','disable-long-term'])for(const persistent of [false,true]) {
+    const {state,operations}=machine({enabled:true,running:true,mode:'scheduled'});
+    const set=operations.setNotificationsEnabled;let writes=0;
+    operations.setNotificationsEnabled=async value=>{
+      writes++;
+      if(writes===1||persistent)throw Error('fixture config unavailable');
+      return set(value);
+    };
+    const result=await invokeMacControlAction(action,{operations,pollAttempts:1});
+    assert.equal(state.running,false,'owned service was not stopped after the initial mute failed');
+    assert.equal(state.autoStartEnabled,action==='stop-temporary');
+    assert.equal(state.notificationsEnabled,persistent);
+    assert.equal(result.ok,!persistent);
+    if(persistent)assert.equal(result.errorCategory,'notification-disable-failed');
+    assert.equal(writes,2);
+  }
+});
+
+test('a failed start reports when its prior notification setting cannot be restored',async()=>{
+  const second=machine();second.operations.start=async()=>{throw Error('fixture start failed');};
+  second.operations.restoreNotificationsEnabled=async()=>{throw Error('fixture restore failed');};
+  assert.equal((await invokeMacControlAction('start-temporary',{operations:second.operations})).errorCategory,'notification-restore-failed');
+});
+
+test('a failed initial notification update prevents starting a service',async()=>{
+  const {state,operations}=machine();let started=false;
+  operations.setNotificationsEnabled=async()=>{throw Error('fixture config unavailable');};
+  operations.start=async()=>{started=true;};
+  const result=await invokeMacControlAction('start-temporary',{operations});
+  assert.equal(result.ok,false);
+  assert.equal(started,false);
+  assert.equal(state.running,false);
+});
+
+test('desktop stop and status do not change notification configuration',async()=>{
+  const {operations}=machine();
+  operations.setNotificationsEnabled=async()=>{assert.fail('desktop/status changed notifications');};
+  operations.stopDesktop=async()=>({ok:true,alreadyStopped:true});
+  assert.equal((await invokeMacControlAction('stop-codex',{operations})).ok,true);
+  assert.equal((await invokeMacControlAction('status',{operations})).ok,true);
 });
 
 test('temporary stop preserves enabled login choice and long-term enable migrates temporary supervisor', async () => {

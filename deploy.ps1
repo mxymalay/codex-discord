@@ -34,6 +34,7 @@ $script:DeployFileAllowlist = @(
     'dispatcher.ps1',
     'discord-config.ps1',
     'discord-secret.ps1',
+    'discord-notification-control.ps1',
     'discord-migration.ps1',
     'export-discord-migration.ps1',
     'import-discord-migration.ps1',

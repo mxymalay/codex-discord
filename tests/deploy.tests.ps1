@@ -32,6 +32,7 @@ $sourceFiles = @(
     'discord-http.ps1',
     'discord-interactions.mjs',
     'discord-secret.ps1',
+    'discord-notification-control.ps1',
     'discord-migration.ps1',
     'export-discord-migration.ps1',
     'import-discord-migration.ps1',
@@ -156,6 +157,65 @@ if ('__ROLE__' === 'new' && mode === 'slow-retry-new') {
 }
 if (process.env.CODEX_DEPLOY_TEST_FAIL_REGISTRATION === '__ROLE__') process.exit(1);
 '@.Replace('__ROLE__', $Role)
+}
+
+function Assert-BoundedRegistrationProcess {
+    param(
+        [Parameter(Mandatory)][string]$Mode,
+        [Parameter(Mandatory)][string]$BridgePath,
+        [Parameter(Mandatory)][string]$ArtifactRoot
+    )
+    New-Item -ItemType Directory -Path $ArtifactRoot -Force | Out-Null
+    $actionPath = Join-Path $ArtifactRoot 'actions.txt'
+    $pidPath = Join-Path $ArtifactRoot 'pids.txt'
+    $testEnvironment = @{
+        CODEX_DEPLOY_TEST_ACTION_PATH = $actionPath
+        CODEX_DEPLOY_TEST_REMOTE_PATH = $null
+        CODEX_DEPLOY_TEST_PID_PATH = $pidPath
+        CODEX_DEPLOY_TEST_REGISTRATION_MODE = $Mode
+        CODEX_DEPLOY_TEST_OUTPUT_SENTINEL = 'DO-NOT-LEAK-REGISTRATION-OUTPUT'
+    }
+    $savedEnvironment = @{}
+    foreach ($name in $testEnvironment.Keys) {
+        $savedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+    }
+    try {
+        foreach ($name in $testEnvironment.Keys) {
+            [Environment]::SetEnvironmentVariable($name, $testEnvironment[$name], 'Process')
+        }
+        $nodePath = (Get-Command node -CommandType Application -ErrorAction Stop).Source
+        # Time only the production process runner, independently of stage checks
+        # and the separate processes needed for deployment and rollback.
+        $processClock = [System.Diagnostics.Stopwatch]::StartNew()
+        try { $result = [CodexDeployBoundedProcess]::Run($nodePath, $BridgePath, 1400, 4096) }
+        finally { $processClock.Stop() }
+        Assert-True ($processClock.ElapsedMilliseconds -lt 5000) "bounded $Mode process exceeded its direct deadline tolerance ($($processClock.ElapsedMilliseconds)ms)"
+        Assert-True (-not $result.Success) "bounded $Mode process unexpectedly succeeded"
+        if ($Mode -in @('huge-stdout-new','huge-stderr-new')) {
+            Assert-True $result.OutputLimitExceeded "bounded $Mode process did not enforce its output cap"
+        } else {
+            Assert-True $result.TimedOut "bounded $Mode process did not enforce its deadline"
+        }
+        $expectedActions = if ($Mode -eq 'slow-retry-new') {
+            'register:new,register:synthetic-429-long-retry'
+        } else { 'register:new' }
+        Assert-True ((@(Get-Content -LiteralPath $actionPath) -join ',') -eq $expectedActions) "bounded $Mode process did not reach its fault fixture"
+        if ($Mode -eq 'hang-new') {
+            $processIds = @(Get-Content -LiteralPath $pidPath)
+            Assert-True ($processIds.Count -eq 2) 'direct bounded registration did not record its parent and descendant'
+            foreach ($pidText in $processIds) {
+                $processId = 0
+                Assert-True ([int]::TryParse($pidText, [ref]$processId)) 'direct bounded registration recorded an invalid process id'
+                Assert-True ($null -eq (Get-Process -Id $processId -ErrorAction SilentlyContinue)) 'direct bounded registration left a process-tree member alive'
+            }
+        }
+        Write-Output "PASS: bounded $Mode process ($($processClock.ElapsedMilliseconds)ms; configured deadline 1400ms)"
+    }
+    finally {
+        foreach ($name in $savedEnvironment.Keys) {
+            [Environment]::SetEnvironmentVariable($name, $savedEnvironment[$name], 'Process')
+        }
+    }
 }
 
 function Install-IsolatedDeploySource {
@@ -1072,6 +1132,7 @@ try {
     foreach ($registrationMode in @('hang-new','huge-stdout-new','huge-stderr-new','slow-retry-new')) {
         $boundedSource = Join-Path $testRoot ("bounded $registrationMode source")
         Install-IsolatedDeploySource -Destination $boundedSource
+        Assert-BoundedRegistrationProcess -Mode $registrationMode -BridgePath (Join-Path $boundedSource 'discord-bridge.mjs') -ArtifactRoot (Join-Path $testRoot "bounded $registrationMode process")
         $boundedLive = Join-Path $testRoot ("bounded $registrationMode live")
         $boundedDesktop = Join-Path $testRoot ("bounded $registrationMode Desktop")
         New-Item -ItemType Directory -Path $boundedLive,$boundedDesktop -Force | Out-Null
@@ -1116,9 +1177,11 @@ try {
             Remove-Item Env:CODEX_DEPLOY_TEST_OUTPUT_SENTINEL -ErrorAction SilentlyContinue
         }
         Assert-True ($boundedError -eq 'Discord command registration failed') "bounded $registrationMode registration did not preserve the fixed primary error"
-        # Registration itself is capped at 1.4s; the larger outer bound also includes the
-        # intentionally separate old-command, bridge, shortcut, file, and Guard compensations.
-        Assert-True ($clock.ElapsedMilliseconds -lt 30000) "bounded $registrationMode registration plus full recovery exceeded its outer bound ($($clock.ElapsedMilliseconds)ms)"
+        # The direct test above checks the 1.4s registration budget within a 5s tolerance.
+        # This whole transaction also copies and verifies the stage and backups, and
+        # launches separate old-command, bridge, shortcut, file, and Guard compensations.
+        # Those operations exceeded 30s on the Windows CI runner even with bounded registration.
+        Assert-True ($clock.ElapsedMilliseconds -lt 120000) "bounded $registrationMode deployment plus full recovery exceeded its transaction bound ($($clock.ElapsedMilliseconds)ms)"
         Assert-True (-not (($boundedText -join "`n").Contains($secretSentinel))) "bounded $registrationMode registration leaked child output"
         Assert-True ((Get-Content -Raw -LiteralPath $boundedRemote) -eq 'old') "bounded $registrationMode rollback did not restore remote Guild commands"
         $boundedRegistrationActions = @(Get-Content -LiteralPath $boundedActions | Where-Object { $_ -like 'register:*' })

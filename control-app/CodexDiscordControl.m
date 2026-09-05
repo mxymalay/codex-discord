@@ -134,7 +134,11 @@ static NSDictionary *DesktopAction(BOOL stop) {
 @property NSMutableArray<NSTextField*> *values;
 @property NSMutableArray<NSButton*> *buttons;
 @property NSTextField *result;
-@property BOOL busy;
+@property NSTextField *refreshHint;
+@property NSProgressIndicator *refreshIndicator;
+@property BOOL statusBusy;
+@property BOOL actionBusy;
+@property NSUInteger statusGeneration;
 @end
 @implementation ControlDelegate
 -(NSTextField*)label:(NSString*)text {NSTextField *v=[NSTextField labelWithString:text];v.font=[NSFont systemFontOfSize:14];return v;}
@@ -142,13 +146,15 @@ static NSDictionary *DesktopAction(BOOL stop) {
     self.window=[[NSWindow alloc]initWithContentRect:NSMakeRect(0,0,700,410) styleMask:NSWindowStyleMaskTitled|NSWindowStyleMaskClosable|NSWindowStyleMaskMiniaturizable backing:NSBackingStoreBuffered defer:NO];
     self.window.title=@"Codex Discord 控制台";[self.window center];
     NSView *view=self.window.contentView;
-    NSTextField *title=[self label:@"Discord 桥接服务"];title.font=[NSFont boldSystemFontOfSize:23];title.frame=NSMakeRect(25,355,630,32);[view addSubview:title];
+    NSTextField *title=[self label:@"Discord 服务与通知"];title.font=[NSFont boldSystemFontOfSize:23];title.frame=NSMakeRect(25,355,450,32);[view addSubview:title];
+    self.refreshIndicator=[[NSProgressIndicator alloc]initWithFrame:NSMakeRect(537,362,16,16)];self.refreshIndicator.style=NSProgressIndicatorStyleSpinning;self.refreshIndicator.controlSize=NSControlSizeSmall;self.refreshIndicator.indeterminate=YES;self.refreshIndicator.displayedWhenStopped=YES;[view addSubview:self.refreshIndicator];[self.refreshIndicator startAnimation:nil];
+    self.refreshHint=[self label:@"每 2 秒刷新"];self.refreshHint.font=[NSFont systemFontOfSize:12];self.refreshHint.textColor=NSColor.secondaryLabelColor;self.refreshHint.frame=NSMakeRect(562,358,113,24);[view addSubview:self.refreshHint];
     NSArray *captions=@[@"桥接服务",@"登录自启",@"Codex 桌面端",@"Discord",@"最近活动",@"继续队列"];
     self.values=[NSMutableArray array];
     for(NSUInteger i=0;i<captions.count;i++){NSTextField *key=[self label:captions[i]];key.frame=NSMakeRect(25,310-i*37,170,25);[view addSubview:key];NSTextField *value=[self label:@"未知"];value.frame=NSMakeRect(195,310-i*37,475,25);[view addSubview:value];[self.values addObject:value];}
     self.buttons=[NSMutableArray array];NSArray *names=@[@"临时开启",@"临时停止",@"长期开启",@"长期停用",@"刷新"];
     for(NSUInteger i=0;i<names.count;i++){NSButton *button=[NSButton buttonWithTitle:names[i] target:self action:@selector(click:)];button.tag=i;button.frame=NSMakeRect(20+i*133,67,128,34);[view addSubview:button];[self.buttons addObject:button];}
-    self.result=[self label:@"正在读取状态…"];self.result.frame=NSMakeRect(25,25,650,27);[view addSubview:self.result];
+    self.result=[self label:@"停止服务会同时暂停本机通知。"];self.result.frame=NSMakeRect(25,25,650,27);[view addSubview:self.result];
     [self.window makeKeyAndOrderFront:nil];[NSApp activateIgnoringOtherApps:YES];
     [NSTimer scheduledTimerWithTimeInterval:2.0 target:self selector:@selector(refresh) userInfo:nil repeats:YES];[self refresh];
 }
@@ -172,21 +178,47 @@ static NSDictionary *DesktopAction(BOOL stop) {
     if(dispatch_group_wait(group,dispatch_time(DISPATCH_TIME_NOW,2*NSEC_PER_SEC))!=0||oversized||task.terminationStatus!=0)return nil;
     id value=[NSJSONSerialization JSONObjectWithData:data options:0 error:nil];return [value isKindOfClass:NSDictionary.class]?value:nil;
 }
+-(void)setText:(NSString*)text forLabel:(NSTextField*)label {
+    if(![label.stringValue isEqualToString:text])label.stringValue=text;
+}
 -(void)apply:(NSDictionary*)status {
-    if(![status[@"ok"]boolValue]){for(NSTextField *v in self.values)v.stringValue=@"未知";return;}
+    [self setText:[status[@"ok"]boolValue]?@"每 2 秒刷新":@"重试中 · 2 秒" forLabel:self.refreshHint];
+    if(![status[@"ok"]boolValue])return;
     NSDictionary *service=status[@"service"],*desktop=status[@"desktop"],*discord=status[@"discord"];
-    self.values[0].stringValue=[NSString stringWithFormat:@"%@ · %@",[service[@"mode"]isEqual:@"scheduled"]?@"登录服务":[service[@"mode"]isEqual:@"temporary"]?@"临时运行":@"未知",[service[@"running"]boolValue]?@"运行中":@"已停止"];
-    self.values[1].stringValue=[service[@"autoStartEnabled"]boolValue]?@"已开启":@"已停用";
-    self.values[2].stringValue=[desktop[@"state"]isEqual:@"unknown"]?@"未知":[desktop[@"running"]boolValue]?@"运行中":@"未运行";
     NSDictionary *states=@{@"ready":@"已连接",@"ok":@"正常",@"connecting":@"连接中",@"reconnecting":@"重连中",@"offline":@"已断开",@"stopped":@"已停止",@"failed":@"故障"};
-    self.values[3].stringValue=[NSString stringWithFormat:@"Gateway：%@ · REST：%@",states[discord[@"state"]]?:@"未知",states[discord[@"restState"]]?:@"未知"];
-    self.values[4].stringValue=[discord[@"lastActivityAt"]isKindOfClass:NSString.class]?discord[@"lastActivityAt"]:@"未知";
-    self.values[5].stringValue=[discord[@"queueState"]isEqual:@"unknown"]?@"未知":[NSString stringWithFormat:@"%@ 条",status[@"queueCount"]?:@0];
+    NSArray<NSString*> *texts=@[
+        [NSString stringWithFormat:@"%@ · %@",[service[@"mode"]isEqual:@"scheduled"]?@"登录服务":[service[@"mode"]isEqual:@"temporary"]?@"临时运行":@"未知",[service[@"running"]boolValue]?@"运行中":@"已停止"],
+        [service[@"autoStartEnabled"]boolValue]?@"已开启":@"已停用",
+        [desktop[@"state"]isEqual:@"unknown"]?@"未知":[desktop[@"running"]boolValue]?@"运行中":@"未运行",
+        [NSString stringWithFormat:@"Gateway：%@ · REST：%@",states[discord[@"state"]]?:@"未知",states[discord[@"restState"]]?:@"未知"],
+        [discord[@"lastActivityAt"]isKindOfClass:NSString.class]?discord[@"lastActivityAt"]:@"未知",
+        [discord[@"queueState"]isEqual:@"unknown"]?@"未知":[NSString stringWithFormat:@"%@ 条",status[@"queueCount"]?:@0]
+    ];
+    for(NSUInteger i=0;i<texts.count;i++)[self setText:texts[i] forLabel:self.values[i]];
 }
 -(void)perform:(NSString*)action {
-    if(self.busy)return;self.busy=YES;for(NSButton *b in self.buttons)b.enabled=NO;
-    BOOL statusOnly=[action isEqual:@"status"];if(!statusOnly)self.result.stringValue=@"正在执行…";
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0),^{NSDictionary *result=[self run:action];NSDictionary *status=statusOnly?result:[self run:@"status"];dispatch_async(dispatch_get_main_queue(),^{[self apply:status];self.result.stringValue=[result[@"ok"]boolValue]?([status[@"ok"]boolValue]?(statusOnly?@"状态已更新。":@"操作已完成。"):@"操作已完成，但状态刷新失败。"):@"操作失败，请检查控制后端。";self.busy=NO;for(NSButton *b in self.buttons)b.enabled=YES;});});
+    BOOL statusOnly=[action isEqual:@"status"];
+    if(self.actionBusy||(statusOnly&&self.statusBusy))return;
+    if(statusOnly)self.statusBusy=YES;
+    else {
+        self.actionBusy=YES;self.statusGeneration++;
+        for(NSButton *button in self.buttons)button.enabled=NO;
+        self.result.stringValue=@"正在执行…";
+    }
+    NSUInteger generation=self.statusGeneration;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED,0),^{
+        NSDictionary *result=[self run:action];NSDictionary *status=statusOnly?result:[self run:@"status"];
+        dispatch_async(dispatch_get_main_queue(),^{
+            if(statusOnly){
+                self.statusBusy=NO;
+                // A poll started before an action must not replace its newer result.
+                if(generation==self.statusGeneration&&!self.actionBusy)[self apply:status];
+            } else {
+                [self apply:status];self.result.stringValue=[result[@"ok"]boolValue]?([status[@"ok"]boolValue]?@"操作已完成。":@"操作已完成，但状态刷新失败。"):@"操作失败，请检查控制后端。";
+                self.actionBusy=NO;for(NSButton *button in self.buttons)button.enabled=YES;
+            }
+        });
+    });
 }
 -(void)refresh{[self perform:@"status"];}
 -(void)click:(NSButton*)sender {

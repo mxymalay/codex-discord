@@ -7,8 +7,8 @@ import { fileURLToPath } from 'node:url';
 import { MAC_APP_NAME,invokeMacControlAction } from './discord-macos-control-lib.mjs';
 const exec=promisify(execFile);
 export const MAC_DEPLOY_FILES=Object.freeze([
-  'discord-bridge.mjs','discord-bridge-lib.mjs','discord-commands-lib.mjs','discord-interactions.mjs','discord-gateway-lib.mjs','discord-health-lib.mjs','discord-task-create-lib.mjs','discord-task-index-lib.mjs','rollout-completion-watcher-lib.mjs','codex-takeover-lib.mjs','discord-control-client.mjs','discord-runtime-lib.mjs','discord-paths-lib.mjs',
-  'dispatcher.ps1','discord-config.ps1','discord-secret.ps1','discord-state.ps1','discord-http.ps1','task-delivery-state.ps1','get-discord-token.ps1','protect-discord-pending-reply.ps1','unprotect-discord-pending-reply.ps1','save-discord-token.ps1','activate-discord-bot.ps1','setup.ps1','repair-notify.ps1','watch-notify.ps1','discord-migration.ps1','export-discord-migration.ps1','import-discord-migration.ps1','discord-macos-notify-guard.mjs',
+  'discord-bridge.mjs','discord-bridge-lib.mjs','discord-commands-lib.mjs','discord-interactions.mjs','discord-gateway-lib.mjs','discord-health-lib.mjs','discord-task-create-lib.mjs','discord-task-index-lib.mjs','rollout-completion-watcher-lib.mjs','codex-takeover-lib.mjs','discord-control-client.mjs','discord-runtime-lib.mjs','discord-paths-lib.mjs','discord-notification-control.mjs',
+  'dispatcher.ps1','discord-config.ps1','discord-secret.ps1','discord-notification-control.ps1','discord-state.ps1','discord-http.ps1','task-delivery-state.ps1','get-discord-token.ps1','protect-discord-pending-reply.ps1','unprotect-discord-pending-reply.ps1','save-discord-token.ps1','activate-discord-bot.ps1','setup.ps1','repair-notify.ps1','watch-notify.ps1','discord-migration.ps1','export-discord-migration.ps1','import-discord-migration.ps1','discord-macos-notify-guard.mjs',
   'discord-macos-control-lib.mjs','discord-macos-control.mjs','deploy-macos.mjs','install-macos.mjs','control-app/CodexDiscordControl.m','assets/codex-discord-control.png',
 ]);
 const hash=bytes=>createHash('sha256').update(bytes).digest('hex');

@@ -16,9 +16,10 @@
 | Windows 加密 | 原有 DPAPI 测试，在 Windows 原生 CI 执行 |
 | macOS 加密 | 真实临时 Keychain；AES-GCM 往返、跨进程读取、篡改拒绝和密文格式检查 |
 | 旧电脑配置迁移 | 密码加密包、错误密码/篡改拒绝、默认不覆盖、两文件提交失败回滚 |
-| macOS 四种服务操作 | 真实隔离 launchd + 假桥接进程；自启选择保持、临时/长期切换 |
+| macOS 四种服务操作 | 真实隔离 launchd + 假桥接进程；自启选择保持、临时/长期切换、停用通知与启动恢复 |
+| 停止后禁止通知 | 两平台真实配置读写与受控服务；六种出站通道重读开关、失败重关、启动失败回滚、单实例及登录恢复 |
 | 服务故障恢复 | SIGKILL 后 launchd 恢复；旧锁恢复；父进程退出后清理拒绝 TERM 的子进程 |
-| 桌面控制台 | 原生编译、应用签名验证、实际进程身份读取、已签名 Codex 桌面状态读取 |
+| 桌面控制台 | 原生编译、应用签名验证、实际进程身份读取、已签名 Codex 桌面状态读取；Mac 原生交互验收保证刷新时按钮可用、旧查询不覆盖新状态、每两秒只更新变化文本 |
 | 退出 Codex 的边界 | 原有 Windows 测试；macOS 受控子进程验证、PID 重用拒绝、孤儿子进程保留与退出等待 |
 | 部署和恢复 | 固定白名单、哈希暂存、私有/未知文件保持、失败回滚、符号链接拒绝、服务选择恢复 |
 | 原生通知修复 | portable-notify 测试；保留已有通知 wrapper；独立 guard 不控制桥接服务 |
@@ -32,7 +33,7 @@ macOS 本机验证使用 Apple Silicon、Node.js 24 和 PowerShell 7.6。基线 
 
 真实 Windows 配置迁移已成功：原账户导出密码加密包，Mac 导入后用 Keychain 重新加密 Token。Discord REST 验证了 Bot 身份、服务器成员与三频道权限，11 个现有命令定义全部匹配。Mac 原生控制台已安装到桌面，真实桥接服务以临时模式运行，Gateway、REST、队列均正常。用户授权的三条系统测试消息已通过 dispatcher 投递，并从各目标频道确认每条只有一份。用户随后在 Discord 实际执行 `/系统测试` 的快速检查，确认全部通过。
 
-本机完整验收已通过：437 项 Node 测试，22 套适用于 macOS 的 PowerShell 测试，Node/PowerShell 语法检查和仓库隐私检查。四套 Windows API 专用测试由 Windows CI 运行。GitHub Actions 结果随交付提交更新。运行方法：
+本机完整验收已通过：450 项 Node 测试，25 套适用于 macOS 的 PowerShell 测试，Node/PowerShell 语法检查和仓库隐私检查。四套 Windows API 专用测试由 Windows CI 运行。GitHub Actions 结果随交付提交更新。运行方法：
 
 ```sh
 pwsh -NoProfile -File ./tests/run-tests.ps1

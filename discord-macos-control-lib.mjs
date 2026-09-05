@@ -5,6 +5,7 @@ import { promisify } from 'node:util';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {setNotificationsEnabled,restoreNotificationsEnabled} from './discord-notification-control.mjs';
 
 const exec = promisify(execFile);
 export const MAC_APP_NAME = 'Codex Discord 控制台.app';
@@ -83,8 +84,22 @@ export async function readMacHealth(toolDir,running,now=Date.now()) {
 
 export async function invokeMacControlAction(action,{toolDir=DEFAULT_DIR,operations,pollAttempts=20,pollMs=100}={}) {
   if(!MAC_CONTROL_ACTIONS.has(action))return failed('invalid','invalid-action');
+  const starting=['start-temporary','enable-long-term'].includes(action);
+  const stopping=['stop-temporary','disable-long-term'].includes(action);
+  let ops,notificationSnapshot,notificationChange=false;
+  const settleNotificationsAfterFailure=async result=>{
+    if(starting&&notificationChange) {
+      try{await ops.restoreNotificationsEnabled(notificationSnapshot);}
+      catch{return failed(action,'notification-restore-failed');}
+    }
+    if(stopping&&ops) {
+      try{await ops.setNotificationsEnabled(false);}
+      catch{return failed(action,'notification-disable-failed');}
+    }
+    return result;
+  };
   try {
-    const ops=operations || await createMacControlOperations({toolDir});
+    ops=operations || await createMacControlOperations({toolDir});
     if(action==='stop-codex') return await ops.stopDesktop();
     const before=await ops.serviceStatus();
     if(action==='status') {
@@ -92,6 +107,13 @@ export async function invokeMacControlAction(action,{toolDir=DEFAULT_DIR,operati
       const health=await readMacHealth(toolDir,before.running);
       return {ok:true,service:{...before,mode:before.runtime?.mode||'unknown'},desktop,codexDesktop:desktop,...health};
     }
+    if(starting) {
+      notificationSnapshot=await ops.setNotificationsEnabled(true);
+      notificationChange=true;
+    }
+    // A damaged or unwritable config must not prevent stopping the owned
+    // service. The final mute below still has to succeed for full success.
+    if(stopping)try{await ops.setNotificationsEnabled(false);}catch{}
     if(action==='start-temporary' && !before.running) await ops.start(before.autoStartEnabled?'scheduled':'temporary');
     if(action==='stop-temporary') await ops.stop(before);
     if(action==='enable-long-term') {
@@ -105,11 +127,19 @@ export async function invokeMacControlAction(action,{toolDir=DEFAULT_DIR,operati
     for(let n=0;n<pollAttempts;n++) {
       const s=await ops.serviceStatus();
       const complete = action==='start-temporary' ? s.running&&s.autoStartEnabled===before.autoStartEnabled : action==='stop-temporary' ? !s.running&&!s.taskRunning&&s.autoStartEnabled===before.autoStartEnabled : action==='enable-long-term' ? s.running&&s.autoStartEnabled&&s.runtime?.mode==='scheduled'&&s.taskDefinitionCurrent : !s.running&&!s.taskRunning&&!s.autoStartEnabled;
-      if(complete)return {ok:true,action,service:{...s,mode:s.runtime?.mode||'unknown'}};
+      if(complete){
+        // A supervisor already starting when stop began may have enabled the
+        // gate after our first write. Close it again only once stopped.
+        if(stopping) {
+          try{await ops.setNotificationsEnabled(false);}
+          catch{return failed(action,'notification-disable-failed');}
+        }
+        return {ok:true,action,service:{...s,mode:s.runtime?.mode||'unknown'}};
+      }
       if(n+1<pollAttempts)await delay(pollMs);
     }
-    return failed(action,'service-action-incomplete');
-  } catch {return failed(action,action==='stop-codex'?'process-control-failed':'control-action-failed');}
+    return await settleNotificationsAfterFailure(failed(action,'service-action-incomplete'));
+  } catch {return await settleNotificationsAfterFailure(failed(action,action==='stop-codex'?'process-control-failed':'control-action-failed'));}
 }
 
 export async function createMacControlOperations({toolDir=DEFAULT_DIR,nodePath=process.execPath,home=os.homedir(),uid=process.getuid(),environment=process.env}={}) {
@@ -166,6 +196,8 @@ export async function createMacControlOperations({toolDir=DEFAULT_DIR,nodePath=p
   };
   return {
     serviceStatus,readRuntime,getInfo,
+    setNotificationsEnabled:enabled=>setNotificationsEnabled(toolDir,enabled),
+    restoreNotificationsEnabled:snapshot=>restoreNotificationsEnabled(toolDir,snapshot),
     install:async () => {
       const previous=await readAgent();const updated=makeLaunchAgent({toolDir,nodePath,uid,environment:{...environment,...previous?.EnvironmentVariables}});await fs.mkdir(agentsDir,{recursive:true,mode:0o700});
       const stat=await fs.lstat(agentsDir);if(!stat.isDirectory()||stat.isSymbolicLink()||stat.uid!==uid)throw Error('untrusted-launch-agent-directory');
@@ -202,6 +234,7 @@ export async function runMacSupervisor(mode,{toolDir=DEFAULT_DIR,bridgePath,node
   });
   if(!locked){lockHolder.stdin.destroy();return;}
   let child=null,stopping=false,wake=null,ownsGroup=false,forceTimer=null;
+  let notificationSnapshot,notificationChange=false,launched=false;
   const shutdown=()=>{
     stopping=true;wake?.();try{child?.kill('SIGTERM');}catch{}
     if(ownsGroup && !forceTimer)forceTimer=setTimeout(()=>{try{process.kill(-process.pid,'SIGKILL');}catch{}},2500).unref();
@@ -211,11 +244,15 @@ export async function runMacSupervisor(mode,{toolDir=DEFAULT_DIR,bridgePath,node
     const identity=await ops.getInfo(process.pid);
     if(!identity||identity.pgid!==process.pid)throw Error('supervisor-process-group-unavailable');
     ownsGroup=true;
+    // A new login or supervisor launch resumes notifications once. Child
+    // retries inside this supervisor must preserve a later console stop.
+    notificationSnapshot=await ops.setNotificationsEnabled(true);notificationChange=true;
     const runtime={version:1,processId:process.pid,startToken:identity.startToken,nodePath,toolDir,mode};
     await writeMacJsonAtomic(runtimePath,runtime);
     while(!stopping) {
       const exitCode=await new Promise(resolve=>{
         child=spawn(nodePath,[bridgePath],{cwd:toolDir,env:environment,stdio:'ignore'});
+        child.once('spawn',()=>{launched=true;});
         child.once('error',()=>resolve(-1));child.once('close',code=>resolve(code));
       });
       child=null;
@@ -225,7 +262,9 @@ export async function runMacSupervisor(mode,{toolDir=DEFAULT_DIR,bridgePath,node
   } finally {
     if(forceTimer)clearTimeout(forceTimer);
     process.off('SIGTERM',shutdown);process.off('SIGINT',shutdown);
-    try{const r=await readJsonBounded(runtimePath);if(r.processId===process.pid)await fs.unlink(runtimePath);}catch{}
-    lockHolder.stdin.end();
+    try {
+      try{const r=await readJsonBounded(runtimePath);if(r.processId===process.pid)await fs.unlink(runtimePath);}catch{}
+      if(notificationChange&&!launched)await ops.restoreNotificationsEnabled(notificationSnapshot);
+    }finally{lockHolder.off('exit',shutdown);lockHolder.stdin.end();}
   }
 }

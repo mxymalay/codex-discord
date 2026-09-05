@@ -86,6 +86,98 @@ foreach ($required in $requiredSources) {
     if (-not (Test-Path -LiteralPath $required -PathType Leaf)) { throw 'Control app installation is missing a required file' }
 }
 
+# WScript.Shell.Save uses the Windows ANSI codepage for shortcut paths. Use
+# IShellLinkW and IPersistFile so Chinese names and user directories round-trip
+# on an English Windows installation as well.
+if (-not ('CodexControlShortcut' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Runtime.InteropServices.ComTypes;
+using System.Text;
+
+[ComImport, Guid("00021401-0000-0000-C000-000000000046")]
+internal class CodexControlShellLink { }
+
+[ComImport, Guid("000214F9-0000-0000-C000-000000000046"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+internal interface ICodexControlShellLinkW
+{
+    void GetPath([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder path, int size, IntPtr findData, uint flags);
+    void GetIDList(out IntPtr itemIdList);
+    void SetIDList(IntPtr itemIdList);
+    void GetDescription([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder description, int size);
+    void SetDescription([MarshalAs(UnmanagedType.LPWStr)] string description);
+    void GetWorkingDirectory([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder directory, int size);
+    void SetWorkingDirectory([MarshalAs(UnmanagedType.LPWStr)] string directory);
+    void GetArguments([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder arguments, int size);
+    void SetArguments([MarshalAs(UnmanagedType.LPWStr)] string arguments);
+    void GetHotkey(out short hotkey);
+    void SetHotkey(short hotkey);
+    void GetShowCmd(out int showCommand);
+    void SetShowCmd(int showCommand);
+    void GetIconLocation([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder iconPath, int size, out int iconIndex);
+    void SetIconLocation([MarshalAs(UnmanagedType.LPWStr)] string iconPath, int iconIndex);
+    void SetRelativePath([MarshalAs(UnmanagedType.LPWStr)] string path, uint reserved);
+    void Resolve(IntPtr window, uint flags);
+    void SetPath([MarshalAs(UnmanagedType.LPWStr)] string path);
+}
+
+public sealed class CodexControlShortcutInfo
+{
+    public string TargetPath { get; set; }
+    public string WorkingDirectory { get; set; }
+    public string Arguments { get; set; }
+    public string Description { get; set; }
+    public string IconLocation { get; set; }
+}
+
+public static class CodexControlShortcut
+{
+    public static void Save(string shortcutPath, string targetPath, string workingDirectory,
+        string arguments, string description, string iconPath, int iconIndex)
+    {
+        object instance = new CodexControlShellLink();
+        try {
+            ICodexControlShellLinkW link = (ICodexControlShellLinkW)instance;
+            link.SetPath(targetPath);
+            link.SetWorkingDirectory(workingDirectory);
+            link.SetArguments(arguments);
+            link.SetDescription(description);
+            link.SetIconLocation(iconPath, iconIndex);
+            ((IPersistFile)instance).Save(shortcutPath, true);
+        }
+        finally { Marshal.FinalReleaseComObject(instance); }
+    }
+
+    public static CodexControlShortcutInfo Read(string shortcutPath)
+    {
+        object instance = new CodexControlShellLink();
+        try {
+            ((IPersistFile)instance).Load(shortcutPath, 0);
+            ICodexControlShellLinkW link = (ICodexControlShellLinkW)instance;
+            StringBuilder target = new StringBuilder(32768);
+            StringBuilder directory = new StringBuilder(32768);
+            StringBuilder arguments = new StringBuilder(32768);
+            StringBuilder description = new StringBuilder(32768);
+            StringBuilder icon = new StringBuilder(32768);
+            int iconIndex;
+            link.GetPath(target, target.Capacity, IntPtr.Zero, 4); // SLGP_RAWPATH: do not resolve or search for another target.
+            link.GetWorkingDirectory(directory, directory.Capacity);
+            link.GetArguments(arguments, arguments.Capacity);
+            link.GetDescription(description, description.Capacity);
+            link.GetIconLocation(icon, icon.Capacity, out iconIndex);
+            return new CodexControlShortcutInfo {
+                TargetPath = target.ToString(), WorkingDirectory = directory.ToString(),
+                Arguments = arguments.ToString(), Description = description.ToString(),
+                IconLocation = icon.ToString() + "," + iconIndex
+            };
+        }
+        finally { Marshal.FinalReleaseComObject(instance); }
+    }
+}
+'@
+}
+
 $transactionId = [guid]::NewGuid().ToString('N')
 $stageDirectory = Join-Path $tool ('.codex-control-install.' + $transactionId + '.stage')
 $stagedExecutable = Join-Path $stageDirectory 'CodexDiscordControl.exe'
@@ -109,15 +201,16 @@ try {
         [System.IO.File]::Copy((Join-Path $source 'codex-control-lib.ps1'), $stagedLibrary, $false)
     }
 
-    $shell = New-Object -ComObject WScript.Shell
-    $shortcut = $shell.CreateShortcut($stagedShortcut)
-    $shortcut.TargetPath = $executablePath
-    $shortcut.WorkingDirectory = $tool
-    $shortcut.Arguments = ''
-    $shortcut.Description = '控制 Discord 桥接服务的运行和开机自启状态'
-    $shortcut.IconLocation = $executablePath + ',0'
-    $shortcut.Save()
+    $description = '控制 Discord 桥接服务的运行和开机自启状态'
+    [CodexControlShortcut]::Save($stagedShortcut, $executablePath, $tool, '', $description, $executablePath, 0)
     if (-not (Test-Path -LiteralPath $stagedShortcut -PathType Leaf)) { throw 'Shortcut staging failed' }
+    $shortcut = [CodexControlShortcut]::Read($stagedShortcut)
+    if (-not $shortcut.TargetPath.Equals($executablePath, [StringComparison]::OrdinalIgnoreCase) -or
+        -not $shortcut.WorkingDirectory.Equals($tool, [StringComparison]::OrdinalIgnoreCase) -or
+        -not $shortcut.IconLocation.Equals(($executablePath + ',0'), [StringComparison]::OrdinalIgnoreCase) -or
+        $shortcut.Arguments -cne '' -or $shortcut.Description -cne $description) {
+        throw 'Shortcut staging verification failed'
+    }
 
     if (-not $ShortcutOnly) {
         $records.Add((Install-ControlTransactionFile -StagedPath $stagedExecutable -DestinationPath $executablePath -BackupPath (Join-Path $tool ('.CodexDiscordControl.' + $transactionId + '.backup.exe'))))

@@ -5,6 +5,7 @@ if (-not (Test-Path -LiteralPath $bridgeStartupPath -PathType Leaf)) {
     throw 'Discord bridge startup helpers are missing'
 }
 . $bridgeStartupPath
+. (Join-Path $PSScriptRoot 'discord-notification-control.ps1')
 
 function Get-CodexDesktopProgramFilesPath {
     [CmdletBinding()]
@@ -410,7 +411,8 @@ function New-CodexControlOperations {
         DisableNotificationGuardTask = { Disable-ScheduledTask -TaskPath '\' -TaskName 'Codex ntfy Notification Guard' -ErrorAction Stop | Out-Null }
         StartDetached = {
             param([Parameter(Mandatory)][string]$StartupPath, [Parameter(Mandatory)][ValidateSet('temporary')][string]$Mode)
-            $supervisorPath = Join-Path (Split-Path -Parent $StartupPath) 'CodexDiscordControl.exe'
+            # Construct the executable path without resolving a PowerShell drive.
+            $supervisorPath = [System.IO.Path]::Combine([System.IO.Path]::GetDirectoryName($StartupPath), 'CodexDiscordControl.exe')
             Start-Process -FilePath $supervisorPath -ArgumentList @('--bridge-supervisor', $Mode) -WindowStyle Hidden -ErrorAction Stop | Out-Null
         }
         OpenBridgeProcess = {
@@ -829,14 +831,33 @@ function Invoke-CodexBridgeServiceAction {
             return [pscustomobject]@{ ok=$false; action=$Action; errorCategory='invalid-service-operations' }
         }
     }
+    $starting = $Action -in @('start-temporary', 'enable-long-term')
+    $notificationSnapshot = $null
     function New-ServiceActionFailure([string]$Category) {
+        if ($starting -and $null -ne $notificationSnapshot) {
+            try { Restore-DiscordNotificationsEnabled -ToolDir $ToolDir -Snapshot $notificationSnapshot }
+            catch { $Category = 'notification-preference-restore-failed' }
+        }
+        elseif (-not $starting) {
+            try { [void](Set-DiscordNotificationsEnabled -ToolDir $ToolDir -Enabled $false) }
+            catch { $Category = 'notification-disable-failed' }
+        }
         $fresh = Get-CodexBridgeServiceStatus -Operations $Operations -ToolDir $ToolDir
         if (-not $fresh.ok) { $fresh = [pscustomobject]@{ ok=$false; state='unknown'; errorCategory='service-status-unavailable' } }
         return [pscustomobject]@{ ok=$false; action=$Action; errorCategory=$Category; service=$fresh }
     }
     $status = Get-CodexBridgeServiceStatus -Operations $Operations -ToolDir $ToolDir
-    if (-not $status.ok) { return [pscustomobject]@{ ok=$false; action=$Action; errorCategory=$status.errorCategory } }
+    if (-not $status.ok) { return New-ServiceActionFailure $status.errorCategory }
     try {
+        if ($starting) {
+            $notificationSnapshot = Set-DiscordNotificationsEnabled -ToolDir $ToolDir -Enabled $true
+        }
+        else {
+            # A config write failure must not prevent stopping the owned bridge.
+            # Both completion and failure paths retry mute and report any remaining failure.
+            try { $notificationSnapshot = Set-DiscordNotificationsEnabled -ToolDir $ToolDir -Enabled $false }
+            catch {}
+        }
         $startupPath = Join-Path ([System.IO.Path]::GetFullPath($ToolDir)) 'start-discord-bridge.ps1'
         switch ($Action) {
             'start-temporary' {
@@ -898,11 +919,14 @@ function Invoke-CodexBridgeServiceAction {
                 'enable-long-term' { $finalStatus.taskDefinitionCurrent -and $finalStatus.autoStartEnabled -and $finalStatus.running -and $finalStatus.runtime.mode -eq 'scheduled' }
                 'disable-long-term' { -not $finalStatus.autoStartEnabled -and -not $finalStatus.running -and -not $finalStatus.taskRunning }
             })
-            if ($complete) { return [pscustomobject][ordered]@{ ok=$true; action=$Action; service=$finalStatus } }
+            if ($complete) {
+                if (-not $starting) { [void](Set-DiscordNotificationsEnabled -ToolDir $ToolDir -Enabled $false) }
+                return [pscustomobject][ordered]@{ ok=$true; action=$Action; service=$finalStatus }
+            }
             if ($attempt -lt ($PollAttempts - 1) -and $Operations.ContainsKey('Sleep') -and $Operations.Sleep -is [scriptblock]) { & $Operations.Sleep $PollMilliseconds }
         }
         if ($null -eq $finalStatus -or -not $finalStatus.ok) { $finalStatus = [pscustomobject]@{ ok=$false; state='unknown'; errorCategory='service-status-unavailable' } }
-        return [pscustomobject][ordered]@{ ok=$false; action=$Action; errorCategory='service-action-incomplete'; service=$finalStatus }
+        return New-ServiceActionFailure 'service-action-incomplete'
     }
     catch { return New-ServiceActionFailure 'service-action-failed' }
 }

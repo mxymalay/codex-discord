@@ -504,6 +504,23 @@ function Get-NotificationProjectName {
     return Split-Path -Leaf $cwd.TrimEnd('\', '/')
 }
 
+function Assert-CurrentProjectNotificationsEnabled {
+    # A dispatcher may outlive the console stop that changed its initial config.
+    # Re-read at each actual outbound boundary, including Discord's fallback route.
+    try {
+        $item = Get-Item -LiteralPath $configPath -Force -ErrorAction Stop
+        if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Invalid notification configuration' }
+        $current = [Text.Json.JsonDocument]::Parse([IO.File]::ReadAllText($configPath))
+        try {
+            $enabled = [Text.Json.JsonElement]::new()
+            if ($current.RootElement.ValueKind -eq [Text.Json.JsonValueKind]::Object -and
+                $current.RootElement.TryGetProperty('enabled', [ref]$enabled) -and
+                $enabled.ValueKind -eq [Text.Json.JsonValueKind]::True) { return }
+        } finally { $current.Dispose() }
+    } catch {}
+    throw [OperationCanceledException]::new('Project notifications are disabled or configuration is unavailable')
+}
+
 function Invoke-JsonPost {
     param(
         [string]$Uri,
@@ -513,6 +530,7 @@ function Invoke-JsonPost {
 
     $json = $Payload | ConvertTo-Json -Depth 8 -Compress
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+    Assert-CurrentProjectNotificationsEnabled
     Invoke-RestMethod -Method Post -Uri $Uri -ContentType 'application/json; charset=utf-8' -Body $bytes -TimeoutSec $TimeoutSeconds | Out-Null
 }
 
@@ -1014,6 +1032,7 @@ function Send-DiscordBotMessage {
         $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
         $headers = New-DiscordBotHeaders -Token $botToken
         $uri = "https://discord.com/api/v10/channels/$ChannelId/messages"
+        Assert-CurrentProjectNotificationsEnabled
         return Invoke-RestMethod -Method Post -Uri $uri -Headers $headers -ContentType 'application/json; charset=utf-8' -Body $bytes -TimeoutSec $TimeoutSeconds
     }
     finally {
