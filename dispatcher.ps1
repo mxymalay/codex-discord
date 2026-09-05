@@ -23,7 +23,11 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $toolDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$codexRoot = Split-Path -Parent $toolDir
+$codexRoot = if (-not [string]::IsNullOrWhiteSpace($env:CODEX_HOME) -and [IO.Path]::IsPathRooted($env:CODEX_HOME)) {
+    [IO.Path]::GetFullPath($env:CODEX_HOME)
+} elseif ((Split-Path -Leaf $toolDir) -eq 'mobile-notify') {
+    Split-Path -Parent $toolDir
+} else { Join-Path ([Environment]::GetFolderPath('UserProfile')) '.codex' }
 $configPath = Join-Path $toolDir 'config.json'
 $logPath = Join-Path $toolDir 'mobile-notify.log'
 $quotaStatePath = Join-Path $toolDir 'quota-state.json'
@@ -1000,6 +1004,9 @@ function Send-DiscordBotMessage {
     if ([string]::IsNullOrWhiteSpace($tokenPath)) {
         throw 'Discord Bot token path is empty'
     }
+    if (-not [System.IO.Path]::IsPathRooted($tokenPath)) {
+        $tokenPath = [System.IO.Path]::GetFullPath((Join-Path $toolDir $tokenPath))
+    }
 
     $botToken = Unprotect-DiscordBotToken -Path $tokenPath
     try {
@@ -1065,11 +1072,18 @@ function Invoke-PreviousNotifier {
 
     $executable = [string]$previous[0]
     if (-not (Test-Path -LiteralPath $executable)) {
-        $runtimeRoot = Join-Path $env:LOCALAPPDATA 'OpenAI\Codex\runtimes\cua_node'
-        $runtimePattern = Join-Path $runtimeRoot '*\bin\node_modules\@oai\sky\bin\windows\codex-computer-use.exe'
-        $replacement = Get-ChildItem -Path $runtimePattern -File -ErrorAction SilentlyContinue |
-            Sort-Object LastWriteTime -Descending |
-            Select-Object -First 1
+        $command = Get-Command -Name $executable -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -ne $command) { $executable = $command.Source }
+    }
+    if (-not (Test-Path -LiteralPath $executable)) {
+        $replacement = $null
+        if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT -and -not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+            $runtimeRoot = Join-Path $env:LOCALAPPDATA 'OpenAI\Codex\runtimes\cua_node'
+            $runtimePattern = Join-Path $runtimeRoot '*\bin\node_modules\@oai\sky\bin\windows\codex-computer-use.exe'
+            $replacement = Get-ChildItem -Path $runtimePattern -File -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending |
+                Select-Object -First 1
+        }
         if ($null -eq $replacement) {
             Write-NotifyLog "Previous notifier is missing: $executable"
             return
@@ -1087,7 +1101,11 @@ function Invoke-PreviousNotifier {
         $allArguments = @($arguments) + @($RawNotification)
         $startInfo = New-Object System.Diagnostics.ProcessStartInfo
         $startInfo.FileName = $executable
-        $startInfo.Arguments = (@($allArguments | ForEach-Object { ConvertTo-WindowsCommandLineArgument -Value ([string]$_) }) -join ' ')
+        if ($null -ne $startInfo.PSObject.Properties['ArgumentList']) {
+            foreach ($argument in $allArguments) { [void]$startInfo.ArgumentList.Add([string]$argument) }
+        } else {
+            $startInfo.Arguments = (@($allArguments | ForEach-Object { ConvertTo-WindowsCommandLineArgument -Value ([string]$_) }) -join ' ')
+        }
         $startInfo.UseShellExecute = $false
         $startInfo.CreateNoWindow = $true
 

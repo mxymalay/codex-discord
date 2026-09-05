@@ -6,7 +6,7 @@
 
 ## 安装
 
-要求 Windows、PowerShell 7、Node.js，以及可从当前环境启动的 Codex。克隆仓库后，在仓库目录执行：
+支持 Windows 和 macOS，要求 PowerShell 7、Node.js 24，以及可从当前环境启动的 Codex。macOS 的安装、旧 Windows 配置迁移和当前桌面接口限制见 [macOS 指南](docs/MACOS.md)。以下为 Windows 安装步骤。克隆仓库后，在仓库目录执行：
 
 ```powershell
 Copy-Item .\config.example.json .\config.json
@@ -76,7 +76,7 @@ Get-ScheduledTask -TaskName 'Codex Discord Bridge'
 
 从 Discord `/新建任务` 或 `/继续任务` 发起的工作，其待确认和最终结果发送回发起任务的原频道；多项任务不会串频道。不会转发 commentary、工具调用或其他“任务进行中”过程信息。Codex 桌面端自己发起的任务仍整理到固定的“任务完成”或“任务待确认”频道，额度变化仍只发额度频道。
 
-桥接服务驻留在本机，Codex 桌面端可以关闭，不会因此让 Bot 下线。电脑仍必须开机、保持 Windows 用户已登录、处于唤醒状态并已联网；关机、休眠、注销或 Bot 离线期间不能执行 Slash Commands。Discord 会保留普通频道回复，下一次电脑恢复、登录并联网后，桥接器从持久游标补读；已进入本地队列的内容会在重启后继续恢复。
+桥接服务驻留在本机，Codex 桌面端可以关闭，不会因此让 Bot 下线。电脑仍必须开机、保持当前系统用户已登录、处于唤醒状态并已联网；关机、休眠、注销或 Bot 离线期间不能执行 Slash Commands。Discord 会保留普通频道回复，下一次电脑恢复、登录并联网后，桥接器从持久游标补读；已进入本地队列的内容会在重启后继续恢复。
 
 Codex 原生 `notify` 仍是快速通知通道。桥接器同时监听 rollout 的 `task_complete`，在原生通知未送达时补发，并通过 turn ID 去重。两条旧路径都由单进程集成保留。
 
@@ -121,6 +121,8 @@ pwsh -NoProfile -File .\tests\discord-bridge-startup.tests.ps1
 ```
 
 完整验证：
+
+双系统统一入口为 `pwsh -NoProfile -File ./tests/run-tests.ps1`。它在 Windows 上运行全部原有 Windows API 测试，在 macOS 上运行平台适用的 PowerShell 测试和原生服务/控制台验收；两者都运行全部适用的 Node 测试。
 
 ```powershell
 pwsh -NoProfile -File .\tests\repository-hygiene.tests.ps1

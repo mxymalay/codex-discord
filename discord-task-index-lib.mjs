@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
+import { expandPathVariables, isAbsolutePath, isPathDescendant, normalizePath, pathApi, pathKey, pathsEqual } from './discord-paths-lib.mjs';
 
 const indexVersion = 1;
 const defaultReadLimits = Object.freeze({
@@ -65,11 +66,11 @@ function identityKey(value) {
   return String(value ?? '').trim().toLocaleLowerCase();
 }
 
-function canonicalWindowsPath(value) {
+function canonicalProjectPath(value) {
   const text = stringOrNull(value);
   if (!text) return null;
   try {
-    return path.win32.normalize(text.replaceAll('/', '\\')).replace(/[\\]+$/u, '').toLocaleLowerCase();
+    return pathKey(text);
   } catch {
     return null;
   }
@@ -78,7 +79,7 @@ function canonicalWindowsPath(value) {
 function projectRoots(project) {
   return (Array.isArray(project?.roots) ? project.roots : [])
     .map((root) => typeof root === 'string' ? root : root?.path)
-    .map(canonicalWindowsPath)
+    .map(canonicalProjectPath)
     .filter(Boolean);
 }
 
@@ -97,12 +98,12 @@ export function inferSavedProject({ cwd, worktreePath, projectId, projectName } 
     return { projectId: String(explicit.id), projectName: String(explicit.name ?? explicit.id) };
   }
 
-  const candidates = [canonicalWindowsPath(cwd), canonicalWindowsPath(worktreePath)].filter(Boolean);
+  const candidates = [canonicalProjectPath(cwd), canonicalProjectPath(worktreePath)].filter(Boolean);
   if (!candidates.length) return { projectId: null, projectName: null };
   let match = null;
   for (const project of saved) {
     for (const root of projectRoots(project)) {
-      if (!candidates.some((candidate) => candidate === root || candidate.startsWith(`${root}\\`))) continue;
+      if (!candidates.some((candidate) => pathsEqual(candidate, root) || isPathDescendant(root, candidate))) continue;
       if (!match || root.length > match.root.length) match = { project, root };
     }
   }
@@ -301,15 +302,14 @@ function configuredWorktreeRoot(explicitRoot, previousIndex) {
   const configured = stringOrNull(explicitRoot) ??
     stringOrNull(previousIndex?.discordWorktreeRoot) ??
     stringOrNull(process.env.DISCORD_WORKTREE_ROOT);
-  if (configured) return path.resolve(configured);
-  if (process.env.CODEX_HOME) return path.resolve(process.env.CODEX_HOME, 'worktrees', 'discord');
+  if (configured) {
+    try {
+      const expanded = expandPathVariables(configured);
+      return isAbsolutePath(expanded) ? normalizePath(expanded) : null;
+    } catch { return null; }
+  }
+  if (isAbsolutePath(process.env.CODEX_HOME)) return pathApi(process.env.CODEX_HOME).join(process.env.CODEX_HOME, 'worktrees', 'discord');
   return null;
-}
-
-function isDescendant(root, candidate) {
-  if (!root || !candidate) return false;
-  const relative = path.relative(path.resolve(root), path.resolve(candidate));
-  return relative !== '' && relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
 }
 
 function projectMetadata(meta, sidebarEntry, previous) {
@@ -357,10 +357,10 @@ function worktreeMetadata(meta, worktreeRoot) {
   const candidatePath = stringOrNull(meta?.worktree_path ?? meta?.worktreePath) ??
     stringOrNull(Array.isArray(runtimeRoots) ? runtimeRoots[0] : null) ?? stringOrNull(meta?.cwd);
   const branch = stringOrNull(meta?.worktree_branch ?? meta?.worktreeBranch ?? meta?.git?.branch);
-  if (!branch?.startsWith('codex/discord-') || !isDescendant(worktreeRoot, candidatePath)) {
+  if (!branch?.startsWith('codex/discord-') || !isPathDescendant(worktreeRoot, candidatePath)) {
     return { worktreePath: null, worktreeBranch: null };
   }
-  return { worktreePath: path.resolve(candidatePath), worktreeBranch: branch };
+  return { worktreePath: pathApi(candidatePath).resolve(candidatePath), worktreeBranch: branch };
 }
 
 function buildRecord({ entries, middleSkipped, rolloutPath, offset, expectedThreadId, sidebarEntry, createdRecord, previous, nowMs, worktreeRoot, latestMapping, projects }) {
@@ -447,7 +447,7 @@ function buildRecord({ entries, middleSkipped, rolloutPath, offset, expectedThre
   const project = Array.isArray(projects) && projects.length > 0 ? inferredProject : explicitProject;
   const explicitlyProjectless = explicitProject.projectId == null && explicitProject.projectName === '无项目';
   const workspacePath = stringOrNull(meta?.cwd ?? createdRecord?.workspace?.cwd);
-  const workspaceName = workspacePath ? stringOrNull(path.win32.basename(workspacePath.replaceAll('/', '\\'))) : null;
+  const workspaceName = workspacePath ? stringOrNull(pathApi(workspacePath).basename(workspacePath)) : null;
   const displayProject = project.projectName ? project : {
     projectId: null,
     projectName: explicitlyProjectless ? '无项目' : workspaceName,

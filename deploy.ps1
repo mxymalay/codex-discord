@@ -19,6 +19,8 @@ $ErrorActionPreference = 'Stop'
 $script:DeployFileAllowlist = @(
     'discord-bridge.mjs',
     'discord-bridge-lib.mjs',
+    'discord-runtime-lib.mjs',
+    'discord-paths-lib.mjs',
     'discord-commands-lib.mjs',
     'discord-interactions.mjs',
     'discord-gateway-lib.mjs',
@@ -32,6 +34,9 @@ $script:DeployFileAllowlist = @(
     'dispatcher.ps1',
     'discord-config.ps1',
     'discord-secret.ps1',
+    'discord-migration.ps1',
+    'export-discord-migration.ps1',
+    'import-discord-migration.ps1',
     'discord-state.ps1',
     'discord-http.ps1',
     'task-delivery-state.ps1',

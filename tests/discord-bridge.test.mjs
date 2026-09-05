@@ -148,7 +148,7 @@ test('production interaction wiring refreshes the shared index and uses only bou
   assert.deepEqual(controlCalls.map((call) => call.action), ['status', 'stop-codex']);
   for (const call of controlCalls) {
     assert.equal(call.powershellPath, 'pwsh.exe');
-    assert.match(call.controlPath, /codex-control\.ps1$/u);
+    assert.match(call.controlPath, process.platform === 'darwin' ? /discord-macos-control\.mjs$/u : /codex-control\.ps1$/u);
     assert.deepEqual(Object.keys(call).sort(), ['action', 'controlPath', 'powershellPath']);
   }
 });
@@ -3696,8 +3696,8 @@ test('resolves the newest installed Codex executable when the scheduled-task PAT
     await fs.utimes(older, oldTime, oldTime);
     await fs.utimes(newest, newTime, newTime);
 
-    assert.equal(await resolveCodexExecutable({ configuredPath: 'codex', localAppData: root }), newest);
-    assert.equal(await resolveCodexExecutable({ configuredPath: older, localAppData: root }), older);
+    assert.equal(await resolveCodexExecutable({ configuredPath: 'codex', localAppData: root, platform: 'win32' }), newest);
+    assert.equal(await resolveCodexExecutable({ configuredPath: older, localAppData: root, platform: 'win32' }), older);
   } finally {
     await fs.rm(root, { recursive: true, force: true });
   }

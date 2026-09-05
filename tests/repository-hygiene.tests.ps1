@@ -1,6 +1,6 @@
 $repo = Split-Path -Parent $PSScriptRoot
 $forbiddenFiles = @(
-    'config.json','discord-token.dpapi','discord-inbox-state.json','discord-message-map.json',
+    'config.json','discord-token.dpapi','discord-token.keychain','discord-inbox-state.json','discord-message-map.json',
     'discord-task-index.json','discord-gateway-state.json','quota-state.json','rollout-watcher-state.json',
     'task-delivery-state.json','discord-bridge-runtime.json','discord-bridge-health.json',
     'discord-bridge.log','discord-bridge-guard.log','mobile-notify.log','notify-guard.log'
@@ -15,7 +15,7 @@ $repositoryFiles = @($trackedRelativePaths | ForEach-Object {
 foreach ($file in $repositoryFiles) {
     if ($forbiddenFiles -ccontains $file.Name -or $file.Extension -ieq '.log') { throw "runtime file tracked candidate: $($file.Name)" }
     if ($file.Name -match '(?i)^(?:discord-inbox-state|discord-task-index)\.corrupt-.*\.json$|^\.rollout-notification-.*\.json$') { throw "runtime recovery file tracked candidate: $($file.Name)" }
-    if ($file.Extension -in @('.exe','.lnk')) { throw "built or shortcut artifact tracked candidate: $($file.Name)" }
+    if ($file.Extension -in @('.exe','.lnk','.discord-migration','.keychain-db')) { throw "built, secret migration or shortcut artifact tracked candidate: $($file.Name)" }
     if ($file.Name -match '(?i)\.codex-discord-deploy\.|\.backup\.|\.stage\.|\.rollback\.') { throw "deployment artifact tracked candidate: $($file.Name)" }
 }
 $binaryExtensions = @(
@@ -54,11 +54,14 @@ $personalUserNames = @($env:USERNAME, (Split-Path -Leaf $profilePath)) |
     Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
     Select-Object -Unique
 foreach ($personalUserName in $personalUserNames) {
+    # Hosted CI service account names are ordinary source vocabulary, not a
+    # developer's private identity. Absolute path and credential scans still run.
+    if ($env:GITHUB_ACTIONS -eq 'true' -and $personalUserName -in @('runner', 'runneradmin')) { continue }
     $userPattern = '(?<![A-Za-z0-9])' + [regex]::Escape($personalUserName) + '(?![A-Za-z0-9])'
     if ($joined -match $userPattern) { throw 'personal user name found' }
 }
 $gitIgnore = Get-Content -Raw -LiteralPath (Join-Path $repo '.gitignore')
-foreach ($pattern in @('*.exe','*.lnk','*.log','*.tmp','*.corrupt-*.json','.rollout-notification-*.json','config.json','discord-token.dpapi','discord-bridge-runtime.json','discord-bridge-health.json')) {
+foreach ($pattern in @('*.exe','*.lnk','*.log','*.tmp','*.corrupt-*.json','.rollout-notification-*.json','config.json','discord-token.dpapi','discord-token.keychain','*.discord-migration','discord-bridge-runtime.json','discord-bridge-health.json')) {
     if (($gitIgnore -split "`r?`n") -cnotcontains $pattern) { throw "gitignore is missing runtime artifact pattern: $pattern" }
 }
 Write-Output 'PASS: repository contains no runtime state or personal deployment values'

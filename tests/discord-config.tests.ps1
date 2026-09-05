@@ -6,6 +6,7 @@ $ErrorActionPreference = 'Stop'
 
 $sourceRoot = Split-Path -Parent $PSScriptRoot
 . (Join-Path $sourceRoot 'discord-config.ps1')
+$testTokenPath = [IO.Path]::GetFullPath((Join-Path ([IO.Path]::GetTempPath()) 'codex-config-test/discord-token.dpapi'))
 
 $config = [pscustomobject][ordered]@{
     enabled = $true
@@ -24,7 +25,7 @@ $result = Set-DiscordBotConfiguration `
     -TaskChannelId '100000000000000004' `
     -ConfirmationChannelId '100000000000000005' `
     -QuotaChannelId '100000000000000006' `
-    -TokenPath 'C:\safe\discord-token.dpapi'
+    -TokenPath $testTokenPath
 
 if ([string]$result.provider -ne 'discord') {
     throw 'Configuration was activated before live verification'
@@ -40,7 +41,7 @@ if ([string]$result.discordTaskChannelId -ne '100000000000000004' -or
     [string]$result.discordQuotaChannelId -ne '100000000000000006') {
     throw 'Discord channel routing was not saved'
 }
-if ([string]$result.discordTokenPath -ne 'C:\safe\discord-token.dpapi') {
+if ([string]$result.discordTokenPath -ne $testTokenPath) {
     throw 'Encrypted token path was not saved'
 }
 foreach ($name in @('endpoint', 'confirmationEndpoint', 'quotaEndpoint', 'legacyDiscordWebhooks')) {

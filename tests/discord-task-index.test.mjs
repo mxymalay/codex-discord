@@ -163,6 +163,34 @@ test('Discord managed worktree project provenance wins over generated path match
   }, projects), { projectId: 'example-project', projectName: 'example-project' });
 });
 
+test('POSIX project inference keeps case and backslash filenames distinct while finding the longest root', () => {
+  const projects = [
+    { id: 'upper', name: 'Upper', roots: ['/Users/operator/Repo'] },
+    { id: 'lower', name: 'Lower', roots: ['/Users/operator/repo'] },
+    { id: 'nested', name: 'Nested', roots: ['/Users/operator/repo/apps/'] },
+    { id: 'literal', name: 'Literal', roots: ['/Users/operator/repo\\archive'] },
+  ];
+  assert.equal(inferSavedProject({ cwd: '/Users/operator/repo/task' }, projects).projectId, 'lower');
+  assert.equal(inferSavedProject({ cwd: '/Users/operator/repo/apps/cashier' }, projects).projectId, 'nested');
+  assert.equal(inferSavedProject({ cwd: '/Users/operator/repo\\archive/task' }, projects).projectId, 'literal');
+  assert.equal(inferSavedProject({ cwd: '/Users/operator/REPO/task' }, projects).projectId, null);
+  assert.equal(inferSavedProject({ cwd: '/Users/operator/repo-old/task' }, projects).projectId, null);
+  assert.equal(inferSavedProject({ cwd: '/Users/operator/task' }, [{ id: 'root', name: 'Root', roots: ['/'] }]).projectId, 'root');
+});
+
+test('index recognizes Windows managed worktrees independently of the host platform', async () => {
+  const paths = await fixture();
+  try {
+    await writeJsonl(paths.sessionIndexPath, [{ id: 'windows-managed', thread_name: 'Windows task' }]);
+    await writeJsonl(paths.rollout('windows-managed'), [meta('windows-managed', {
+      cwd: 'd:/Codex/worktrees/discord/operation', git: { branch: 'codex/discord-operation' },
+    })]);
+    const index = await buildTaskIndex({ ...paths, discordWorktreeRoot: 'D:\\codex\\worktrees\\discord' });
+    assert.equal(index.tasks[0].worktreePath, 'd:\\Codex\\worktrees\\discord\\operation');
+    assert.equal(index.tasks[0].worktreeBranch, 'codex/discord-operation');
+  } finally { await fs.rm(paths.root, { recursive: true, force: true }); }
+});
+
 test('index project display falls back to the workspace name but preserves explicit no-project tasks', async () => {
   const paths = await fixture();
   try {

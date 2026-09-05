@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
     [switch]$FromClipboard,
+    [switch]$FromStdin,
     [switch]$UseEncryptedToken,
     [string]$AllowedUserId = '',
     [switch]$AllowedUserIdFromClipboard,
@@ -12,7 +13,7 @@ $ErrorActionPreference = 'Stop'
 
 $toolDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $configPath = Join-Path $toolDir 'config.json'
-$tokenPath = Join-Path $toolDir 'discord-token.dpapi'
+$tokenPath = Join-Path $toolDir $(if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) { 'discord-token.dpapi' } else { 'discord-token.keychain' })
 . (Join-Path $toolDir 'discord-secret.ps1')
 . (Join-Path $toolDir 'discord-config.ps1')
 . (Join-Path $toolDir 'discord-http.ps1')
@@ -43,15 +44,23 @@ function Invoke-DiscordRead {
     }
 }
 
-if ([bool]$FromClipboard -eq [bool]$UseEncryptedToken) {
-    throw '令牌来源必须且只能选择 -FromClipboard 或 -UseEncryptedToken'
+if (@(@($FromClipboard, $FromStdin, $UseEncryptedToken) | Where-Object { [bool]$_ }).Count -ne 1) {
+    throw '令牌来源必须且只能选择 -FromClipboard、-FromStdin 或 -UseEncryptedToken'
 }
 if (-not (Test-Path -LiteralPath $configPath)) {
     throw '通知配置文件不存在'
 }
+$config = Get-Content -Raw -LiteralPath $configPath -Encoding UTF8 | ConvertFrom-Json
+if ($UseEncryptedToken) {
+    $configuredTokenPath = Get-DiscordConfigProperty -Config $config -Name 'discordTokenPath'
+    if (-not [string]::IsNullOrWhiteSpace($configuredTokenPath)) { $tokenPath = $configuredTokenPath }
+}
 
 $token = if ($FromClipboard) {
     [string](Get-Clipboard -Raw)
+}
+elseif ($FromStdin) {
+    [Console]::In.ReadToEnd()
 }
 else {
     Unprotect-DiscordBotToken -Path $tokenPath
@@ -72,7 +81,6 @@ if (-not (Test-DiscordSnowflake -Value $AllowedUserId)) {
 }
 $AllowedUserId = $AllowedUserId.Trim()
 
-$config = Get-Content -Raw -LiteralPath $configPath -Encoding UTF8 | ConvertFrom-Json
 $expectedApplicationId = if ([string]::IsNullOrWhiteSpace($ExpectedApplicationId)) { [string]$config.discordApplicationId } else { $ExpectedApplicationId }
 $taskWebhook = Get-DiscordConfigProperty -Config $config -Name 'endpoint'
 $confirmationWebhook = Get-DiscordConfigProperty -Config $config -Name 'confirmationEndpoint'
@@ -144,7 +152,11 @@ finally {
 $token = $null
 [System.GC]::Collect()
 
-Write-Output 'Bot Token 已使用 Windows DPAPI 加密保存。'
+if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+    Write-Output 'Bot Token 已使用 Windows DPAPI 加密保存。'
+} else {
+    Write-Output 'Bot Token 已使用 AES-256-GCM 加密保存；加密密钥保存在 macOS Keychain。'
+}
 Write-Output ('应用：{0}；服务器：{1}；授权用户：{2}' -f (Get-MaskedIdentifier $applicationId), (Get-MaskedIdentifier ([string]$guildIds[0])), (Get-MaskedIdentifier $AllowedUserId))
 Write-Output ('三个频道：{0} / {1} / {2}' -f (Get-MaskedIdentifier $channelIds[0]), (Get-MaskedIdentifier $channelIds[1]), (Get-MaskedIdentifier $channelIds[2]))
 if ([string]$updated.provider -eq 'discord-bot') {

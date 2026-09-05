@@ -16,5 +16,8 @@ $tokenPath = [string]$config.discordTokenPath
 if ([string]::IsNullOrWhiteSpace($tokenPath)) {
     throw 'Discord Bot Token 路径未配置'
 }
+if (-not [System.IO.Path]::IsPathRooted($tokenPath)) {
+    $tokenPath = [System.IO.Path]::GetFullPath((Join-Path $toolDir $tokenPath))
+}
 
 Write-Output (Unprotect-DiscordBotToken -Path $tokenPath)

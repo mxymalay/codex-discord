@@ -2,19 +2,26 @@
 param(
     [switch]$Quiet,
 
-    [string]$CodexRoot = (Join-Path $env:USERPROFILE '.codex'),
+    [string]$CodexRoot = '',
 
     [string]$PowerShellPath
 )
 
 $ErrorActionPreference = 'Stop'
 
+if ([string]::IsNullOrWhiteSpace($CodexRoot)) {
+    $CodexRoot = if (-not [string]::IsNullOrWhiteSpace($env:CODEX_HOME) -and [IO.Path]::IsPathRooted($env:CODEX_HOME)) {
+        $env:CODEX_HOME
+    } else { Join-Path ([Environment]::GetFolderPath('UserProfile')) '.codex' }
+}
 $codexRoot = [System.IO.Path]::GetFullPath($CodexRoot)
 $configPath = Join-Path $codexRoot 'config.toml'
-$notifierPath = Join-Path $codexRoot 'mobile-notify\dispatcher.ps1'
-$logPath = Join-Path $codexRoot 'mobile-notify\notify-guard.log'
+$notifierPath = Join-Path (Join-Path $codexRoot 'mobile-notify') 'dispatcher.ps1'
+$logPath = Join-Path (Join-Path $codexRoot 'mobile-notify') 'notify-guard.log'
 if ([string]::IsNullOrWhiteSpace($PowerShellPath)) {
-    $PowerShellPath = (Get-Command pwsh.exe -ErrorAction Stop).Source
+    $runtimeName = if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) { 'pwsh.exe' } else { 'pwsh' }
+    $currentRuntime = Join-Path $PSHOME $runtimeName
+    $PowerShellPath = if (Test-Path -LiteralPath $currentRuntime) { $currentRuntime } else { (Get-Command $runtimeName -CommandType Application -ErrorAction Stop).Source }
 }
 $PowerShellPath = [System.IO.Path]::GetFullPath($PowerShellPath)
 
@@ -61,7 +68,7 @@ for ($attempt = 1; $attempt -le 5; $attempt++) {
         $notifyPattern = '(?m)^notify\s*=.*$'
         $currentMatch = [regex]::Match($text, $notifyPattern)
         $desiredNotify = $directNotify
-        if ($currentMatch.Success -and $currentMatch.Value -match 'codex-computer-use\.exe' -and $currentMatch.Value -match '"--previous-notify"') {
+        if ($currentMatch.Success -and $currentMatch.Value -match 'codex-computer-use(?:\.exe)?"' -and $currentMatch.Value -match '"--previous-notify"') {
             $nestedPattern = '("--previous-notify"\s*,\s*)"(?:\\.|[^"\\])*"'
             $nestedMatch = [regex]::Match($currentMatch.Value, $nestedPattern)
             if ($nestedMatch.Success) {
@@ -88,7 +95,7 @@ for ($attempt = 1; $attempt -le 5; $attempt++) {
         $temporaryPath = Join-Path (Split-Path -Parent $configPath) ('.config.toml.notify-guard-{0}.tmp' -f $PID)
         [System.IO.File]::WriteAllText($temporaryPath, $updated, (New-Object System.Text.UTF8Encoding($false)))
         Move-Item -LiteralPath $temporaryPath -Destination $configPath -Force
-        Write-GuardLog 'Restored Codex ntfy notification hook.'
+        Write-GuardLog 'Restored Codex mobile notification hook.'
         exit 0
     }
     catch {
