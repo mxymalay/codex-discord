@@ -36,13 +36,15 @@ macOS 本机验证使用 Apple Silicon、Node.js 24 和 PowerShell 7.6。基线 
 
 通知停用修复部署后，本机又实际执行临时停止：桥接退出、通知开关关闭；从另一个目录独立调用 dispatcher 的三类 dry-run 均被抑制。重新开启后服务与通知恢复，其他配置字段保持不变。新版原生 UI 已实际显示小圈及每两秒刷新，后台轮询时全部按钮可用。
 
-真实 Discord 的七个只读命令以及任务列表详情按钮均已取得私有回执：任务列表、任务详情、任务搜索、继续队列、额度、系统状态和帮助。最初额度显示暂无快照；这次空态检查不代表已验证实际额度变化提醒。
+真实 Discord 的七个只读命令以及任务列表、搜索结果的详情按钮均已取得私有回执：任务列表、任务详情、任务搜索、继续队列、额度、系统状态和帮助。额度的空态和已有快照均已验证，过期快照明确标注。另已只读核对一条真实周额度变化通知：Discord 服务端消息、发送日志、本机快照及原始官方 `token_count` 记录的值和时间匹配；这项证据不归因于两轮模型验收，也不代表单独验证了按模型分类的额度。
 
 真实模型验收恰好创建一个任务并执行两轮，沿用 `gpt-6-astra / ultra`，原始结果分别为 `CODEX_DISCORD_CREATE_OK` 和 `CODEX_DISCORD_CONTINUE_OK。`。第二轮句号由模型产生，Discord 显示与原始结果一致。两条来源记录均为已投递，每轮观察到一条完成消息；没有工具调用或文件操作记录，工作目录为空。续接队列待发数为 0，保留一条“已送达”历史。
 
+续接回执的“查看当前运行状态”按钮已返回真实私有“任务已完成”卡片，关联同一续接回执，结果及模型标注均一致。另已执行 `/退出codex` 的风险预览并点击“取消”：私有取消回执出现，确认退出按钮移除，桌面主进程的 PID 和启动时间保持不变，桥接继续运行；没有执行退出或中断任务。
+
 这次实测暴露并修复了完成补发故障：新格式的用户输入未被识别、单项错误阻塞整批、归档后定位丢失及 PowerShell 归档资格检查遗漏。新版在真实状态副本上完整解释了 15 条积压，其中 13 条是用户通知、2 条有完整内部续行证据；部署后实际待处理数归零，推进时间继续更新，重启后观察窗口内未新增同类失败。已完成的验收任务也已显示首条输入摘要，不再停留在“生成中”。
 
-本次本机完整验收通过：497 项 Node 测试，26 套适用于 macOS 的 PowerShell 测试，Node/PowerShell 语法检查和仓库隐私检查。四套 Windows API 专用测试由 Windows CI 运行。[PR 的检查结果](https://github.com/mxymalay/codex-discord/pull/1/checks)对应每次提交；此前 `28dd479` 的双平台 CI 为 macOS 482 项 Node / 25 套 PowerShell、Windows 474 项 Node / 29 套 PowerShell，Windows 另跳过 8 项 macOS 专用测试。运行方法：
+本次本机完整验收通过：497 项 Node 测试，26 套适用于 macOS 的 PowerShell 测试，Node/PowerShell 语法检查和仓库隐私检查。四套 Windows API 专用测试由 Windows CI 运行。[代码提交 `b4b9ec6` 的双平台 CI](https://github.com/mxymalay/codex-discord/actions/runs/33988942897)为 macOS 497 项 Node / 26 套 PowerShell、Windows 489 项 Node / 30 套 PowerShell，均为 0 失败；Windows 另跳过 8 项 Mac/Unix 专属测试。后续提交的状态见 [PR 检查结果](https://github.com/mxymalay/codex-discord/pull/1/checks)。运行方法：
 
 ```sh
 pwsh -NoProfile -File ./tests/run-tests.ps1
@@ -51,7 +53,6 @@ pwsh -NoProfile -File ./tests/run-tests.ps1
 ## 未完成的真实环境验收
 
 - 当前 Mac 版 Codex 的内部桌面工具接口拒绝外部 Node 进程。Unix socket 实现与失败/排队路径已覆盖，直接接管现有桌面任务尚不具备该版本的真实通过证据；详情见 [macOS 指南](MACOS.md)。
-- 续接成功回执的“查看当前运行状态”按钮尚未取得浏览器可见回执，等待人工核对；不能仅凭单元测试宣称真实按钮验收通过。
 - 旧 Windows 机器仍需安装交付包中的更新并确认停用效果；Windows CI 的隔离验证不代表旧机器已经更新。
 - 主动退出用户 Codex、关机/休眠/重新登录及网络中断后的真实恢复，需要在目标机器上安排测试。
 
