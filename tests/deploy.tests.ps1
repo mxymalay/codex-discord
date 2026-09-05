@@ -326,6 +326,75 @@ function Assert-DirectoryUnchanged {
     }
 }
 
+function Test-StoppedDeployNotificationRestoration {
+    # Exercise the actual restoration and notification-control functions while replacing only
+    # Windows process/task boundaries. This also runs independently on macOS during review.
+    $parseTokens = $null; $parseErrors = $null
+    $deployAst = [Management.Automation.Language.Parser]::ParseFile($deployScript, [ref]$parseTokens, [ref]$parseErrors)
+    Assert-True ($parseErrors.Count -eq 0) 'Deployment script could not be parsed for restoration regression'
+    foreach ($name in @('Test-DeployBridgeStateEqual', 'Restore-DeployBridgeState')) {
+        $definition = $deployAst.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name }, $true)
+        Assert-True ($null -ne $definition) "Missing deployment function: $name"
+        . ([scriptblock]::Create($definition.Extent.Text))
+    }
+    . (Join-Path $sourceRoot 'codex-control-lib.ps1')
+    function Invoke-DeployControl {
+        param($PowerShellPath, $ControlPath, $Action)
+        $result = Invoke-CodexBridgeServiceAction -Action $Action -ToolDir $fixtureDirectory -Operations $fixtureOperations -PollAttempts 1 -PollMilliseconds 0
+        if (-not $result.ok) { throw "control action failed: $Action" }
+        return $result
+    }
+    function Invoke-DeployServiceProbe {
+        param($PowerShellPath, $ProbePath, $Action, $ToolDir)
+        Assert-True ($Action -eq 'status') 'Restoration unexpectedly used the staged action fallback'
+        $status = Get-CodexBridgeServiceStatus -Operations $fixtureOperations -ToolDir $ToolDir
+        return [pscustomobject]@{ok=$status.ok;service=[pscustomobject]@{
+            taskInstalled=$status.taskInstalled; autoStartEnabled=$status.autoStartEnabled
+            taskRunning=$status.taskRunning; running=$status.running; mode='unknown'
+        }}
+    }
+    foreach ($installed in @($true, $false)) {
+        $fixtureDirectory = Join-Path $testRoot "stopped notification regression $installed"
+        [void][IO.Directory]::CreateDirectory($fixtureDirectory)
+        $fixtureControl = Join-Path $fixtureDirectory 'codex-control.ps1'
+        [IO.File]::WriteAllText($fixtureControl, '# All task boundaries are injected by this test.')
+        $fixtureConfig = Join-Path $fixtureDirectory 'config.json'
+        $beforeJson = '{"enabled":true,"previousNotify":["synthetic-previous-notifier","--keep"],"nested":{"value":[1,"two",true]},"huge":9007199254740993,"exponent":1e400,"negativeZero":-0}'
+        [IO.File]::WriteAllText($fixtureConfig, $beforeJson)
+        $fixtureToken = Join-Path $fixtureDirectory 'discord-token.dpapi'
+        [IO.File]::WriteAllBytes($fixtureToken, [byte[]](0,255,1,22))
+        $fixtureOperations = @{
+            GetTask = { [pscustomobject]@{installed=$installed; enabled=$false; running=$false; definitionCurrent=$true} }.GetNewClosure()
+            GetRuntime = { $null }
+            StopTask = { throw 'Already stopped task should not be stopped again' }
+            InstallTask = { throw 'Stopped deployment must never create a task' }
+            EnableTask = { throw 'Stopped deployment must preserve disabled startup' }
+            StartTask = { throw 'Stopped deployment must not start a task' }
+            StartDetached = { throw 'Stopped deployment must not start a bridge' }
+        }
+        $expected = [pscustomobject]@{taskInstalled=$installed;autoStartEnabled=$false;taskRunning=$false;running=$false;mode='unknown'}
+        $restored = Restore-DeployBridgeState -PowerShellPath 'unused' -ProbePath 'unused' -ToolDir $fixtureDirectory -Expected $expected -ControlPath $fixtureControl
+        $before = [Text.Json.JsonDocument]::Parse($beforeJson)
+        $after = [Text.Json.JsonDocument]::Parse([IO.File]::ReadAllText($fixtureConfig))
+        try {
+            Assert-True ($after.RootElement.GetProperty('enabled').ValueKind -eq [Text.Json.JsonValueKind]::False) "Stopped deployment left legacy hook notifications enabled (taskInstalled=$installed)"
+            foreach ($property in $before.RootElement.EnumerateObject()) {
+                if ($property.Name -ceq 'enabled') { continue }
+                Assert-True ($after.RootElement.GetProperty($property.Name).GetRawText() -ceq $property.Value.GetRawText()) "Stopped deployment changed unrelated configuration: $($property.Name)"
+            }
+        } finally { $before.Dispose(); $after.Dispose() }
+        Assert-True ((Get-BytesHex $fixtureToken) -ceq '00FF0116') 'Stopped deployment changed the encrypted token'
+        Assert-True (Test-DeployBridgeStateEqual -Actual $restored.service -Expected $expected) 'Stopped deployment changed task existence or startup preference'
+        # A malformed config must produce a failed update, never claim that notifications stopped.
+        [IO.File]::WriteAllText($fixtureConfig, '{broken')
+        $failed = $false
+        try { [void](Restore-DeployBridgeState -PowerShellPath 'unused' -ProbePath 'unused' -ToolDir $fixtureDirectory -Expected $expected -ControlPath $fixtureControl) }
+        catch { $failed = $true }
+        Assert-True $failed 'Stopped deployment ignored a notification configuration failure'
+    }
+    Write-Output 'PASS: stopped deployment mutes legacy hooks while preserving configuration, token and task preferences'
+}
+
 function Get-TestShortPath {
     param([Parameter(Mandatory)][string]$Path)
 
@@ -349,6 +418,7 @@ public static class CodexDeployTestPathNative {
 try {
     Assert-True (Test-Path -LiteralPath $deployScript -PathType Leaf) 'deploy.ps1 is missing'
     New-Item -ItemType Directory -Path $testRoot -Force | Out-Null
+    Test-StoppedDeployNotificationRestoration
 
     foreach ($relativePath in $sourceFiles) {
         Assert-True (Test-Path -LiteralPath (Join-Path $sourceRoot $relativePath) -PathType Leaf) "deployment source is missing: $relativePath"
@@ -813,11 +883,11 @@ try {
     Install-IsolatedDeploySource -Destination $nonSkipSource
 
     $guardCases = @(
-        [pscustomobject]@{Name='absent'; Initial=@{exists=$false;trusted=$true;enabled=$false;running=$false}; Expected=@('guard:status','probe:status','install:shortcut','register:new','probe:status','guard:status')},
-        [pscustomobject]@{Name='enabled running auto restart'; Initial=@{exists=$true;trusted=$true;enabled=$true;running=$true;autoRestartWhenEnabled=$true}; Expected=@('guard:status','guard:disable','guard:stop','guard:status','probe:status','install:shortcut','register:new','probe:status','guard:status','guard:enable','guard:start','guard:status')},
-        [pscustomobject]@{Name='enabled stopped'; Initial=@{exists=$true;trusted=$true;enabled=$true;running=$false}; Expected=@('guard:status','guard:disable','guard:stop','guard:status','probe:status','install:shortcut','register:new','probe:status','guard:status','guard:status','guard:enable','guard:status')},
-        [pscustomobject]@{Name='disabled running'; Initial=@{exists=$true;trusted=$true;enabled=$false;running=$true}; Expected=@('guard:status','guard:disable','guard:stop','guard:status','probe:status','install:shortcut','register:new','probe:status','guard:status','guard:enable','guard:start','guard:disable','guard:status')},
-        [pscustomobject]@{Name='disabled stopped'; Initial=@{exists=$true;trusted=$true;enabled=$false;running=$false}; Expected=@('guard:status','guard:disable','guard:stop','guard:status','probe:status','install:shortcut','register:new','probe:status','guard:status','guard:status')}
+        [pscustomobject]@{Name='absent'; Initial=@{exists=$false;trusted=$true;enabled=$false;running=$false}; Expected=@('guard:status','probe:status','install:shortcut','register:new','control:new:stop-temporary','probe:status','guard:status')},
+        [pscustomobject]@{Name='enabled running auto restart'; Initial=@{exists=$true;trusted=$true;enabled=$true;running=$true;autoRestartWhenEnabled=$true}; Expected=@('guard:status','guard:disable','guard:stop','guard:status','probe:status','install:shortcut','register:new','control:new:stop-temporary','probe:status','guard:status','guard:enable','guard:start','guard:status')},
+        [pscustomobject]@{Name='enabled stopped'; Initial=@{exists=$true;trusted=$true;enabled=$true;running=$false}; Expected=@('guard:status','guard:disable','guard:stop','guard:status','probe:status','install:shortcut','register:new','control:new:stop-temporary','probe:status','guard:status','guard:status','guard:enable','guard:status')},
+        [pscustomobject]@{Name='disabled running'; Initial=@{exists=$true;trusted=$true;enabled=$false;running=$true}; Expected=@('guard:status','guard:disable','guard:stop','guard:status','probe:status','install:shortcut','register:new','control:new:stop-temporary','probe:status','guard:status','guard:enable','guard:start','guard:disable','guard:status')},
+        [pscustomobject]@{Name='disabled stopped'; Initial=@{exists=$true;trusted=$true;enabled=$false;running=$false}; Expected=@('guard:status','guard:disable','guard:stop','guard:status','probe:status','install:shortcut','register:new','control:new:stop-temporary','probe:status','guard:status','guard:status')}
     )
     foreach ($case in $guardCases) {
         $caseLive = Join-Path $testRoot ("guard $($case.Name) live")
@@ -925,9 +995,9 @@ try {
     $serviceCases = @(
         [pscustomobject]@{ Name='scheduled'; Initial=@{taskInstalled=$true;autoStartEnabled=$true;taskRunning=$true;running=$true;mode='scheduled'}; Expected=@('probe:status','probe:stop-temporary','install:shortcut','register:new','control:new:enable-long-term','probe:status'); Installed=$true; TaskRunning=$true; Running=$true; AutoStart=$true; Mode='scheduled' },
         [pscustomobject]@{ Name='enabled stopped'; Initial=@{taskInstalled=$true;autoStartEnabled=$true;taskRunning=$false;running=$false;mode='unknown'}; Expected=@('probe:status','install:shortcut','register:new','control:new:enable-long-term','control:new:stop-temporary','probe:status'); Installed=$true; TaskRunning=$false; Running=$false; AutoStart=$true; Mode='unknown' },
-        [pscustomobject]@{ Name='disabled'; Initial=@{taskInstalled=$true;autoStartEnabled=$false;taskRunning=$false;running=$false;mode='unknown'}; Expected=@('probe:status','install:shortcut','register:new','probe:status'); Installed=$true; TaskRunning=$false; Running=$false; AutoStart=$false; Mode='unknown' },
+        [pscustomobject]@{ Name='disabled'; Initial=@{taskInstalled=$true;autoStartEnabled=$false;taskRunning=$false;running=$false;mode='unknown'}; Expected=@('probe:status','install:shortcut','register:new','control:new:stop-temporary','probe:status'); Installed=$true; TaskRunning=$false; Running=$false; AutoStart=$false; Mode='unknown' },
         [pscustomobject]@{ Name='temporary'; Initial=@{taskInstalled=$true;autoStartEnabled=$false;taskRunning=$false;running=$true;mode='temporary'}; Expected=@('probe:status','probe:stop-temporary','install:shortcut','register:new','control:new:start-temporary','probe:status'); Installed=$true; TaskRunning=$false; Running=$true; AutoStart=$false; Mode='temporary' },
-        [pscustomobject]@{ Name='no task'; Initial=@{taskInstalled=$false;autoStartEnabled=$false;taskRunning=$false;running=$false;mode='unknown'}; Expected=@('probe:status','install:shortcut','register:new','probe:status'); Installed=$false; TaskRunning=$false; Running=$false; AutoStart=$false; Mode='unknown' }
+        [pscustomobject]@{ Name='no task'; Initial=@{taskInstalled=$false;autoStartEnabled=$false;taskRunning=$false;running=$false;mode='unknown'}; Expected=@('probe:status','install:shortcut','register:new','control:new:stop-temporary','probe:status'); Installed=$false; TaskRunning=$false; Running=$false; AutoStart=$false; Mode='unknown' }
     )
     foreach ($case in $serviceCases) {
         $caseLive = Join-Path $testRoot ("non skip $($case.Name) live")

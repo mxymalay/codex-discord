@@ -159,7 +159,7 @@ pwsh -NoProfile -File ./tests/run-tests.ps1
 
 更新前回到**源码根目录**，Git 用户运行 `git pull --ff-only`；ZIP 用户下载同一分支的新源码到独立目录。再运行对应平台的部署命令，保留原自启选择和私有状态：
 
-Windows 可在解压后的源码根目录双击 `update-windows.cmd`，它会更新默认运行目录并保留原服务选择。源码目录仍须独立于桌面和运行目录；请先阅读窗口中的错误或成功信息。也可以在 PowerShell 7 手动执行：
+Windows 可在解压后的源码根目录双击 `update-windows.cmd`，它会更新默认运行目录并保留原服务选择。旧服务如果已经停止，更新时会同步关闭本工具的通知开关。源码目录仍须独立于桌面和运行目录；请先阅读窗口中的错误或成功信息。也可以在 PowerShell 7 手动执行：
 
 ```powershell
 $codexRoot = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }

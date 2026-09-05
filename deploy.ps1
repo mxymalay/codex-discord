@@ -728,6 +728,12 @@ function Restore-DeployBridgeState {
         & $invokeAction 'enable-long-term'
         & $invokeAction 'stop-temporary'
     }
+    else {
+        # Older consoles stopped only the bridge, leaving native notify hooks enabled.
+        # Reapply stop through the updated controller so these hooks are muted too; this
+        # action neither installs a missing task nor changes the existing startup choice.
+        & $invokeAction 'stop-temporary'
+    }
 
     $final = Invoke-DeployServiceProbe -PowerShellPath $PowerShellPath -ProbePath $ProbePath -Action 'status' -ToolDir $ToolDir
     if (-not (Test-DeployBridgeStateEqual -Actual $final.service -Expected $Expected)) {
