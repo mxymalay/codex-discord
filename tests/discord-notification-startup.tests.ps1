@@ -6,7 +6,8 @@ $sourceRoot=Split-Path -Parent $PSScriptRoot
 if (-not $StartupScript) { $StartupScript=Join-Path $sourceRoot 'start-discord-bridge.ps1' }
 $testRoot=Join-Path ([IO.Path]::GetTempPath()) ('discord-notification-startup-' + [guid]::NewGuid().ToString('N'))
 $pwshPath=(Get-Process -Id $PID).Path
-$nodePath=(Get-Command node -CommandType Application -ErrorAction Stop).Source
+$originalPath=$env:PATH
+$firstNodePath=(Get-Command node -ErrorAction Stop).Source
 function Invoke-Fixture([string]$Directory) {
     $start=[Diagnostics.ProcessStartInfo]::new()
     $start.FileName=$pwshPath
@@ -20,12 +21,38 @@ function Invoke-Fixture([string]$Directory) {
         [void]$child.Start()
         $stdout=$child.StandardOutput.ReadToEndAsync()
         $stderr=$child.StandardError.ReadToEndAsync()
-        if (-not $child.WaitForExit(20000)) { $child.Kill($true); throw 'Isolated startup fixture exceeded its deadline' }
+        if (-not $child.WaitForExit(20000)) {
+            try { $child.Kill($true) } catch {}
+            [void]$child.WaitForExit(2000)
+            $diagnostics=[Collections.Generic.List[string]]::new()
+            foreach ($capture in @(@{Name='stdout';Task=$stdout},@{Name='stderr';Task=$stderr})) {
+                if ($capture.Task.Wait(2000)) {
+                    $content=$capture.Task.GetAwaiter().GetResult()
+                    if ($content.Length -gt 4000) { $content=$content.Substring($content.Length - 4000) }
+                    $diagnostics.Add($capture.Name + ': ' + $content)
+                } else { $diagnostics.Add($capture.Name + ': capture did not finish after termination') }
+            }
+            foreach ($name in @('discord-bridge-guard.log','observations.txt','attempts.txt')) {
+                $path=Join-Path $Directory $name
+                if (Test-Path -LiteralPath $path) { $diagnostics.Add($name + ': ' + ((Get-Content -LiteralPath $path -Tail 8) -join ' | ')) }
+            }
+            throw ('Isolated startup fixture exceeded its deadline; ' + ($diagnostics -join "`n"))
+        }
         return [pscustomobject]@{ExitCode=$child.ExitCode;Output=$stdout.GetAwaiter().GetResult();Error=$stderr.GetAwaiter().GetResult()}
     } finally { $child.Dispose() }
 }
 try {
     [void][IO.Directory]::CreateDirectory($testRoot)
+    # Hosted runners can have setup-node and a preinstalled Node on PATH.
+    # Exercise actual command discovery with multiple application matches.
+    $additionalNodeDirectory=Join-Path $testRoot 'additional Node installation'
+    [void][IO.Directory]::CreateDirectory($additionalNodeDirectory)
+    $nodeName=if ($IsWindows) { 'node.exe' } else { 'node' }
+    [void][IO.File]::CreateSymbolicLink((Join-Path $additionalNodeDirectory $nodeName),$firstNodePath)
+    $env:PATH=$additionalNodeDirectory + [IO.Path]::PathSeparator + $originalPath
+    $nodeCandidates=@(Get-Command node -CommandType Application -ErrorAction Stop)
+    if ($nodeCandidates.Count -lt 2) { throw 'Fixture did not create multiple Node application matches' }
+    $nodePath=$nodeCandidates[0].Source
     $mutexName='Local\CodexDiscordBridgeNotificationTest-' + [guid]::NewGuid().ToString('N')
     $startupText=[IO.File]::ReadAllText($StartupScript).Replace('Local\CodexDiscordBridge',$mutexName)
     [IO.File]::WriteAllText((Join-Path $testRoot 'start-discord-bridge.ps1'),$startupText)
@@ -46,7 +73,11 @@ function New-BridgeSupervisorJob { param($ToolDir,$Process) [IO.File]::WriteAllT
 function Write-BridgeRuntimeIdentity { param($Path,$Mode,$ProcessId,$CreationTimeUtc,$ToolDir) }
 function Remove-BridgeRuntimeIdentity { param($Path,$ExpectedProcessId) return $true }
 function Close-BridgeJob { param($Handle) }
-function Format-BridgeGuardLogEntry { param($Category,$ExitCode,$DurationMs) return $Category }
+function Format-BridgeGuardLogEntry {
+    param($Category,$ExitCode,$DurationMs)
+    if ($Category -eq 'bridge-launch-failed') { return ($Category + ': ' + [string]$Error[0]) }
+    return ($Category + ': exit=' + $ExitCode)
+}
 function Get-Command {
     param($Name,$ErrorAction)
     if ($Name -eq 'node') { return [pscustomobject]@{Source='__NODE__'} }
@@ -56,6 +87,12 @@ function Start-Sleep {
     param($Seconds)
     $observations=Join-Path $PSScriptRoot 'observations.txt'
     if ((Test-Path $observations) -and @(Get-Content $observations).Count -ge 2) { throw 'isolated-fixture-complete' }
+    $attemptPath=Join-Path $PSScriptRoot 'attempts.txt'
+    Add-Content -LiteralPath $attemptPath -Value 'attempt'
+    if (@(Get-Content -LiteralPath $attemptPath).Count -ge 4) {
+        $guardPath=Join-Path $PSScriptRoot 'discord-bridge-guard.log'
+        throw ('isolated-fixture-observations-missing; ' + ((Get-Content -LiteralPath $guardPath -Tail 8) -join ' | '))
+    }
 }
 '@.Replace('__NODE__',$nodePath.Replace("'","''"))
     [IO.File]::WriteAllText((Join-Path $testRoot 'discord-bridge-startup.ps1'),$fakeNative)
@@ -89,4 +126,7 @@ function Write-BridgeRuntimeIdentity {
     if (($observed -join ',') -cne 'true,false') { throw ('Supervisor must enable once after ownership and retain stop through retries; observed ' + ($observed -join ',')) }
     if ((Get-Content -Raw (Join-Path $testRoot 'config.json') | ConvertFrom-Json).enabled) { throw 'Supervisor child retry re-enabled stopped notifications' }
     Write-Output 'PASS: owner enables notifications once and retries respect a subsequent stop'
-} finally { Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue }
+} finally {
+    $env:PATH=$originalPath
+    Remove-Item -LiteralPath $testRoot -Recurse -Force -ErrorAction SilentlyContinue
+}

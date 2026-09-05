@@ -183,7 +183,7 @@ function Assert-BoundedRegistrationProcess {
         foreach ($name in $testEnvironment.Keys) {
             [Environment]::SetEnvironmentVariable($name, $testEnvironment[$name], 'Process')
         }
-        $nodePath = (Get-Command node -CommandType Application -ErrorAction Stop).Source
+        $nodePath = (Get-Command node -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
         # Time only the production process runner, independently of stage checks
         # and the separate processes needed for deployment and rollback.
         $processClock = [System.Diagnostics.Stopwatch]::StartNew()
