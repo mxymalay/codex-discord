@@ -58,6 +58,17 @@ function userMessage(text = '请检查 Discord 通知为什么漏发') {
   };
 }
 
+function goalContextMessage() {
+  return {
+    type: 'response_item',
+    payload: {
+      type: 'message', role: 'user',
+      content: [{ type: 'input_text', text: '<codex_internal_context source="goal">Continue the existing goal.</codex_internal_context>' }],
+      internal_chat_message_metadata_passthrough: { turn_id: turnId, content_item_kinds: ['goal.internal_context'] },
+    },
+  };
+}
+
 function taskComplete(message = '已经完成修复。') {
   return {
     timestamp: '2026-09-01T00:00:10.000Z',
@@ -833,6 +844,116 @@ test('retires a proven inter-agent-only root turn without claiming a notificatio
     assert.equal(state.lastSuppressedReason,'inter-agent-only-turn');
     assert.doesNotMatch(JSON.stringify(state),/internal automatic follow-up|internal agent response/);
   } finally { await fs.rm(paths.root,{recursive:true,force:true}); }
+});
+
+test('retires exact internal goal continuations with or without inter-agent results', async (t) => {
+  for (const withAgentResults of [true, false]) {
+    await t.test(withAgentResults ? 'with-agent-results' : 'without-agent-results', async () => {
+      const paths = await fixture();
+      try {
+        const agentResults = withAgentResults ? [
+          { type: 'inter_agent_communication_metadata', payload: { trigger_turn: turnId } },
+          { type: 'response_item', payload: { type: 'agent_message', message: 'internal result' } },
+        ] : [];
+        const earlierUserInput = { type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'unrelated earlier turn input' }], internal_chat_message_metadata_passthrough: { turn_id: 'earlier-turn', content_item_kinds: ['user.text'] } } };
+        await fs.writeFile(paths.rolloutPath, [sessionMeta(), earlierUserInput, taskStarted(), turnContext(), goalContextMessage(),
+          ...agentResults, taskComplete('internal goal continuation result'),
+        ].map(jsonLine).join(''), 'utf8');
+        let state = createEmptyRolloutWatcherState();
+        state.initialized = true;
+        for (let attempt = 0; attempt < 2; attempt++) {
+          await pollRolloutCompletions({
+            sessionsRoot: paths.sessionsRoot, state, nowMs: Date.parse('2026-09-01T00:00:20.000Z'), graceMs: 0, retryMs: 0,
+            dispatchNotification: async () => assert.fail('proven internal goal continuation must not reach the dispatcher'),
+          });
+          assert.deepEqual(state.pending, {});
+          assert.equal(state.suppressedInternalTurnCount, 1);
+          assert.equal(state.lastSuppressedReason, 'goal-internal-context-only-turn');
+          assert.doesNotMatch(JSON.stringify(state), /Continue the existing goal|internal goal continuation result/);
+          state = JSON.parse(JSON.stringify(state));
+        }
+      } finally { await fs.rm(paths.root, { recursive: true, force: true }); }
+    });
+  }
+});
+
+test('goal context cannot retire a real, ambiguous, damaged or Discord-origin turn', async (t) => {
+  const variants = [
+    'user-text', 'user-response-text', 'authored-goal-wrapper', 'image-only', 'legacy-user', 'unknown-user-shape', 'unknown-kind', 'mixed-kinds',
+    'kind-count-mismatch', 'non-text-content', 'no-metadata', 'no-turn-tag', 'wrong-turn-tag', 'conflicting-turn-tags',
+    'unwrapped', 'wrong-wrapper-source', 'extra-wrapper-attribute', 'text-outside-wrapper', 'multiple-wrappers',
+    'goal-evidence-other-turn', 'target-user-before-start', 'no-start', 'no-completion-id', 'interleaved-turn', 'duplicate-start',
+    'compacted', 'malformed-line', 'oversized-line', 'truncated-completion', 'conflicting-root', 'discord-origin',
+  ];
+  for (const variant of variants) {
+    await t.test(variant, async () => {
+      const paths = await fixture();
+      try {
+        const goal = goalContextMessage();
+        const metadata = goal.payload.internal_chat_message_metadata_passthrough;
+        const middle = [goal];
+        if (variant === 'user-text') middle.push(userMessage('actual user request'));
+        if (variant === 'user-response-text') middle.push({ type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'actual user request' }], internal_chat_message_metadata_passthrough: { turn_id: turnId, content_item_kinds: ['user.text'] } } });
+        if (variant === 'authored-goal-wrapper') metadata.content_item_kinds = ['user.text'];
+        if (variant === 'image-only') middle.push({ type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_image', image_url: 'image-canary' }], internal_chat_message_metadata_passthrough: { turn_id: turnId, content_item_kinds: ['user.image'] } } });
+        if (variant === 'legacy-user') middle.push(userMessage(''));
+        if (variant === 'unknown-user-shape') middle.push({ type: 'response_item', payload: { type: 'future_message', role: 'user', content: [] } });
+        if (variant === 'unknown-kind') metadata.content_item_kinds = ['goal.future_context'];
+        if (variant === 'mixed-kinds') { metadata.content_item_kinds.push('user.text'); goal.payload.content.push({ type: 'input_text', text: '' }); }
+        if (variant === 'kind-count-mismatch') metadata.content_item_kinds.push('goal.internal_context');
+        if (variant === 'non-text-content') goal.payload.content = [{ type: 'input_image', image_url: 'image-canary' }];
+        if (variant === 'no-metadata') delete goal.payload.internal_chat_message_metadata_passthrough;
+        if (variant === 'no-turn-tag') delete metadata.turn_id;
+        if (variant === 'wrong-turn-tag') metadata.turn_id = 'other-turn';
+        if (variant === 'conflicting-turn-tags') goal.payload.turn_id = 'other-turn';
+        if (variant === 'unwrapped') goal.payload.content[0].text = 'not a complete goal context';
+        if (variant === 'wrong-wrapper-source') goal.payload.content[0].text = goal.payload.content[0].text.replace('source="goal"', 'source="user"');
+        if (variant === 'extra-wrapper-attribute') goal.payload.content[0].text = goal.payload.content[0].text.replace('source="goal"', 'source="goal" extra="unknown"');
+        if (variant === 'text-outside-wrapper') goal.payload.content[0].text += ' actual user request';
+        if (variant === 'multiple-wrappers') goal.payload.content[0].text += goal.payload.content[0].text;
+        if (variant === 'interleaved-turn') middle.push({ type: 'event_msg', payload: { type: 'task_started', turn_id: 'other-turn' } });
+        if (variant === 'duplicate-start') middle.push(taskStarted());
+        if (variant === 'compacted') middle.push({ type: 'compacted', payload: {} });
+        if (variant === 'conflicting-root') middle.push({ ...sessionMeta(), payload: { ...sessionMeta().payload, id: 'other-root' } });
+        const complete = taskComplete();
+        if (variant === 'no-completion-id') delete complete.payload.turn_id;
+        const prefix = variant === 'goal-evidence-other-turn'
+          ? [sessionMeta(), { type: 'event_msg', payload: { type: 'task_started', turn_id: 'other-turn' } }, { ...goalContextMessage(), payload: { ...goalContextMessage().payload, internal_chat_message_metadata_passthrough: { turn_id: 'other-turn', content_item_kinds: ['goal.internal_context'] } } }, taskStarted()]
+          : [sessionMeta(), ...(variant === 'target-user-before-start' ? [{
+            type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'explicit target input before start' }], internal_chat_message_metadata_passthrough: { turn_id: turnId, content_item_kinds: ['user.text'] } },
+          }] : []), ...(variant === 'no-start' ? [] : [taskStarted()])];
+        const unreadable = variant === 'malformed-line' ? '{broken-json}\n' : variant === 'oversized-line' ? jsonLine({ type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'x'.repeat(8 * 1024 * 1024) }] } }) : '';
+        const content = [...prefix, ...(variant === 'goal-evidence-other-turn' ? [] : middle)].map(jsonLine).join('') + unreadable +
+          (variant === 'truncated-completion' ? JSON.stringify(complete).slice(0, -1) : jsonLine(complete));
+        await fs.writeFile(paths.rolloutPath, content, 'utf8');
+        const state = createEmptyRolloutWatcherState();
+        state.initialized = true;
+        state.files[path.resolve(paths.rolloutPath)] = { offset: Buffer.byteLength(content), threadId, cwd: sessionMeta().payload.cwd, activeTurnId: '', rootEligible: true };
+        state.pending[turnId] = { completedAtMs: Date.parse('2026-09-01T00:00:10.000Z'), lastAttemptAtMs: 0, rolloutPath: paths.rolloutPath, threadId, cwd: sessionMeta().payload.cwd };
+        const inboxState = createEmptyInboxState();
+        if (variant === 'discord-origin') inboxState.discordTurnOrigins[turnId] = {
+          threadId, guildId: '222222222222222222', channelId: '777777777777777777', source: 'slash',
+          createdAt: '2026-09-01T00:00:01.000Z', rolloutCursor: 0, deliveredEventIds: [], deliveryState: 'pending',
+        };
+        let dispatches = 0;
+        await pollRolloutCompletions({
+          sessionsRoot: paths.sessionsRoot, state, inboxState, persistInboxState: async () => {},
+          nowMs: Date.parse('2026-09-01T00:00:20.000Z'), graceMs: 0, retryMs: 0,
+          dispatchNotification: async (notification) => {
+            dispatches++;
+            if (['user-text', 'user-response-text'].includes(variant)) assert.deepEqual(notification['input-messages'], ['actual user request']);
+            if (variant === 'authored-goal-wrapper') assert.deepEqual(notification['input-messages'], [goal.payload.content[0].text]);
+            if (variant === 'discord-origin') assert.equal(notification['discord-origin-channel-id'], '777777777777777777');
+            throw new Error('retain-ambiguous-goal-turn');
+          },
+        }).catch((error) => assert.match(error.message, /retain-ambiguous-goal-turn/));
+        assert.equal(Object.hasOwn(state.pending, turnId), true);
+        assert.equal(state.suppressedInternalTurnCount, undefined);
+        if (['user-text', 'user-response-text', 'authored-goal-wrapper', 'discord-origin'].includes(variant)) assert.equal(dispatches, 1);
+        if (variant === 'discord-origin') assert.notEqual(inboxState.discordTurnOrigins[turnId].deliveryState, 'terminal-delivered');
+      } finally { await fs.rm(paths.root, { recursive: true, force: true }); }
+    });
+  }
 });
 
 test('empty input without complete proof of an internal-only turn remains retryable', async (t) => {

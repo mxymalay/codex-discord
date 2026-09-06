@@ -159,7 +159,11 @@ pwsh -NoProfile -File ./tests/run-tests.ps1
 
 更新前回到**源码根目录**，Git 用户运行 `git pull --ff-only`；ZIP 用户下载同一分支的新源码到独立目录。再运行对应平台的部署命令，保留原自启选择和私有状态：
 
-Windows 可在解压后的源码根目录双击 `update-windows.cmd`，它会更新默认运行目录并保留原服务选择。旧服务如果已经停止，更新时会同步关闭本工具的通知开关。源码目录仍须独立于桌面和运行目录；请先阅读窗口中的错误或成功信息。也可以在 PowerShell 7 手动执行：
+Windows 可在解压后的源码根目录双击 `update-windows.cmd`，它会更新默认运行目录并保留原服务选择。旧服务如果已经停止，更新时会同步关闭本工具的通知开关。源码目录仍须独立于桌面和运行目录；请先阅读窗口中的错误或成功信息。
+
+ZIP 用户先在资源管理器中右键压缩包，选择 **全部解压缩 / Extract All → 提取**，再进入解压后的 `codex-discord` 文件夹。确认 `update-windows.cmd` 和 `update-windows.ps1` 位于同一文件夹，再双击 CMD。直接在压缩包中运行会只临时提取 CMD，导致找不到配套脚本；新版启动器会对此提示完整解压。
+
+也可以在 PowerShell 7 手动执行：
 
 ```powershell
 $codexRoot = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
@@ -184,6 +188,7 @@ node ./deploy-macos.mjs --source-root "$PWD" \
 | Slash 正常但文字回复不续接 | Message Content Intent、Read Message History、是否使用授权账户回复正式任务消息；额度通知和测试消息不能续接 |
 | Token 丢失或失效 | 在 Developer Portal 重置，重新复制并运行本平台保存 Token 的命令，再临时停止/开启桥接；Token 不粘贴到聊天或命令参数 |
 | Windows 拒绝执行下载的脚本 | 确认源码来源后，先在下载 ZIP 的文件属性中“解除锁定”并重新解压；受组织策略管理的电脑按其规则处理 |
+| 更新提示找不到 `update-windows.ps1`，路径含 `Temp` 和 `.zip` | 关闭窗口，右键 ZIP 选择“全部解压缩”，从解压后的文件夹重新运行；不要直接在压缩包中双击 CMD |
 | Windows 提示 C# compiler unavailable / Mac 提示 xcrun 失败 | 修复系统 .NET Framework 开发编译器 / 完成 Xcode Command Line Tools 安装，再部署 |
 
 保存 Token 后可从剪贴板历史中清除它。需要求助时只提供脱敏错误和测试结果，不发送 `config.json`、Token 文件或任务状态文件。

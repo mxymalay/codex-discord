@@ -131,6 +131,56 @@ test('resumes with the previous session and latest sequence after reconnect', as
   assert.equal(client.getStatus().reconnectCount, 1);
 });
 
+test('a successful resume returns to ready and keeps its session and updated sequence', async () => {
+  const { client, sockets, timers } = createHarness();
+  await client.start();
+  sockets[0].receive({ op: 10, d: { heartbeat_interval: 45_000 } });
+  sockets[0].receive({ op: 0, t: 'READY', s: 41, d: { session_id: 'session-1', resume_gateway_url: 'wss://resume.test' } });
+  sockets[0].receive({ op: 7, d: null });
+  await timers.advance(1_000);
+  sockets[1].receive({ op: 10, d: { heartbeat_interval: 45_000 } });
+  sockets[1].emit('message', { data: '{invalid-frame' });
+  assert.equal(client.getStatus().lastError, 'gateway-frame-invalid');
+
+  sockets[1].receive({ op: 0, t: 'RESUMED', s: 42, d: {} });
+  assert.deepEqual(client.getStatus(), {
+    state: 'ready', sessionId: 'session-1', lastHeartbeatAt: null, lastAckAt: null,
+    lastEventAt: 1_000, reconnectCount: 1, lastError: null,
+  });
+  sockets[1].receive({ op: 7, d: null });
+  await timers.advance(2_000);
+  sockets[2].receive({ op: 10, d: { heartbeat_interval: 45_000 } });
+  assert.deepEqual(sockets[2].sent[0], {
+    op: 6, d: { token: 'test-token', session_id: 'session-1', seq: 42 },
+  });
+});
+
+test('a resumed event without an existing session cannot report ready', async () => {
+  const { client, sockets } = createHarness();
+  await client.start();
+  sockets[0].receive({ op: 0, t: 'RESUMED', s: 42, d: {} });
+  assert.equal(client.getStatus().state, 'connecting');
+  assert.equal(client.getStatus().sessionId, null);
+  sockets[0].receive({ op: 10, d: { heartbeat_interval: 45_000 } });
+  assert.equal(sockets[0].sent[0].op, 2);
+});
+
+test('resumed events from retired sockets or a stopped lifecycle cannot change state', async () => {
+  const { client, sockets, timers } = createHarness();
+  await client.start();
+  sockets[0].receive({ op: 10, d: { heartbeat_interval: 45_000 } });
+  sockets[0].receive({ op: 0, t: 'READY', s: 41, d: { session_id: 'session-1', resume_gateway_url: 'wss://resume.test' } });
+  sockets[0].receive({ op: 7, d: null });
+  await timers.advance(1_000);
+  const connecting = client.getStatus();
+  sockets[0].receive({ op: 0, t: 'RESUMED', s: 99, d: {} });
+  assert.deepEqual(client.getStatus(), connecting);
+  await client.stop();
+  const stopped = client.getStatus();
+  sockets[1].receive({ op: 0, t: 'RESUMED', s: 100, d: {} });
+  assert.deepEqual(client.getStatus(), stopped);
+});
+
 test('invalid session clears resumable state and identifies on the next connection', async () => {
   const { client, sockets, timers } = createHarness();
   await client.start();

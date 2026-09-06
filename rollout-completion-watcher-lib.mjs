@@ -803,14 +803,14 @@ export async function pollRolloutCompletions({
       continue;
     }
     try {
-      const { notification, internalOnly } = reconstructed;
+      const { notification, internalOnly, internalSuppressionReason } = reconstructed;
       const enrichedNotification = enrichDiscordOriginNotification(notification, inboxState);
       const origin = enrichedNotification ? resolveDiscordOrigin(enrichedNotification, inboxState) : null;
       if (internalOnly && !origin) {
         delete state.pending[turnId];
         const count = Number(state.suppressedInternalTurnCount);
         state.suppressedInternalTurnCount = Number.isSafeInteger(count) && count >= 0 ? Math.min(1_000_000, count + 1) : 1;
-        state.lastSuppressedReason = 'inter-agent-only-turn';
+        state.lastSuppressedReason = internalSuppressionReason;
         continue;
       }
       if (origin?.deliveryState === 'terminal-delivered') {
@@ -885,6 +885,23 @@ async function exactTerminalBoundary(item, turnId) {
   return boundary;
 }
 
+function isExactGoalContextInput(payload, turnId) {
+  const metadata = payload?.internal_chat_message_metadata_passthrough;
+  const content = payload?.content;
+  const kinds = metadata?.content_item_kinds;
+  if (payload?.type !== 'message' || payload.role !== 'user' || metadata?.turn_id !== String(turnId) ||
+      !Array.isArray(content) || content.length === 0 || !Array.isArray(kinds) || kinds.length !== content.length) return false;
+  const opening = '<codex_internal_context source="goal">';
+  const closing = '</codex_internal_context>';
+  return content.every((item, index) => {
+    if (kinds[index] !== 'goal.internal_context' || item?.type !== 'input_text' || typeof item.text !== 'string') return false;
+    const text = item.text.trim();
+    if (!text.startsWith(opening) || !text.endsWith(closing)) return false;
+    const body = text.slice(opening.length, -closing.length);
+    return body.trim().length > 0 && !body.includes('<codex_internal_context') && !body.includes(closing);
+  });
+}
+
 async function reconstructNotification(item, turnId) {
   let activeTurnId = '';
   let inputMessages = [];
@@ -892,6 +909,7 @@ async function reconstructNotification(item, turnId) {
   let rootMetadataCount = 0, targetStarts = 0;
   let currentRootEligible = false, rootEligible = false, skippedLine = false, sawCompaction = false, exactActiveCompletion = false;
   let sawUserMessage = false, sawAgentMetadata = false, sawAgentMessage = false;
+  let sawGoalContext = false, sawOtherUserInput = false;
   let model = '';
   let effort = '';
   let notification = null;
@@ -916,12 +934,21 @@ async function reconstructNotification(item, turnId) {
         currentRootEligible = rootSessionMeta(entry, item.threadId);
         if (activeTurnId === String(turnId)) rootEligible = rootEligible && currentRootEligible;
       }
+      if (activeTurnId !== String(turnId) && ['event_msg', 'response_item'].includes(entry?.type) &&
+          (entry.payload?.type === 'user_message' || entry.type === 'response_item' && String(entry.payload?.role ?? '').toLocaleLowerCase() === 'user') &&
+          [entry.payload?.internal_chat_message_metadata_passthrough?.turn_id, entry.payload?.turn_id]
+            .some((value) => value != null && String(value) === String(turnId))) sawOtherUserInput = true;
       if (activeTurnId === String(turnId)) {
         if (entry?.type === 'inter_agent_communication_metadata' && payloadBelongsToTurn(entry.payload)) sawAgentMetadata = true;
         if (entry?.type === 'compacted') sawCompaction = true;
         if (entry?.type === 'response_item' && entry.payload?.type === 'agent_message' && payloadBelongsToTurn(entry.payload)) sawAgentMessage = true;
         if (entry?.type === 'response_item' && entry.payload?.type === 'message' && String(entry.payload?.role ?? '').toLocaleLowerCase() === 'user') sawUserMessage = true;
         if (entry?.type === 'event_msg' && entry.payload?.type === 'user_message') sawUserMessage = true;
+        if (entry?.type === 'response_item' && String(entry.payload?.role ?? '').toLocaleLowerCase() === 'user') {
+          if (payloadBelongsToTurn(entry.payload) && isExactGoalContextInput(entry.payload, turnId)) sawGoalContext = true;
+          else sawOtherUserInput = true;
+        }
+        if (['event_msg', 'response_item'].includes(entry?.type) && entry.payload?.type === 'user_message') sawOtherUserInput = true;
       }
       if (entry?.type === 'response_item') {
         appendInput(entry.payload ?? {}, 'response');
@@ -965,11 +992,14 @@ async function reconstructNotification(item, turnId) {
     throw new Error('Rollout content is unavailable; fallback notification will retry');
   }
   if (notification) {
-    // No-input turns remain ambiguous unless a complete exact root span positively identifies
-    // a pure agent-result wakeup. A user message, compaction or skipped bytes defeats this proof.
-    const internalOnly = rootMetadataCount > 0 && rootEligible && targetStarts === 1 && exactActiveCompletion &&
-      sawAgentMetadata && sawAgentMessage && !sawUserMessage && !sawCompaction && !skippedLine && inputMessages.length === 0;
-    return { notification, internalOnly };
+    // Empty input alone proves nothing. Retire only a complete exact root span containing
+    // a pure agent-result wakeup or exclusively typed, wrapped goal-context user inputs.
+    const completeRootSpan = rootMetadataCount > 0 && rootEligible && targetStarts === 1 && exactActiveCompletion &&
+      !sawCompaction && !skippedLine && inputMessages.length === 0;
+    const internalSuppressionReason = !completeRootSpan ? null
+      : sawAgentMetadata && sawAgentMessage && !sawUserMessage ? 'inter-agent-only-turn'
+        : sawGoalContext && !sawOtherUserInput ? 'goal-internal-context-only-turn' : null;
+    return { notification, internalOnly: internalSuppressionReason !== null, internalSuppressionReason };
   }
   throw new Error('Rollout completion content is unavailable; fallback notification will retry');
 }

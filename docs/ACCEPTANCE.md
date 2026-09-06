@@ -12,6 +12,7 @@
 | 回复续接、继续队列、停止当前回合 | bridge/takeover/router 回归；提交前回退、提交后不确定状态、防止重复发送 |
 | 完成、待确认、额度三个通知通道 | PowerShell 路由、来源频道、额度快照、消息映射、去重与长 JSON 测试 |
 | rollout 补发、离线补收 | 新旧用户输入格式、内部续行识别、逐项失败重试、部分推进时间、归档精确定位与发送资格、去重及损坏状态处理 |
+| 自动目标续行与 Gateway 重连 | 仅有明确 goal 内部上下文的完整回合不进入通知重试；真实/未知输入及 Discord 来源保留保护；RESUMED 恢复 ready，旧连接和已停止客户端不能改变状态 |
 | 未命名任务标题 | 首条真实输入摘要；保留真实名称与旧 inbox，过滤注入上下文，不用尾部续接作为原始标题，Unicode 安全截断 |
 | 系统状态和系统测试 | health、dispatcher synthetic tests；快速/完整检查边界 |
 | Windows 加密 | 原有 DPAPI 测试，在 Windows 原生 CI 执行 |
@@ -23,6 +24,7 @@
 | 桌面控制台 | 原生编译、应用签名验证、实际进程身份读取、已签名 Codex 桌面状态读取；Mac 原生交互验收保证刷新时按钮可用、旧查询不覆盖新状态、每两秒只更新变化文本 |
 | 退出 Codex 的边界 | 原有 Windows 测试；macOS 受控子进程验证、PID 重用拒绝、孤儿子进程保留与退出等待 |
 | 部署和恢复 | 固定白名单、哈希暂存、私有/未知文件保持、失败回滚、符号链接拒绝、服务选择恢复 |
+| Windows ZIP 更新入口 | 缺少配套脚本先提示完整解压；Windows 原生隔离测试覆盖带空格/括号路径、缺 PowerShell 及退出码传递 |
 | 原生通知修复 | portable-notify 测试；保留已有通知 wrapper；独立 guard 不控制桥接服务 |
 | 仓库交付 | 语法检查、Git diff 检查、配置/Token/运行状态/本机路径扫描 |
 
@@ -44,7 +46,11 @@ macOS 本机验证使用 Apple Silicon、Node.js 24 和 PowerShell 7.6。基线 
 
 这次实测暴露并修复了完成补发故障：新格式的用户输入未被识别、单项错误阻塞整批、归档后定位丢失及 PowerShell 归档资格检查遗漏。新版在真实状态副本上完整解释了 15 条积压，其中 13 条是用户通知、2 条有完整内部续行证据；部署后实际待处理数归零，推进时间继续更新，重启后观察窗口内未新增同类失败。已完成的验收任务也已显示首条输入摘要，不再停留在“生成中”。
 
-本次本机完整验收通过：497 项 Node 测试，26 套适用于 macOS 的 PowerShell 测试，Node/PowerShell 语法检查和仓库隐私检查。四套 Windows API 专用测试由 Windows CI 运行。[代码提交 `b4b9ec6` 的双平台 CI](https://github.com/mxymalay/codex-discord/actions/runs/33988942897)为 macOS 497 项 Node / 26 套 PowerShell、Windows 489 项 Node / 30 套 PowerShell，均为 0 失败；Windows 另跳过 8 项 Mac/Unix 专属测试。后续提交的状态见 [PR 检查结果](https://github.com/mxymalay/codex-discord/pull/1/checks)。运行方法：
+持续运行后的复查发现两条自动目标续行被当作空输入通知反复重试。修复要求完整、精确的根任务回合、匹配回合 ID 的 `goal.internal_context` 类型和完整包装，真实或未知用户输入、损坏记录、Discord 来源都不能被抑制。真实两条积压的只读副本由待处理 2 条变为 0 条，内部计数增加 2，序列化后再次轮询不重复处理，未调用发送器。同时补上 Gateway 成功 `RESUMED` 后恢复 ready 的状态更新；该协议场景通过受控帧测试验证，不把重启后的 READY 当作实际 RESUMED 证据。
+
+旧 Windows 用户于 2026-09-06 确认更新后已修复、不再发送任何消息，因此旧机更新与通知停用验收已取得用户报告。安装时还发现直接在 ZIP 中双击 CMD 会丢失兄弟脚本，现已补上明确的完整解压提示和指南。该用户报告针对当时交付的通知停用修复，不代表此后新增补丁已在旧机重新运行。
+
+最新本机完整验收通过：536 项 Node 测试，4 项 Windows 原生启动器测试跳过；26 套适用于 macOS 的 PowerShell 测试、Node/PowerShell 语法检查和仓库隐私检查通过。四套 Windows API 专用 PowerShell 测试及 Windows 原生启动器用例由 Windows CI 运行。[此前提交 `08a45b8` 的双平台 CI](https://github.com/mxymalay/codex-discord/actions/runs/33990116433)为 macOS 497 项 Node / 26 套 PowerShell、Windows 489 项 Node / 30 套 PowerShell，均为 0 失败；当前提交的结果见 [PR 检查结果](https://github.com/mxymalay/codex-discord/pull/1/checks)。运行方法：
 
 ```sh
 pwsh -NoProfile -File ./tests/run-tests.ps1
@@ -53,7 +59,6 @@ pwsh -NoProfile -File ./tests/run-tests.ps1
 ## 未完成的真实环境验收
 
 - 当前 Mac 版 Codex 的内部桌面工具接口拒绝外部 Node 进程。Unix socket 实现与失败/排队路径已覆盖，直接接管现有桌面任务尚不具备该版本的真实通过证据；详情见 [macOS 指南](MACOS.md)。
-- 旧 Windows 机器仍需安装交付包中的更新并确认停用效果；Windows CI 的隔离验证不代表旧机器已经更新。
 - 主动退出用户 Codex、关机/休眠/重新登录及网络中断后的真实恢复，需要在目标机器上安排测试。
 
 这些项目没有被标成已通过。自动测试用于降低回归风险，不构成“零 bug”保证。
