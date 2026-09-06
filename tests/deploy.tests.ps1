@@ -290,10 +290,20 @@ function Invoke-CodexNotificationGuardAction {
 '@
     $fakeInstaller = @'
 [CmdletBinding()]
-param([string]$SourceRoot,[string]$ToolDir,[string]$DesktopPath,[switch]$ShortcutOnly)
+param([string]$SourceRoot,[string]$ToolDir,[string]$DesktopPath,[switch]$ShortcutOnly,[Collections.Generic.List[object]]$ShortcutTransactionLog)
 if (-not $ShortcutOnly) { throw 'isolated installer requires ShortcutOnly' }
 Add-Content -LiteralPath $env:CODEX_DEPLOY_TEST_ACTION_PATH -Value 'install:shortcut' -Encoding UTF8
-[System.IO.File]::WriteAllText((Join-Path $DesktopPath 'Codex Discord 控制台.lnk'), 'isolated-new-shortcut', [System.Text.UTF8Encoding]::new($false))
+$newPath=Join-Path $DesktopPath '码驿 · CodexRelay 控制台.lnk'
+$hadOriginal=Test-Path -LiteralPath $newPath -PathType Leaf
+$originalHash=if($hadOriginal){(Get-FileHash -LiteralPath $newPath -Algorithm SHA256).Hash}else{$null}
+[System.IO.File]::WriteAllText($newPath, 'isolated-new-shortcut', [System.Text.UTF8Encoding]::new($false))
+$ShortcutTransactionLog.Add([pscustomobject]@{DestinationPath=$newPath;HadOriginal=$hadOriginal;OriginalHash=$originalHash;ExpectedHash=(Get-FileHash -LiteralPath $newPath -Algorithm SHA256).Hash;Removed=$false})
+if ($env:CODEX_DEPLOY_TEST_MIGRATE_LEGACY_SHORTCUT -eq '1') {
+    $legacyPath=Join-Path $DesktopPath 'Codex Discord 控制台.lnk'
+    $legacyHash=(Get-FileHash -LiteralPath $legacyPath -Algorithm SHA256).Hash
+    Remove-Item -LiteralPath $legacyPath -Force
+    $ShortcutTransactionLog.Add([pscustomobject]@{DestinationPath=$legacyPath;HadOriginal=$true;OriginalHash=$legacyHash;ExpectedHash=$null;Removed=$true})
+}
 if ($env:CODEX_DEPLOY_TEST_FAIL_SHORTCUT_AFTER_WRITE -eq '1') { throw 'synthetic-shortcut-failure' }
 '@
     $fakeBuilder = @'
@@ -1023,7 +1033,7 @@ try {
             $caseFinal.autoStartEnabled -eq $case.AutoStart -and
             $caseFinal.mode -eq $case.Mode
         ) "non-Skip $($case.Name) changed the exact installed/enabled/running/owner state"
-        Assert-True (Test-Path -LiteralPath (Join-Path $caseDesktop 'Codex Discord 控制台.lnk') -PathType Leaf) "non-Skip $($case.Name) did not install the isolated shortcut"
+        Assert-True (Test-Path -LiteralPath (Join-Path $caseDesktop '码驿 · CodexRelay 控制台.lnk') -PathType Leaf) "non-Skip $($case.Name) did not install the isolated shortcut"
     }
 
     # Shortcut creation is an external live mutation too. If the trusted installer writes the
@@ -1034,8 +1044,8 @@ try {
     $shortcutFailureActions = Join-Path $testRoot 'shortcut partial failure actions.txt'
     New-Item -ItemType Directory -Path $shortcutFailureLive,$shortcutFailureDesktop -Force | Out-Null
     [System.IO.File]::WriteAllText($shortcutFailureState, '{"taskInstalled":true,"taskRunning":false,"running":false,"autoStartEnabled":false,"mode":"unknown"}', [System.Text.UTF8Encoding]::new($false))
-    Write-TestBytes -Path (Join-Path $shortcutFailureDesktop 'Codex Discord 控制台.lnk') -Bytes ([byte[]](41,0,42,255))
-    $shortcutFailureBefore = Get-BytesHex -Path (Join-Path $shortcutFailureDesktop 'Codex Discord 控制台.lnk')
+    Write-TestBytes -Path (Join-Path $shortcutFailureDesktop '码驿 · CodexRelay 控制台.lnk') -Bytes ([byte[]](41,0,42,255))
+    $shortcutFailureBefore = Get-BytesHex -Path (Join-Path $shortcutFailureDesktop '码驿 · CodexRelay 控制台.lnk')
     $env:CODEX_DEPLOY_TEST_STATE_PATH = $shortcutFailureState
     $env:CODEX_DEPLOY_TEST_ACTION_PATH = $shortcutFailureActions
     $env:CODEX_DEPLOY_TEST_FAIL_SHORTCUT_AFTER_WRITE = '1'
@@ -1047,8 +1057,8 @@ try {
         Remove-Item Env:CODEX_DEPLOY_TEST_ACTION_PATH -ErrorAction SilentlyContinue
         Remove-Item Env:CODEX_DEPLOY_TEST_FAIL_SHORTCUT_AFTER_WRITE -ErrorAction SilentlyContinue
     }
-    Assert-True ($shortcutFailureError -match 'synthetic-shortcut-failure') 'deployment hid the trusted shortcut partial-write failure'
-    Assert-True ((Get-BytesHex -Path (Join-Path $shortcutFailureDesktop 'Codex Discord 控制台.lnk')) -ceq $shortcutFailureBefore) 'shortcut partial-write failure did not restore the exact previous bytes'
+    Assert-True ($shortcutFailureError -match 'synthetic-shortcut-failure') "deployment hid the trusted shortcut partial-write failure: $shortcutFailureError"
+    Assert-True ((Get-BytesHex -Path (Join-Path $shortcutFailureDesktop '码驿 · CodexRelay 控制台.lnk')) -ceq $shortcutFailureBefore) 'shortcut partial-write failure did not restore the exact previous bytes'
 
     # Discord bulk registration can reach the Guild before the local process reports failure.
     # Any attempted update must therefore compensate with the restored bridge definitions.
@@ -1083,7 +1093,7 @@ try {
     New-Item -ItemType Directory -Path $shortcutCasLive,$shortcutCasDesktop -Force | Out-Null
     [System.IO.File]::WriteAllText((Join-Path $shortcutCasLive 'codex-control.ps1'), (Get-IsolatedControlScript -Role old), [System.Text.UTF8Encoding]::new($false))
     [System.IO.File]::WriteAllText((Join-Path $shortcutCasLive 'discord-bridge.mjs'), (Get-IsolatedBridgeScript -Role old), [System.Text.UTF8Encoding]::new($false))
-    Write-TestBytes -Path (Join-Path $shortcutCasDesktop 'Codex Discord 控制台.lnk') -Bytes ([byte[]](71,72,73,74))
+    Write-TestBytes -Path (Join-Path $shortcutCasDesktop '码驿 · CodexRelay 控制台.lnk') -Bytes ([byte[]](71,72,73,74))
     [System.IO.File]::WriteAllText($shortcutCasState, '{"taskInstalled":true,"taskRunning":false,"running":false,"autoStartEnabled":false,"mode":"unknown"}', [System.Text.UTF8Encoding]::new($false))
     $shortcutCasThirdParty = [byte[]](240,13,202,254)
     $shortcutCasChanged = $false
@@ -1106,7 +1116,7 @@ try {
         Remove-Item Env:CODEX_DEPLOY_TEST_FAIL_REGISTRATION -ErrorAction SilentlyContinue
     }
     Assert-True ($shortcutCasError -match 'rollback is incomplete') 'shortcut rollback CAS race did not report incomplete rollback'
-    Assert-True ((Get-BytesHex -Path (Join-Path $shortcutCasDesktop 'Codex Discord 控制台.lnk')) -ceq [Convert]::ToHexString($shortcutCasThirdParty)) 'shortcut rollback CAS race overwrote concurrent bytes'
+    Assert-True ((Get-BytesHex -Path (Join-Path $shortcutCasDesktop '码驿 · CodexRelay 控制台.lnk')) -ceq [Convert]::ToHexString($shortcutCasThirdParty)) 'shortcut rollback CAS race overwrote concurrent bytes'
 
     # A service action can start the new bridge and then report failure. The new runtime must be
     # stopped while the new files still exist, before local files and the old service are restored.
@@ -1170,17 +1180,20 @@ try {
     [System.IO.File]::WriteAllText((Join-Path $externalRollbackLive 'codex-control.ps1'), (Get-IsolatedControlScript -Role old), [System.Text.UTF8Encoding]::new($false))
     [System.IO.File]::WriteAllText((Join-Path $externalRollbackLive 'discord-bridge.mjs'), (Get-IsolatedBridgeScript -Role old), [System.Text.UTF8Encoding]::new($false))
     Write-TestBytes -Path (Join-Path $externalRollbackLive 'CodexDiscordControl.exe') -Bytes ([byte[]](1,2,3,4))
-    Write-TestBytes -Path (Join-Path $externalRollbackDesktop 'Codex Discord 控制台.lnk') -Bytes ([byte[]](5,6,7,8))
+    Write-TestBytes -Path (Join-Path $externalRollbackDesktop '码驿 · CodexRelay 控制台.lnk') -Bytes ([byte[]](5,6,7,8))
     $oldRollbackControlHash = Get-BytesHex -Path (Join-Path $externalRollbackLive 'codex-control.ps1')
     $oldRollbackBridgeHash = Get-BytesHex -Path (Join-Path $externalRollbackLive 'discord-bridge.mjs')
     $oldRollbackExeHash = Get-BytesHex -Path (Join-Path $externalRollbackLive 'CodexDiscordControl.exe')
-    $oldRollbackShortcutHash = Get-BytesHex -Path (Join-Path $externalRollbackDesktop 'Codex Discord 控制台.lnk')
+    $oldRollbackShortcutHash = Get-BytesHex -Path (Join-Path $externalRollbackDesktop '码驿 · CodexRelay 控制台.lnk')
+    Write-TestBytes -Path (Join-Path $externalRollbackDesktop 'Codex Discord 控制台.lnk') -Bytes ([byte[]](9,10,11,12))
+    $oldRollbackLegacyHash = Get-BytesHex -Path (Join-Path $externalRollbackDesktop 'Codex Discord 控制台.lnk')
     $externalRollbackState = Join-Path $testRoot 'external rollback state.json'
     $externalRollbackActions = Join-Path $testRoot 'external rollback actions.txt'
     [System.IO.File]::WriteAllText($externalRollbackState, '{"taskInstalled":true,"taskRunning":true,"running":true,"autoStartEnabled":true,"mode":"scheduled"}', [System.Text.UTF8Encoding]::new($false))
     $env:CODEX_DEPLOY_TEST_STATE_PATH = $externalRollbackState
     $env:CODEX_DEPLOY_TEST_ACTION_PATH = $externalRollbackActions
     $env:CODEX_DEPLOY_TEST_FAIL_ACTION = 'enable-long-term'
+    $env:CODEX_DEPLOY_TEST_MIGRATE_LEGACY_SHORTCUT = '1'
     $externalRollbackError = $null
     try { & $deployScript -SourceRoot $externalRollbackSource -LiveRoot $externalRollbackLive -DesktopPath $externalRollbackDesktop | Out-Null }
     catch { $externalRollbackError = $_.Exception.Message }
@@ -1188,12 +1201,14 @@ try {
         Remove-Item Env:CODEX_DEPLOY_TEST_STATE_PATH -ErrorAction SilentlyContinue
         Remove-Item Env:CODEX_DEPLOY_TEST_ACTION_PATH -ErrorAction SilentlyContinue
         Remove-Item Env:CODEX_DEPLOY_TEST_FAIL_ACTION -ErrorAction SilentlyContinue
+        Remove-Item Env:CODEX_DEPLOY_TEST_MIGRATE_LEGACY_SHORTCUT -ErrorAction SilentlyContinue
     }
     Assert-True ($externalRollbackError -eq 'control action failed: enable-long-term') 'external rollback replaced the primary service-restore failure'
     Assert-True ((Get-BytesHex -Path (Join-Path $externalRollbackLive 'codex-control.ps1')) -ceq $oldRollbackControlHash) 'external rollback did not restore the old control entrypoint'
     Assert-True ((Get-BytesHex -Path (Join-Path $externalRollbackLive 'discord-bridge.mjs')) -ceq $oldRollbackBridgeHash) 'external rollback did not restore the old bridge command definitions'
     Assert-True ((Get-BytesHex -Path (Join-Path $externalRollbackLive 'CodexDiscordControl.exe')) -ceq $oldRollbackExeHash) 'external rollback did not restore the old executable'
-    Assert-True ((Get-BytesHex -Path (Join-Path $externalRollbackDesktop 'Codex Discord 控制台.lnk')) -ceq $oldRollbackShortcutHash) 'external rollback did not restore the old shortcut'
+    Assert-True ((Get-BytesHex -Path (Join-Path $externalRollbackDesktop '码驿 · CodexRelay 控制台.lnk')) -ceq $oldRollbackShortcutHash) 'external rollback did not restore the old shortcut'
+    Assert-True ((Get-BytesHex -Path (Join-Path $externalRollbackDesktop 'Codex Discord 控制台.lnk')) -ceq $oldRollbackLegacyHash) 'external rollback did not restore the migrated legacy shortcut'
     $externalRollbackFinal = Get-Content -Raw -LiteralPath $externalRollbackState | ConvertFrom-Json
     Assert-True ($externalRollbackFinal.running -eq $true -and $externalRollbackFinal.autoStartEnabled -eq $true) 'external rollback did not restore the prior bridge service state'
     $externalActions = @(Get-Content -LiteralPath $externalRollbackActions)
@@ -1209,11 +1224,11 @@ try {
         [System.IO.File]::WriteAllText((Join-Path $boundedLive 'codex-control.ps1'), (Get-IsolatedControlScript -Role old), [System.Text.UTF8Encoding]::new($false))
         [System.IO.File]::WriteAllText((Join-Path $boundedLive 'discord-bridge.mjs'), (Get-IsolatedBridgeScript -Role old), [System.Text.UTF8Encoding]::new($false))
         Write-TestBytes -Path (Join-Path $boundedLive 'CodexDiscordControl.exe') -Bytes ([byte[]](31,41,59,26))
-        Write-TestBytes -Path (Join-Path $boundedDesktop 'Codex Discord 控制台.lnk') -Bytes ([byte[]](53,58,97,93))
+        Write-TestBytes -Path (Join-Path $boundedDesktop '码驿 · CodexRelay 控制台.lnk') -Bytes ([byte[]](53,58,97,93))
         $boundedOldControl = Get-BytesHex -Path (Join-Path $boundedLive 'codex-control.ps1')
         $boundedOldBridge = Get-BytesHex -Path (Join-Path $boundedLive 'discord-bridge.mjs')
         $boundedOldExe = Get-BytesHex -Path (Join-Path $boundedLive 'CodexDiscordControl.exe')
-        $boundedOldShortcut = Get-BytesHex -Path (Join-Path $boundedDesktop 'Codex Discord 控制台.lnk')
+        $boundedOldShortcut = Get-BytesHex -Path (Join-Path $boundedDesktop '码驿 · CodexRelay 控制台.lnk')
         $boundedState = Join-Path $testRoot ("bounded $registrationMode state.json")
         $boundedActions = Join-Path $testRoot ("bounded $registrationMode actions.txt")
         $boundedRemote = Join-Path $testRoot ("bounded $registrationMode remote.txt")
@@ -1262,7 +1277,7 @@ try {
         Assert-True ((Get-BytesHex -Path (Join-Path $boundedLive 'codex-control.ps1')) -ceq $boundedOldControl) "bounded $registrationMode rollback changed the old control"
         Assert-True ((Get-BytesHex -Path (Join-Path $boundedLive 'discord-bridge.mjs')) -ceq $boundedOldBridge) "bounded $registrationMode rollback changed the old bridge"
         Assert-True ((Get-BytesHex -Path (Join-Path $boundedLive 'CodexDiscordControl.exe')) -ceq $boundedOldExe) "bounded $registrationMode rollback changed the old executable"
-        Assert-True ((Get-BytesHex -Path (Join-Path $boundedDesktop 'Codex Discord 控制台.lnk')) -ceq $boundedOldShortcut) "bounded $registrationMode rollback changed the old shortcut"
+        Assert-True ((Get-BytesHex -Path (Join-Path $boundedDesktop '码驿 · CodexRelay 控制台.lnk')) -ceq $boundedOldShortcut) "bounded $registrationMode rollback changed the old shortcut"
         $boundedFinalState = Get-Content -Raw -LiteralPath $boundedState | ConvertFrom-Json
         Assert-True ($boundedFinalState.running -eq $true -and $boundedFinalState.autoStartEnabled -eq $true -and $boundedFinalState.mode -eq 'scheduled') "bounded $registrationMode rollback changed bridge ownership"
         Assert-True (@(Get-ChildItem -LiteralPath $boundedLive -Directory -Force | Where-Object { $_.Name -like '.codex-discord-deploy.*.stage' }).Count -eq 0) "bounded $registrationMode rollback left a deployment stage"
@@ -1304,7 +1319,8 @@ try {
     Assert-True ($readme -match '临时开启[\s\S]{0,1000}临时停止[\s\S]{0,1000}长期开启[\s\S]{0,1000}长期停用') 'README does not explain the four control modes'
     Assert-True ($readme -match '原频道[\s\S]{0,500}(?:待确认|最终结果)[\s\S]{0,500}不(?:会|再)转发[\s\S]{0,100}(?:commentary|工具调用|过程)') 'README does not document final-only Discord-origin routing'
     Assert-True ($readme -match '登录[\s\S]{0,300}(?:唤醒|休眠)[\s\S]{0,300}(?:联网|网络)') 'README does not document the logged-in, awake, networked PC boundary'
-    Assert-True ($readme -match 'deploy\.ps1[\s\S]{0,500}(?:恢复|重建|重新部署)') 'README does not provide one-command repository recovery'
+    Assert-True ($readme -match 'git clone --branch main https://github\.com/mxymalay/CodexRelay\.git') 'README does not obtain the current main repository'
+    Assert-True ($readme -match '安全部署、更新与恢复[\s\S]{0,1000}update-windows\.cmd' -and $readme -match 'deploy-macos\.mjs') 'README does not provide current Windows and macOS recovery entrypoints'
     Assert-True ($readme -match 'Token|secret|私密[\s\S]{0,300}(?:不进入 Git|不提交)') 'README does not state the source/runtime secret boundary'
 
     Write-Output 'PASS: safe allowlisted deployment, rollback, and recovery documentation'

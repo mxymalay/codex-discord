@@ -1,8 +1,10 @@
-# 从零安装：Windows 与 macOS
+# 码驿 · CodexRelay 从零安装：Windows 与 macOS
 
-两套系统都有桌面的 **Codex Discord 控制台**：Windows 是原生 EXE 和快捷方式，macOS 是原生 `.app` 和桌面入口。安装完成后可以直接点按钮管理服务，不必一直开着终端。本指南适合收到代码后首次安装的人；已有旧电脑配置的人先看末尾的迁移说明。
+两套系统都有桌面的 **码驿 · CodexRelay 控制台**：Windows 是原生 EXE 和快捷方式，macOS 是原生 `.app` 和桌面入口。安装完成后可以直接点按钮管理服务，不必一直开着终端。本指南适合收到代码后首次安装的人；已有旧电脑配置的人先看末尾的迁移说明。
 
 每位使用者准备自己的 Codex 账户、Discord Bot、服务器和 Token。分享源码或仓库链接即可；不要打包正在运行的 `mobile-notify` 目录，其中包含私有配置、密文 Token 和任务状态。
+
+更名只更新产品和桌面显示名称；已有运行目录、程序和服务标识继续兼容，详见 [README 的兼容说明](../README.md#兼容标识)。
 
 ## 1. 准备环境和源码
 
@@ -17,11 +19,11 @@
 Windows/macOS 支持已合入 `main`，新安装和更新都使用主分支。把源码放在普通工作目录，例如“文稿/项目”，不要放在桌面或下面的运行目录内：
 
 ```sh
-git clone --branch main https://github.com/mxymalay/codex-discord.git
-cd codex-discord
+git clone --branch main https://github.com/mxymalay/CodexRelay.git
+cd CodexRelay
 ```
 
-也可在[主分支页面](https://github.com/mxymalay/codex-discord/tree/main)选择 **Code → Download ZIP** 并完整解压，然后在解压后的仓库根目录打开终端。GitHub ZIP 解压后的源码文件夹通常叫 `codex-discord-main`；分享的源码包可能叫 `codex-discord`，以包含 `README.md` 和安装脚本的文件夹为准。私有仓库需要仓库所有者授予访问权限，或由所有者提供仅含源码的压缩包。仓库不需要额外执行 `npm install`。
+也可在[主分支页面](https://github.com/mxymalay/CodexRelay/tree/main)选择 **Code → Download ZIP** 并完整解压，然后在解压后的仓库根目录打开终端。GitHub ZIP 解压后的源码文件夹通常叫 `CodexRelay-main`；分享的源码包可能叫 `CodexRelay`，以包含 `README.md` 和安装脚本的文件夹为准。仓库已公开，可直接分享链接或仅含源码的压缩包；每位使用者仍需配置自己的 Bot 和凭据。仓库不需要额外执行 `npm install`。
 
 默认 Codex 数据目录为 Windows 的 `%USERPROFILE%\.codex`、Mac 的 `~/.codex`；运行目录是其中的 `mobile-notify`。已有自定义 `CODEX_HOME` 的人沿用它，且必须是绝对路径；不要为安装本工具另建一个与 Codex 实际使用位置不同的数据目录。
 
@@ -90,7 +92,7 @@ node .\discord-bridge.mjs --register-commands --once
 Start-Process .\CodexDiscordControl.exe
 ```
 
-每一步成功后再继续。Token 保存时会联网核对 Bot 身份，随后用当前 Windows 用户的 DPAPI 加密。命令注册应报告并核验 **11 个 Guild Commands**；计划任务安装会立即启动服务并启用当前用户登录自启。桌面会出现 **Codex Discord 控制台** 快捷方式。
+每一步成功后再继续。Token 保存时会联网核对 Bot 身份，随后用当前 Windows 用户的 DPAPI 加密。命令注册应报告并核验 **11 个 Guild Commands**；计划任务安装会立即启动服务并启用当前用户登录自启。桌面会出现 **码驿 · CodexRelay 控制台** 快捷方式。
 
 `repair-notify.ps1` 安装 Codex 原生通知 hook；若以后其他工具覆盖了 notify 设置，再运行它。新装流程不假定旧版通知修复 guard 已存在。已有自定义通知处理器的人应先备份 Codex 的 `config.toml`，再核对自己的通知设置。
 
@@ -104,7 +106,9 @@ cd "${CODEX_HOME:-$HOME/.codex}/mobile-notify"
 open -t ./config.json
 ```
 
-第一次安装会生成本机配置、编译原生 App，并建立桌面的 **Codex Discord 控制台.app** 入口。输出 `configurationRequired: true` 表示接下来需要配置，不是安装失败；此时不会注册命令或启动桥接。按第 3 步填满六个 ID，使用纯文本保存。安装器已设置 Mac 的 Token 路径、工作树和无项目目录。
+第一次安装会生成本机配置、编译原生 App，并建立桌面的 **码驿 · CodexRelay 控制台.app** 入口。输出 `configurationRequired: true` 表示接下来需要配置，不是安装失败；此时不会注册命令或启动桥接。按第 3 步填满六个 ID，使用纯文本保存。安装器已设置 Mac 的 Token 路径、工作树和无项目目录。
+
+桌面入口指向运行目录内保留原名的 `Codex Discord 控制台.app`。下面的 `open` 命令打开默认桌面入口；安装到自定义桌面目录时，使用该目录中的同名入口。
 
 **重新复制 Bot Token**，替换下面命令中的 `<你的Discord用户ID>`，逐条执行：
 
@@ -116,7 +120,7 @@ pwsh -NoProfile -File ./repair-notify.ps1
 node ./discord-macos-notify-guard.mjs --action enable
 node ./discord-macos-control.mjs --action enable-long-term
 node ./discord-macos-control.mjs --action status
-open './Codex Discord 控制台.app'
+open "$HOME/Desktop/码驿 · CodexRelay 控制台.app"
 ```
 
 每一步成功后再继续。Token 文件是 `discord-token.keychain`，加密密钥存在当前用户的 Keychain；保持 Keychain 可访问，按系统提示允许访问。独立 notify guard 只修复通知 hook，不会重新开启被你长期停用的桥接服务。已有自定义通知处理器时，先备份 Codex 的 `config.toml` 再运行 repair。
@@ -125,7 +129,7 @@ Mac 使用这些 `.mjs` 安装与控制入口，不运行 Windows 的 `deploy.ps
 
 ## 5. 桌面怎么用，怎样确认装好了
 
-双击桌面的 **Codex Discord 控制台**。两平台均显示服务、自启、Discord、Codex 桌面端、继续队列和最后活动状态，每两秒刷新。Mac 右上角的小圈表示自动刷新，后台轮询只更新变化的状态文字；按钮只在执行操作时禁用。关闭控制台窗口后，桥接仍在后台运行。
+双击桌面的 **码驿 · CodexRelay 控制台**。两平台均显示服务、自启、Discord、Codex 桌面端、继续队列和最后活动状态，每两秒刷新。Mac 右上角的小圈表示自动刷新，后台轮询只更新变化的状态文字；按钮只在执行操作时禁用。关闭控制台窗口后，桥接仍在后台运行。
 
 | 按钮 | 现在的服务与本机通知 | 下次用户登录 |
 | --- | --- | --- |
@@ -157,7 +161,27 @@ pwsh -NoProfile -File ./tests/run-tests.ps1
 
 ## 6. 更新与常见恢复
 
-更新前回到**源码根目录**。Git 用户先运行 `git status`，确认本地修改已经妥善保存，再依次执行以下命令。即使以前安装的是 `codex/windows-macos-support`，以后也切换到 `main` 获取更新：
+更新前回到**源码根目录**。Git 用户先运行 `git status`，确认本地修改已经妥善保存。旧仓库克隆先检查 remote 地址：
+
+```sh
+git remote get-url origin
+```
+
+若仍指向旧仓库名，按现有协议选择一条命令更新地址；HTTPS 用户保留 HTTPS，SSH 用户保留 SSH，不需要更换登录方式或密钥：
+
+原地址使用 HTTPS 时：
+
+```sh
+git remote set-url origin https://github.com/mxymalay/CodexRelay.git
+```
+
+原地址使用 SSH 时，改用这一条：
+
+```sh
+git remote set-url origin git@github.com:mxymalay/CodexRelay.git
+```
+
+现有本地源码文件夹可以保留原名，不影响更新。随后依次执行以下命令；即使以前安装的是 `codex/windows-macos-support`，以后也切换到 `main` 获取更新：
 
 ```sh
 git fetch origin
@@ -165,11 +189,11 @@ git switch main
 git pull --ff-only
 ```
 
-如果切换或快进更新失败，先保留本地修改并处理提示，不要强制覆盖。ZIP 用户从[主分支页面](https://github.com/mxymalay/codex-discord/tree/main)下载最新源码并解压到独立目录。获取源码后，继续运行下面对应平台的部署命令；仅执行 Git 更新或解压 ZIP 不会更新后台运行的文件。部署会保留原自启选择和私有状态。
+如果切换或快进更新失败，先保留本地修改并处理提示，不要强制覆盖。ZIP 用户从[主分支页面](https://github.com/mxymalay/CodexRelay/tree/main)下载最新源码并解压到独立目录。获取源码后，继续运行下面对应平台的部署命令；仅执行 Git 更新或解压 ZIP 不会更新后台运行的文件。部署会保留原自启选择和私有状态。
 
 Windows 可在解压后的源码根目录双击 `update-windows.cmd`，它会更新默认运行目录并保留原服务选择。旧服务如果已经停止，更新时会同步关闭本工具的通知开关。源码目录仍须独立于桌面和运行目录；请先阅读窗口中的错误或成功信息。
 
-ZIP 用户先在资源管理器中右键压缩包，选择 **全部解压缩 / Extract All → 提取**，再进入解压后的源码文件夹（通常为 `codex-discord-main` 或 `codex-discord`）。确认 `update-windows.cmd` 和 `update-windows.ps1` 位于同一文件夹，再双击 CMD。直接在压缩包中运行会只临时提取 CMD，导致找不到配套脚本；新版启动器会对此提示完整解压。
+ZIP 用户先在资源管理器中右键压缩包，选择 **全部解压缩 / Extract All → 提取**，再进入解压后的源码文件夹（通常为 `CodexRelay-main` 或 `CodexRelay`）。确认 `update-windows.cmd` 和 `update-windows.ps1` 位于同一文件夹，再双击 CMD。直接在压缩包中运行会只临时提取 CMD，导致找不到配套脚本；新版启动器会对此提示完整解压。
 
 也可以在 PowerShell 7 手动执行：
 
@@ -188,7 +212,7 @@ node ./deploy-macos.mjs --source-root "$PWD" \
 | 现象 | 先检查什么 |
 | --- | --- |
 | 桌面入口或控制台被误删 | 用上面的部署命令重新生成；不要用示例覆盖私有配置 |
-| Token 保存说“不属于本次创建的应用” | Application ID 与刚复制的 Bot Token 是否属于同一个应用 |
+| Token 保存提示“剪贴板中的令牌不属于当前配置的 Discord 应用” | Application ID 与刚复制的 Bot Token 是否属于同一个应用 |
 | 提示“旧 Discord 三路配置不完整” | 六个 ID 是否都已填写，三个频道 ID 是否有效且不同；新装无需补 Webhook |
 | 命令不显示 | Bot 是否已邀请到正确服务器；重新执行 `node ./discord-bridge.mjs --register-commands --once`，确认 11 个命令核验成功 |
 | Bot 离线或无响应 | 控制台服务状态、网络、电脑是否唤醒；运行目录的 `discord-bridge.log`；Mac 的 PowerShell 路径及 Keychain 是否可访问 |

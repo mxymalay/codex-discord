@@ -94,7 +94,7 @@ $botIdentity = Invoke-DiscordRead -Uri 'https://discord.com/api/v10/users/@me' -
 $applicationId = [string]$botIdentity.id
 if (-not [bool]$botIdentity.bot -or [string]::IsNullOrWhiteSpace($applicationId) -or
     (-not [string]::IsNullOrWhiteSpace($expectedApplicationId) -and $applicationId -ne $expectedApplicationId)) {
-    throw '剪贴板中的令牌不属于本次创建的 Codex Bridge 应用'
+    throw '剪贴板中的令牌不属于当前配置的 Discord 应用'
 }
 
 $existingIds = @(

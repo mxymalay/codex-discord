@@ -714,7 +714,7 @@ export function renderHelp() {
     帮助: '显示本帮助。',
   };
   return [
-    '# Codex Discord 命令帮助',
+    '# 码驿 · CodexRelay 命令帮助',
     ...COMMAND_NAMES.map((name) => `- **/${name}** — ${descriptions[name]}`),
     '',
     '### 远程接管',
@@ -726,7 +726,7 @@ export function renderHelp() {
     '',
     '### 本机服务',
     '- Codex 桌面端可以关闭，但电脑必须保持当前系统用户已登录、处于唤醒状态并已联网；关机、休眠或 Bot 离线时命令不可执行。',
-    '- `Codex Discord 控制台` 提供临时开启、临时停止、长期开启、长期停用。临时开启或停止不改变长期自启设置。',
+    '- `码驿 · CodexRelay 控制台` 提供临时开启、临时停止、长期开启、长期停用。临时开启或停止不改变长期自启设置。',
     '',
     '所有消息结果仅调用者可见，并且不会触发 Discord mentions。',
     '已有本地队列会在电脑恢复、登录并联网后继续处理。Markdown 结构由 Bot 生成，任务值会转义、截断且禁用 mentions。',

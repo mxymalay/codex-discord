@@ -1,10 +1,12 @@
-# Codex Discord 私有命令控制台
+# 码驿 · CodexRelay
 
-这个工具把 Codex 的任务完成、待确认和周额度通知发送到三个独立的 Discord 频道，并在同一个私有 Bot 中提供 11 个中文 Slash Commands。桥接器只服务配置中的一个 Discord 服务器和一个授权用户；查询结果、按钮回执、Modal 回执和错误信息均为 Ephemeral，且禁用 mentions。
+码驿 · CodexRelay 把 Codex 的任务完成、待确认和周额度通知发送到三个独立的 Discord 频道，并在同一个私有 Bot 中提供 11 个中文 Slash Commands。桥接器只服务配置中的一个 Discord 服务器和一个授权用户；查询结果、按钮回执、Modal 回执和错误信息均为 Ephemeral，且禁用 mentions。
 
-Discord Gateway、Slash Commands、任务索引、新建/继续任务、通知回复补收、继续队列重试和 rollout 完成补发由同一个 `Codex Discord Bridge` 进程管理，共享桥接状态。Codex 原生通知 hook 是独立通知入口；控制台停止桥接时也会暂停本工具的通知。无需公网地址或第二个命令服务。
+Discord Gateway、Slash Commands、任务索引、新建/继续任务、通知回复补收、继续队列重试和 rollout 完成补发由同一个码驿 · CodexRelay 桥接进程管理，共享桥接状态。Codex 原生通知 hook 是独立通知入口；控制台停止桥接时也会暂停本工具的通知。无需公网地址或第二个命令服务。
 
 Windows/macOS 支持已合入 `main`，首次安装和后续更新都从主分支获取源码。当前 Mac 的活动桌面任务接管仍受接口权限限制；已通过与未完成的项目见 [验收记录](docs/ACCEPTANCE.md)。
+
+公开源码仓库为 [mxymalay/CodexRelay](https://github.com/mxymalay/CodexRelay)，可以直接分享仓库链接。每位使用者使用自己的 Codex 账户和 Discord Bot；公开源码不包含个人配置或凭据。
 
 ## 安装
 
@@ -13,8 +15,8 @@ Windows/macOS 支持已合入 `main`，首次安装和后续更新都从主分�
 两套系统都需要 PowerShell 7、Node.js 24，以及已安装、登录并启动过的 Codex。Mac 另需 Xcode Command Line Tools 来构建原生控制台。
 
 ```sh
-git clone --branch main https://github.com/mxymalay/codex-discord.git
-cd codex-discord
+git clone --branch main https://github.com/mxymalay/CodexRelay.git
+cd CodexRelay
 ```
 
 | 系统 | 首次安装 | Token 存储 | 后台服务与控制台 |
@@ -72,7 +74,7 @@ Codex 原生 `notify` 仍是快速通知通道。桥接器同时监听 rollout �
 
 ## Windows / macOS 控制台与四种运行方式
 
-两套系统的桌面入口均为 `Codex Discord 控制台`，每两秒刷新桥接服务、登录自启、Discord、Codex 桌面端、继续队列和最后活动状态。Mac 右上角小圈提示刷新，只更新变化的文字，后台轮询时按钮保持可用。桥接服务在后台运行，关闭控制台窗口后仍会运行。四个按钮的含义是：
+两套系统的桌面入口均为 `码驿 · CodexRelay 控制台`，每两秒刷新桥接服务、登录自启、Discord、Codex 桌面端、继续队列和最后活动状态。Mac 右上角小圈提示刷新，只更新变化的文字，后台轮询时按钮保持可用。桥接服务在后台运行，关闭控制台窗口后仍会运行。四个按钮的含义是：
 
 - `临时开启`：立即运行桥接，但不改变长期自启设置；若长期处于停用，下一次登录不会自动恢复。
 - `临时停止`：立即停止桥接并暂停本工具的通知，但不改变长期自启设置；若长期开启，下次登录仍会自动运行并恢复通知。
@@ -80,6 +82,19 @@ Codex 原生 `notify` 仍是快速通知通道。桥接器同时监听 rollout �
 - `长期停用`：停止桥接、暂停本工具的通知并禁用登录自启；通知 guard 不会越权重新安装或拉起它。Token、队列和历史状态均保留。
 
 临时操作保留长期自启选择。要重新运行，打开控制台选择对应的开启按钮；要长期停用，使用“长期停用”按钮并确认。日常操作见 [控制台使用说明](docs/GETTING-STARTED.md#5-桌面怎么用怎样确认装好了)，Mac 命令行入口见 [Mac 服务控制](docs/MACOS.md)。
+
+## 兼容标识
+
+产品名和桌面显示名称现为 **码驿 · CodexRelay**、**码驿 · CodexRelay 控制台**。以下内部名称保留，用于识别已有安装、恢复服务和读取原配置与密文；不要手动重命名运行文件或重建 Token。
+
+| 保留内容 | 兼容标识 |
+| --- | --- |
+| 运行目录与脚本 | `mobile-notify`、`discord-*.mjs`、`discord-*.ps1` 等现有脚本名 |
+| Windows 程序与计划任务 | `CodexDiscordControl.exe`、`Codex Discord Bridge` |
+| Mac 安装目录内的应用 bundle | `Codex Discord 控制台.app` |
+| 凭据与状态 | 现有 DPAPI/Keychain 标识、密文格式、配置键、环境变量及运行状态文件名 |
+
+Mac 桌面的新入口 `码驿 · CodexRelay 控制台.app` 指向运行目录内的 `Codex Discord 控制台.app`；两者不是两套安装。历史设计与实现记录中的旧目录、分支和服务名称保留为历史证据，GitHub 链接已更新到新仓库地址。
 
 ## 安全部署、更新与恢复
 

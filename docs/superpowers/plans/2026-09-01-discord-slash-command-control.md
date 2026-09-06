@@ -1,5 +1,7 @@
 # Discord Slash Commands 控制台 Implementation Plan
 
+历史设计与实现记录：本文属于现名“码驿 · CodexRelay”的项目，保留当时的目录、服务标识、界面名称和示例。当前安装与更新请看[入门指南](../../GETTING-STARTED.md)，更名时保留的兼容标识见 [README](../../../README.md#兼容标识)。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 在现有私有 Discord Bot 中加入 10 个中文 Slash Commands，让唯一授权用户私密查询、新建和继续 Codex 主任务，管理继续队列、查询周额度并执行系统自检，同时简化任务通知标题。
@@ -60,7 +62,7 @@
 - Preserve locally but never copy/commit: `config.json`, `discord-token.dpapi`, `*.log`, `*-state.json`, `discord-message-map.json`
 
 **Interfaces:**
-- Consumes: empty remote `https://github.com/mxymalay/codex-discord.git`.
+- Consumes: empty remote `https://github.com/mxymalay/CodexRelay.git`.
 - Produces: clean local repository on `main`, remote `origin`, sanitized source baseline, reusable `config.example.json`.
 
 - [ ] **Step 1: Clone the empty repository into an isolated workspace**
@@ -69,7 +71,7 @@ Run:
 
 ```powershell
 $repoRoot = Join-Path (Get-Location) 'codex-discord'
-git clone https://github.com/mxymalay/codex-discord.git $repoRoot
+git clone https://github.com/mxymalay/CodexRelay.git $repoRoot
 git -C $repoRoot switch -c main
 ```
 

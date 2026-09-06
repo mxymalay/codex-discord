@@ -1,5 +1,7 @@
 # Discord Slash Commands 控制台设计
 
+历史设计与实现记录：本文属于现名“码驿 · CodexRelay”的项目，保留当时的目录、服务标识、界面名称和示例。当前安装与更新请看[入门指南](../../GETTING-STARTED.md)，更名时保留的兼容标识见 [README](../../../README.md#兼容标识)。
+
 ## 背景与目标
 
 现有 `discord-bridge.mjs` 已经承担三类 Discord 通知、任务通知映射、自由回复续接、忙碌任务排队和 Codex 完成事件补发。新增能力是在同一个私有 Bot 中提供原生 Discord Slash Commands，让唯一授权用户可以从手机查询主任务、查看完整结果、搜索历史、新建或继续指定任务、管理继续队列、查询周额度并检查系统状态。

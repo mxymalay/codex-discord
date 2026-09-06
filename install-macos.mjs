@@ -2,23 +2,20 @@ import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { deployMac } from './deploy-macos.mjs';
-import { MAC_APP_NAME } from './discord-macos-control-lib.mjs';
+import { deployMac,createMacDesktopShortcut } from './deploy-macos.mjs';
 
-export async function installMac({sourceRoot=path.dirname(fileURLToPath(import.meta.url)),liveRoot=path.join(process.env.CODEX_HOME||path.join(os.homedir(),'.codex'),'mobile-notify'),desktopPath=path.join(os.homedir(),'Desktop'),skipLiveActions=false}={}) {
+export async function installMac({sourceRoot=path.dirname(fileURLToPath(import.meta.url)),liveRoot=path.join(process.env.CODEX_HOME||path.join(os.homedir(),'.codex'),'mobile-notify'),desktopPath=path.join(os.homedir(),'Desktop'),skipLiveActions=false,deploy=deployMac}={}) {
   if(process.platform!=='darwin')throw Error('macos-required');
   await fs.mkdir(liveRoot,{recursive:true,mode:0o700});await fs.mkdir(desktopPath,{recursive:true});
   let configured=true;try{await fs.access(path.join(liveRoot,'config.json'));}catch{configured=false;}
-  const result=await deployMac({sourceRoot,liveRoot,desktopPath,skipLiveActions:skipLiveActions||!configured});
+  const result=await deploy({sourceRoot,liveRoot,desktopPath,skipLiveActions:skipLiveActions||!configured});
   if(!configured){
     const config=JSON.parse(await fs.readFile(path.join(sourceRoot,'config.example.json'),'utf8'));
     config.discordTokenPath=path.join(liveRoot,'discord-token.keychain');config.discordProjectlessRoot=path.join(os.homedir(),'Documents','Codex','Discord Tasks');config.discordWorktreeRoot=path.join(process.env.CODEX_HOME||path.join(os.homedir(),'.codex'),'worktrees','discord');
     await fs.writeFile(path.join(liveRoot,'config.json'),`${JSON.stringify(config,null,2)}\n`,{flag:'wx',mode:0o600});
   }
   if(!configured && !skipLiveActions){
-    const target=path.join(desktopPath,MAC_APP_NAME),destination=path.join(await fs.realpath(liveRoot),MAC_APP_NAME);
-    try{const stat=await fs.lstat(target);if(!stat.isSymbolicLink()||await fs.readlink(target)!==destination)throw Error('desktop-shortcut-unowned');}
-    catch(error){if(error.code!=='ENOENT')throw error;await fs.symlink(destination,target);}
+    await createMacDesktopShortcut({liveRoot,desktopPath});
   }
   return {...result,configurationRequired:!configured};
 }

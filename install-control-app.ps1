@@ -4,7 +4,8 @@ param(
     [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$ToolDir,
     [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$DesktopPath,
     [switch]$ShortcutOnly,
-    [ValidateSet('none','after-executable','after-backend','after-library','before-shortcut')]
+    [AllowNull()][System.Collections.Generic.List[object]]$ShortcutTransactionLog,
+    [ValidateSet('none','after-executable','after-backend','after-library','before-shortcut','after-shortcut','after-legacy-shortcut')]
     [string]$FailureInjectionStep = 'none'
 )
 
@@ -28,20 +29,73 @@ function Install-ControlTransactionFile {
     param(
         [Parameter(Mandatory)][string]$StagedPath,
         [Parameter(Mandatory)][string]$DestinationPath,
-        [Parameter(Mandatory)][string]$BackupPath
+        [Parameter(Mandatory)][string]$BackupPath,
+        [switch]$GuardShortcut,
+        [AllowNull()][string]$ExpectedOriginalHash
     )
     $hadOriginal = Test-Path -LiteralPath $DestinationPath -PathType Leaf
+    $expectedHash = if ($GuardShortcut) { (Get-FileHash -LiteralPath $StagedPath -Algorithm SHA256).Hash } else { $null }
+    if ($GuardShortcut -and ($hadOriginal -ne (-not [string]::IsNullOrEmpty($ExpectedOriginalHash)) -or
+        ($hadOriginal -and (Get-FileHash -LiteralPath $DestinationPath -Algorithm SHA256).Hash -cne $ExpectedOriginalHash))) {
+        throw 'Desktop shortcut changed before installation'
+    }
     if ($hadOriginal) { [System.IO.File]::Replace($StagedPath, $DestinationPath, $BackupPath, $true) }
     else { [System.IO.File]::Move($StagedPath, $DestinationPath) }
+    if ($GuardShortcut -and $hadOriginal -and (Get-FileHash -LiteralPath $BackupPath -Algorithm SHA256).Hash -cne $ExpectedOriginalHash) {
+        # Preserve bytes displaced by a concurrent writer instead of claiming them.
+        if ((Get-FileHash -LiteralPath $DestinationPath -Algorithm SHA256).Hash -ceq $expectedHash) {
+            $quarantine = $BackupPath + '.displaced'
+            [System.IO.File]::Move($DestinationPath,$quarantine)
+            if ((Get-FileHash -LiteralPath $quarantine -Algorithm SHA256).Hash -cne $expectedHash) {
+                if (-not (Test-Path -LiteralPath $DestinationPath)) { [System.IO.File]::Move($quarantine,$DestinationPath) }
+                throw 'Desktop shortcut changed during installation recovery'
+            }
+            [System.IO.File]::Move($BackupPath,$DestinationPath)
+            Remove-Item -LiteralPath $quarantine -Force
+        }
+        throw 'Desktop shortcut changed during installation'
+    }
     return [pscustomobject]@{
         DestinationPath = $DestinationPath
         BackupPath = $BackupPath
         HadOriginal = $hadOriginal
+        GuardShortcut = [bool]$GuardShortcut
+        ExpectedHash = $expectedHash
+        OriginalHash = if ($hadOriginal) { $ExpectedOriginalHash } else { $null }
+        Removed = $false
     }
 }
 
 function Restore-ControlTransactionFile {
     param([Parameter(Mandatory)][object]$Record, [Parameter(Mandatory)][string]$TransactionId)
+    if ($Record.GuardShortcut) {
+        if ($Record.HadOriginal -and
+            (-not (Test-Path -LiteralPath $Record.BackupPath -PathType Leaf) -or
+             (Get-FileHash -LiteralPath $Record.BackupPath -Algorithm SHA256).Hash -cne $Record.OriginalHash)) {
+            throw 'Desktop shortcut rollback backup changed'
+        }
+        if ($Record.Removed) {
+            if (Test-Path -LiteralPath $Record.DestinationPath) { throw 'Legacy shortcut rollback refused concurrent bytes' }
+            # A legacy link removed by this transaction may only fill an absent name.
+            [System.IO.File]::Move($Record.BackupPath,$Record.DestinationPath)
+            return
+        }
+        if (-not (Test-Path -LiteralPath $Record.DestinationPath -PathType Leaf) -or
+            (Get-FileHash -LiteralPath $Record.DestinationPath -Algorithm SHA256).Hash -cne $Record.ExpectedHash) {
+            throw 'Desktop shortcut rollback refused concurrent bytes'
+        }
+        $quarantine = Join-Path (Split-Path -Parent $Record.DestinationPath) ('.codex-control-install.' + $TransactionId + '.shortcut-quarantine')
+        # Inspect the bytes actually moved, not the earlier precheck snapshot. An
+        # exclusive move back preserves a replacement made during that window.
+        [System.IO.File]::Move($Record.DestinationPath,$quarantine)
+        if ((Get-FileHash -LiteralPath $quarantine -Algorithm SHA256).Hash -cne $Record.ExpectedHash) {
+            if (-not (Test-Path -LiteralPath $Record.DestinationPath)) { [System.IO.File]::Move($quarantine,$Record.DestinationPath) }
+            throw 'Desktop shortcut rollback refused concurrent bytes'
+        }
+        if ($Record.HadOriginal) { [System.IO.File]::Move($Record.BackupPath,$Record.DestinationPath) }
+        Remove-Item -LiteralPath $quarantine -Force
+        return
+    }
     if ($Record.HadOriginal) {
         if (-not (Test-Path -LiteralPath $Record.BackupPath -PathType Leaf)) { throw 'Control bundle backup is unavailable' }
         if (Test-Path -LiteralPath $Record.DestinationPath -PathType Leaf) {
@@ -54,6 +108,28 @@ function Restore-ControlTransactionFile {
     elseif (Test-Path -LiteralPath $Record.DestinationPath -PathType Leaf) {
         Remove-Item -LiteralPath $Record.DestinationPath -Force
     }
+}
+
+function Test-ControlShortcutOwnership {
+    param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)][string]$ExecutablePath,[Parameter(Mandatory)][string]$ToolDirectory)
+    try {
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { return $false }
+        $link = [CodexControlShortcut]::Read($Path)
+        return [IO.Path]::GetFullPath($link.TargetPath).Equals($ExecutablePath,[StringComparison]::OrdinalIgnoreCase) -and
+            [IO.Path]::GetFullPath($link.WorkingDirectory).Equals($ToolDirectory,[StringComparison]::OrdinalIgnoreCase) -and
+            $link.Arguments -ceq ''
+    } catch { return $false }
+}
+
+function Get-ControlOwnedShortcutHash {
+    param([Parameter(Mandatory)][string]$Path,[Parameter(Mandatory)][string]$ExecutablePath,[Parameter(Mandatory)][string]$ToolDirectory)
+    try {
+        $before = (Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash
+        if (-not (Test-ControlShortcutOwnership -Path $Path -ExecutablePath $ExecutablePath -ToolDirectory $ToolDirectory)) { return $null }
+        if ((Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash -cne $before) { return $null }
+        return $before
+    } catch { return $null }
 }
 
 function Remove-ControlStage {
@@ -183,12 +259,19 @@ $stageDirectory = Join-Path $tool ('.codex-control-install.' + $transactionId + 
 $stagedExecutable = Join-Path $stageDirectory 'CodexDiscordControl.exe'
 $stagedBackend = Join-Path $stageDirectory 'codex-control.ps1'
 $stagedLibrary = Join-Path $stageDirectory 'codex-control-lib.ps1'
-$stagedShortcut = Join-Path $desktop ('.Codex Discord 控制台.' + $transactionId + '.stage.lnk')
+$stagedShortcut = Join-Path $desktop ('.CodexRelay.' + $transactionId + '.stage.lnk')
 
 $executablePath = Join-Path $tool 'CodexDiscordControl.exe'
 $backendPath = Join-Path $tool 'codex-control.ps1'
 $libraryPath = Join-Path $tool 'codex-control-lib.ps1'
-$shortcutPath = Join-Path $desktop 'Codex Discord 控制台.lnk'
+$shortcutPath = Join-Path $desktop '码驿 · CodexRelay 控制台.lnk'
+$legacyShortcutPath = Join-Path $desktop 'Codex Discord 控制台.lnk'
+$shortcutOriginalHash = $null
+if (Test-Path -LiteralPath $shortcutPath) {
+    $shortcutOriginalHash = Get-ControlOwnedShortcutHash -Path $shortcutPath -ExecutablePath $executablePath -ToolDirectory $tool
+    if (-not $shortcutOriginalHash) { throw 'Desktop shortcut is not owned by this installation' }
+}
+$legacyShortcutHash = Get-ControlOwnedShortcutHash -Path $legacyShortcutPath -ExecutablePath $executablePath -ToolDirectory $tool
 $records = [System.Collections.Generic.List[object]]::new()
 $succeeded = $false
 
@@ -221,7 +304,24 @@ try {
         Invoke-ControlFailureInjection -Step 'after-library'
     }
     Invoke-ControlFailureInjection -Step 'before-shortcut'
-    $records.Add((Install-ControlTransactionFile -StagedPath $stagedShortcut -DestinationPath $shortcutPath -BackupPath (Join-Path $desktop ('.Codex Discord 控制台.' + $transactionId + '.backup.lnk'))))
+    $shortcutRecord = Install-ControlTransactionFile -StagedPath $stagedShortcut -DestinationPath $shortcutPath -BackupPath (Join-Path $desktop ('.CodexRelay.' + $transactionId + '.backup.lnk')) -GuardShortcut -ExpectedOriginalHash $shortcutOriginalHash
+    $records.Add($shortcutRecord)
+    if ($null -ne $ShortcutTransactionLog) { $ShortcutTransactionLog.Add($shortcutRecord) }
+    Invoke-ControlFailureInjection -Step 'after-shortcut'
+    if ($legacyShortcutHash) {
+        if (-not (Test-ControlShortcutOwnership -Path $legacyShortcutPath -ExecutablePath $executablePath -ToolDirectory $tool) -or
+            (Get-FileHash -LiteralPath $legacyShortcutPath -Algorithm SHA256).Hash -cne $legacyShortcutHash) { throw 'Legacy shortcut changed before migration' }
+        $legacyBackup = Join-Path $desktop ('.CodexRelay.' + $transactionId + '.legacy-backup.lnk')
+        [IO.File]::Move($legacyShortcutPath,$legacyBackup)
+        if ((Get-FileHash -LiteralPath $legacyBackup -Algorithm SHA256).Hash -cne $legacyShortcutHash) {
+            if (-not (Test-Path -LiteralPath $legacyShortcutPath)) { [IO.File]::Move($legacyBackup,$legacyShortcutPath) }
+            throw 'Legacy shortcut changed during migration'
+        }
+        $legacyRecord = [pscustomobject]@{DestinationPath=$legacyShortcutPath;BackupPath=$legacyBackup;HadOriginal=$true;GuardShortcut=$true;ExpectedHash=$null;OriginalHash=$legacyShortcutHash;Removed=$true}
+        $records.Add($legacyRecord)
+        if ($null -ne $ShortcutTransactionLog) { $ShortcutTransactionLog.Add($legacyRecord) }
+    }
+    Invoke-ControlFailureInjection -Step 'after-legacy-shortcut'
     $succeeded = $true
 }
 catch {

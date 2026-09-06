@@ -865,7 +865,7 @@ $readmeMarker = Join-Path $source 'README.md'
 if (-not (Test-Path -LiteralPath $readmeMarker -PathType Leaf)) { throw 'SourceRoot is missing the repository marker' }
 [void](Assert-DeployPathBoundary -Root $source -Path $readmeMarker -Label 'repository marker')
 $markerText = [System.IO.File]::ReadAllText($readmeMarker, [System.Text.Encoding]::UTF8)
-if (-not $markerText.StartsWith('# Codex Discord 私有命令控制台', [System.StringComparison]::Ordinal)) {
+if (($markerText -split '\r?\n', 2)[0] -cnotin @('# 码驿 · CodexRelay', '# CodexRelay', '# Codex Discord 私有命令控制台')) {
     throw 'SourceRoot repository marker is invalid'
 }
 
@@ -888,8 +888,10 @@ foreach ($relativePath in $script:DeployFileAllowlist) {
 foreach ($relativePath in $script:GeneratedDeployFiles) {
     [void](Assert-DeployPathBoundary -Root $live -Path (Join-Path $live $relativePath) -Label "generated destination $relativePath")
 }
-$shortcutPath = Join-Path $desktop 'Codex Discord 控制台.lnk'
+$shortcutPath = Join-Path $desktop '码驿 · CodexRelay 控制台.lnk'
+$legacyShortcutPath = Join-Path $desktop 'Codex Discord 控制台.lnk'
 [void](Assert-DeployPathBoundary -Root $desktop -Path $shortcutPath -Label 'Desktop shortcut')
+[void](Assert-DeployPathBoundary -Root $desktop -Path $legacyShortcutPath -Label 'Legacy Desktop shortcut')
 
 $transactionId = [guid]::NewGuid().ToString('N')
 $timestamp = [DateTimeOffset]::Now.ToString('yyyyMMdd-HHmmss-fffffff')
@@ -906,7 +908,7 @@ $records = [System.Collections.Generic.List[object]]::new()
 $createdDirectories = [System.Collections.Generic.List[object]]::new()
 $priorStatus = $null
 $serviceStopped = $false
-$shortcutRecord = $null
+$shortcutRecords = [System.Collections.Generic.List[object]]::new()
 $deploymentCommitted = $false
 $primaryError = $null
 $terminalError = $null
@@ -1064,19 +1066,21 @@ try {
             $serviceStopped = $true
             [void](Invoke-DeployServiceProbe -PowerShellPath $powerShellPath -ProbePath $serviceProbePath -Action 'stop-temporary' -ToolDir $live)
         }
-        $shortcutHadOriginal = Test-Path -LiteralPath $shortcutPath -PathType Leaf
-        $shortcutBackupPath = Join-Path $backupRoot 'desktop-shortcut\Codex Discord 控制台.lnk'
-        if ($shortcutHadOriginal) {
-            New-Item -ItemType Directory -Path (Split-Path -Parent $shortcutBackupPath) -Force | Out-Null
-            $shortcutOriginalHash = Get-DeployHash -Path $shortcutPath
-            [void](Assert-DeployPathBoundary -Root $backupRoot -Path $shortcutBackupPath -Label 'Desktop shortcut backup')
-            Assert-DeployDirectoryIdentity -Expected $desktopIdentity
-            Assert-DeployDirectChildIdentity -ParentIdentity $backupParentIdentity -ChildIdentity $backupRootIdentity -Label 'deployment backup root'
-            [System.IO.File]::Copy($shortcutPath, $shortcutBackupPath, $false)
-            if ((Get-DeployHash -Path $shortcutBackupPath) -cne $shortcutOriginalHash) { throw 'Desktop shortcut backup hash mismatch' }
+        foreach ($candidateShortcut in @($shortcutPath,$legacyShortcutPath)) {
+            $shortcutHadOriginal = Test-Path -LiteralPath $candidateShortcut -PathType Leaf
+            $shortcutBackupPath = Join-Path (Join-Path $backupRoot 'desktop-shortcut') ([IO.Path]::GetFileName($candidateShortcut))
+            if ($shortcutHadOriginal) {
+                New-Item -ItemType Directory -Path (Split-Path -Parent $shortcutBackupPath) -Force | Out-Null
+                $shortcutOriginalHash = Get-DeployHash -Path $candidateShortcut
+                [void](Assert-DeployPathBoundary -Root $backupRoot -Path $shortcutBackupPath -Label 'Desktop shortcut backup')
+                Assert-DeployDirectoryIdentity -Expected $desktopIdentity
+                Assert-DeployDirectChildIdentity -ParentIdentity $backupParentIdentity -ChildIdentity $backupRootIdentity -Label 'deployment backup root'
+                [System.IO.File]::Copy($candidateShortcut, $shortcutBackupPath, $false)
+                if ((Get-DeployHash -Path $shortcutBackupPath) -cne $shortcutOriginalHash) { throw 'Desktop shortcut backup hash mismatch' }
+            }
+            else { $shortcutOriginalHash = $null }
+            $shortcutRecords.Add([pscustomobject]@{ HadOriginal=$shortcutHadOriginal; BackupPath=$shortcutBackupPath; OriginalHash=$shortcutOriginalHash; DestinationPath=$candidateShortcut; IsLegacy=($candidateShortcut -ceq $legacyShortcutPath); MutationAttempted=$false; ChangedByTransaction=$false; ExpectedHash=$null })
         }
-        else { $shortcutOriginalHash = $null }
-        $shortcutRecord = [pscustomobject]@{ HadOriginal=$shortcutHadOriginal; BackupPath=$shortcutBackupPath; OriginalHash=$shortcutOriginalHash; DestinationPath=$shortcutPath; MutationAttempted=$false; ChangedByTransaction=$false; ExpectedHash=$null }
     }
 
     Assert-DeployStageIdentity -LiveIdentity $liveIdentity -StageIdentity $stageIdentity
@@ -1133,24 +1137,42 @@ try {
         if ($FailureInjectionStep -ceq 'before-live-actions') { throw 'injected-deploy-failure:before-live-actions' }
         # The installer may write the shortcut and then fail, so recovery ownership begins
         # before the external action rather than after its successful return.
-        $shortcutExistsBefore = Test-Path -LiteralPath $shortcutPath -PathType Leaf
-        if ($shortcutExistsBefore -ne $shortcutRecord.HadOriginal -or
-            ($shortcutExistsBefore -and (Get-DeployHash -Path $shortcutPath) -cne $shortcutRecord.OriginalHash)) {
-            throw 'Desktop shortcut changed after backup'
+        foreach ($shortcutRecord in $shortcutRecords) {
+            $shortcutExistsBefore = Test-Path -LiteralPath $shortcutRecord.DestinationPath -PathType Leaf
+            if ($shortcutExistsBefore -ne $shortcutRecord.HadOriginal -or
+                ($shortcutExistsBefore -and (Get-DeployHash -Path $shortcutRecord.DestinationPath) -cne $shortcutRecord.OriginalHash)) {
+                throw 'Desktop shortcut changed after backup'
+            }
         }
-        $shortcutRecord.MutationAttempted = $true
+        foreach ($shortcutRecord in $shortcutRecords) { $shortcutRecord.MutationAttempted = $true }
+        $shortcutTransactionLog = [System.Collections.Generic.List[object]]::new()
         try {
-            & (Join-Path $live 'install-control-app.ps1') -SourceRoot $live -ToolDir $live -DesktopPath $desktop -ShortcutOnly | Out-Null
+            & (Join-Path $live 'install-control-app.ps1') -SourceRoot $live -ToolDir $live -DesktopPath $desktop -ShortcutOnly -ShortcutTransactionLog $shortcutTransactionLog | Out-Null
         }
         finally {
             Assert-DeployDirectoryIdentity -Expected $desktopIdentity
             Assert-DeployDirectChildIdentity -ParentIdentity $backupParentIdentity -ChildIdentity $backupRootIdentity -Label 'deployment backup root'
-            if (Test-Path -LiteralPath $shortcutPath -PathType Leaf) {
-                $currentShortcutHash = Get-DeployHash -Path $shortcutPath
-                $shortcutRecord.ExpectedHash = $currentShortcutHash
-                $shortcutRecord.ChangedByTransaction = (-not $shortcutRecord.HadOriginal -or $currentShortcutHash -cne $shortcutRecord.OriginalHash)
+            foreach ($shortcutRecord in $shortcutRecords) {
+                # Only the installer can attest which bytes it committed. A hash
+                # observed after its return may belong to a concurrent user edit.
+                $proof = @($shortcutTransactionLog | Where-Object { $_.DestinationPath -ceq $shortcutRecord.DestinationPath })
+                if ($proof.Count -eq 0) { continue }
+                if ($proof.Count -ne 1) { throw 'Desktop shortcut transaction proof is invalid' }
+                # Get-FileHash emits uppercase in the installer; Get-DeployHash
+                # uses lowercase. Normalize this boundary without changing null.
+                $proofOriginalHash = if ($null -eq $proof[0].OriginalHash) { $null } else { ([string]$proof[0].OriginalHash).ToLowerInvariant() }
+                if ($proof[0].HadOriginal -ne $shortcutRecord.HadOriginal -or
+                    $proofOriginalHash -cne $shortcutRecord.OriginalHash -or
+                    [bool]$proof[0].Removed -ne [bool]$shortcutRecord.IsLegacy) { throw 'Desktop shortcut transaction proof is invalid' }
+                $shortcutRecord.ExpectedHash = if ($null -eq $proof[0].ExpectedHash) { $null } else { ([string]$proof[0].ExpectedHash).ToLowerInvariant() }
+                $existsNow = Test-Path -LiteralPath $shortcutRecord.DestinationPath -PathType Leaf
+                # The installer can roll itself back before throwing. Do not undo
+                # that recovery, or claim a legacy name it never removed.
+                $alreadyRestored = if ($shortcutRecord.HadOriginal) {
+                    $existsNow -and (Get-DeployHash -Path $shortcutRecord.DestinationPath) -ceq $shortcutRecord.OriginalHash
+                } else { -not $existsNow }
+                $shortcutRecord.ChangedByTransaction = -not $alreadyRestored
             }
-            elseif ($shortcutRecord.HadOriginal) { $shortcutRecord.ChangedByTransaction = $true }
         }
         if (-not (Test-Path -LiteralPath $shortcutPath -PathType Leaf)) { throw 'Control app shortcut installation failed' }
         foreach ($record in $records) {
@@ -1214,12 +1236,31 @@ catch {
             catch { $rollbackFailed = $true }
         }
     }
-    if ($null -ne $shortcutRecord -and $shortcutRecord.MutationAttempted -and $shortcutRecord.ChangedByTransaction) {
+    foreach ($shortcutRecord in $shortcutRecords) {
+      if ($shortcutRecord.MutationAttempted -and $shortcutRecord.ChangedByTransaction) {
         try {
             Assert-DeployDirectoryIdentity -Expected $desktopIdentity
             Assert-DeployDirectChildIdentity -ParentIdentity $backupParentIdentity -ChildIdentity $backupRootIdentity -Label 'deployment backup root'
-            if ([string]::IsNullOrWhiteSpace([string]$shortcutRecord.ExpectedHash) -or
-                -not (Test-Path -LiteralPath $shortcutRecord.DestinationPath -PathType Leaf) -or
+            if ([string]::IsNullOrWhiteSpace([string]$shortcutRecord.ExpectedHash)) {
+                # A successfully migrated legacy link is absent. Restore it with an
+                # exclusive move, never replacing a user's concurrently created link.
+                if (-not $shortcutRecord.HadOriginal -or (Test-Path -LiteralPath $shortcutRecord.DestinationPath)) {
+                    throw 'Desktop shortcut rollback refused concurrent bytes'
+                }
+                if (-not (Test-Path -LiteralPath $shortcutRecord.BackupPath -PathType Leaf) -or
+                    (Get-DeployHash -Path $shortcutRecord.BackupPath) -cne $shortcutRecord.OriginalHash) { throw 'Desktop shortcut backup changed before rollback' }
+                $shortcutRestore = Join-Path $desktop ('.codex-discord-deploy.' + $transactionId + '.legacy-shortcut-rollback')
+                [System.IO.File]::Copy($shortcutRecord.BackupPath,$shortcutRestore,$false)
+                Invoke-DeployTestHook -Name 'BetweenShortcutRollbackPrecheckAndReplace' -Context $shortcutRecord
+                Assert-DeployDirectoryIdentity -Expected $desktopIdentity
+                Assert-DeployDirectChildIdentity -ParentIdentity $backupParentIdentity -ChildIdentity $backupRootIdentity -Label 'deployment backup root'
+                if ((Get-DeployHash -Path $shortcutRecord.BackupPath) -cne $shortcutRecord.OriginalHash -or
+                    (Get-DeployHash -Path $shortcutRestore) -cne $shortcutRecord.OriginalHash) { throw 'Desktop shortcut backup changed before rollback' }
+                [System.IO.File]::Move($shortcutRestore,$shortcutRecord.DestinationPath)
+                if ((Get-DeployHash -Path $shortcutRecord.DestinationPath) -cne $shortcutRecord.OriginalHash) { throw 'Desktop shortcut rollback hash mismatch' }
+                continue
+            }
+            if (-not (Test-Path -LiteralPath $shortcutRecord.DestinationPath -PathType Leaf) -or
                 (Get-DeployHash -Path $shortcutRecord.DestinationPath) -cne $shortcutRecord.ExpectedHash) {
                 throw 'Desktop shortcut rollback refused concurrent bytes'
             }
@@ -1270,6 +1311,7 @@ catch {
             }
         }
         catch { $rollbackFailed = $true }
+      }
     }
     if ($commandRegistrationAttempted) {
         try {
