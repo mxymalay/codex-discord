@@ -1057,7 +1057,7 @@ try {
         Remove-Item Env:CODEX_DEPLOY_TEST_ACTION_PATH -ErrorAction SilentlyContinue
         Remove-Item Env:CODEX_DEPLOY_TEST_FAIL_SHORTCUT_AFTER_WRITE -ErrorAction SilentlyContinue
     }
-    Assert-True ($shortcutFailureError -match 'synthetic-shortcut-failure') 'deployment hid the trusted shortcut partial-write failure'
+    Assert-True ($shortcutFailureError -match 'synthetic-shortcut-failure') "deployment hid the trusted shortcut partial-write failure: $shortcutFailureError"
     Assert-True ((Get-BytesHex -Path (Join-Path $shortcutFailureDesktop '码驿 · CodexRelay 控制台.lnk')) -ceq $shortcutFailureBefore) 'shortcut partial-write failure did not restore the exact previous bytes'
 
     # Discord bulk registration can reach the Guild before the local process reports failure.

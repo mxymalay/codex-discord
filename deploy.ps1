@@ -1157,10 +1157,14 @@ try {
                 # observed after its return may belong to a concurrent user edit.
                 $proof = @($shortcutTransactionLog | Where-Object { $_.DestinationPath -ceq $shortcutRecord.DestinationPath })
                 if ($proof.Count -eq 0) { continue }
-                if ($proof.Count -ne 1 -or $proof[0].HadOriginal -ne $shortcutRecord.HadOriginal -or
-                    $proof[0].OriginalHash -cne $shortcutRecord.OriginalHash -or
+                if ($proof.Count -ne 1) { throw 'Desktop shortcut transaction proof is invalid' }
+                # Get-FileHash emits uppercase in the installer; Get-DeployHash
+                # uses lowercase. Normalize this boundary without changing null.
+                $proofOriginalHash = if ($null -eq $proof[0].OriginalHash) { $null } else { ([string]$proof[0].OriginalHash).ToLowerInvariant() }
+                if ($proof[0].HadOriginal -ne $shortcutRecord.HadOriginal -or
+                    $proofOriginalHash -cne $shortcutRecord.OriginalHash -or
                     [bool]$proof[0].Removed -ne [bool]$shortcutRecord.IsLegacy) { throw 'Desktop shortcut transaction proof is invalid' }
-                $shortcutRecord.ExpectedHash = $proof[0].ExpectedHash
+                $shortcutRecord.ExpectedHash = if ($null -eq $proof[0].ExpectedHash) { $null } else { ([string]$proof[0].ExpectedHash).ToLowerInvariant() }
                 $existsNow = Test-Path -LiteralPath $shortcutRecord.DestinationPath -PathType Leaf
                 # The installer can roll itself back before throwing. Do not undo
                 # that recovery, or claim a legacy name it never removed.
