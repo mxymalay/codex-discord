@@ -23,7 +23,11 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $toolDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$codexRoot = Split-Path -Parent $toolDir
+$codexRoot = if (-not [string]::IsNullOrWhiteSpace($env:CODEX_HOME) -and [IO.Path]::IsPathRooted($env:CODEX_HOME)) {
+    [IO.Path]::GetFullPath($env:CODEX_HOME)
+} elseif ((Split-Path -Leaf $toolDir) -eq 'mobile-notify') {
+    Split-Path -Parent $toolDir
+} else { Join-Path ([Environment]::GetFolderPath('UserProfile')) '.codex' }
 $configPath = Join-Path $toolDir 'config.json'
 $logPath = Join-Path $toolDir 'mobile-notify.log'
 $quotaStatePath = Join-Path $toolDir 'quota-state.json'
@@ -230,6 +234,139 @@ function Get-SessionMetadataForThread {
     return $null
 }
 
+function Read-ArchivedRootTurnCandidate {
+    param([string]$Path, [string]$ThreadId, [string]$TurnId)
+
+    $before = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if ($before.PSIsContainer -or ($before.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $before.Length -eq 0) {
+        throw 'Archive candidate is not a nonempty regular file.'
+    }
+    $initialLength = $before.Length
+    $initialWriteTicks = $before.LastWriteTimeUtc.Ticks
+    $stream = $null
+    $lineBuffer = New-Object IO.MemoryStream
+    $utf8 = New-Object Text.UTF8Encoding($false, $true)
+    $buffer = New-Object byte[] 65536
+    $maxLineBytes = 8 * 1024 * 1024
+    $lineNumber = 0
+    $currentMetadata = $null
+    $targetMetadata = $null
+    $sawMatchingMetadata = $false
+    $targetStarts = 0
+    $targetCompletes = 0
+    $targetOpen = $false
+    try {
+        $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+        while (($bytesRead = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            $offset = 0
+            while ($offset -lt $bytesRead) {
+                $newline = [Array]::IndexOf($buffer, [byte]10, $offset, $bytesRead - $offset)
+                $end = if ($newline -lt 0) { $bytesRead } else { $newline }
+                $count = $end - $offset
+                if ($lineBuffer.Length + $count -gt $maxLineBytes) { throw 'Archive JSONL line exceeds the size limit.' }
+                $lineBuffer.Write($buffer, $offset, $count)
+                $offset = $end + 1
+                if ($newline -lt 0) { continue }
+
+                $lineNumber++
+                $line = $utf8.GetString($lineBuffer.GetBuffer(), 0, [int]$lineBuffer.Length)
+                $lineBuffer.SetLength(0)
+                if ($lineNumber -eq 1) { $line = $line.TrimStart([char]0xFEFF) }
+                if ([string]::IsNullOrWhiteSpace($line)) { continue }
+                $entry = $line | ConvertFrom-Json -ErrorAction Stop
+                $entryType = [string](Get-OptionalValue -Object $entry -Name 'type' -DefaultValue '')
+                if ($entry -isnot [System.Management.Automation.PSCustomObject] -or [string]::IsNullOrWhiteSpace($entryType)) {
+                    throw 'Archive JSONL entry cannot be classified.'
+                }
+                $payload = Get-OptionalValue -Object $entry -Name 'payload' -DefaultValue $null
+                if ($entryType -eq 'session_meta') {
+                    if ($targetOpen) { throw 'Session metadata changed inside the archived target turn.' }
+                    if ($payload -isnot [System.Management.Automation.PSCustomObject]) { throw 'Archive session metadata is invalid.' }
+                    $currentMetadata = $payload
+                    if ([string](Get-OptionalValue -Object $payload -Name 'id' -DefaultValue '') -ieq $ThreadId) { $sawMatchingMetadata = $true }
+                    continue
+                }
+                if ($entryType -ne 'event_msg') { continue }
+                if ($payload -isnot [System.Management.Automation.PSCustomObject]) { throw 'Archive event payload is invalid.' }
+                $eventType = [string](Get-OptionalValue -Object $payload -Name 'type' -DefaultValue '')
+                $eventTurnId = [string](Get-OptionalValue -Object $payload -Name 'turn_id' -DefaultValue '')
+                if ($eventType -eq 'task_started') {
+                    if ($targetOpen) { throw 'Another turn start interrupted the archived target turn.' }
+                    if ($eventTurnId -ine $TurnId) { continue }
+                    $targetStarts++
+                    if ($targetStarts -ne 1 -or [string](Get-OptionalValue -Object $currentMetadata -Name 'id' -DefaultValue '') -ine $ThreadId) {
+                        throw 'Archived target turn does not have unique matching session metadata.'
+                    }
+                    $targetMetadata = $currentMetadata
+                    $targetOpen = $true
+                }
+                elseif ($eventType -eq 'task_complete') {
+                    if ($targetOpen -and $eventTurnId -ine $TurnId) { throw 'Another completion interrupted the archived target turn.' }
+                    if ($eventTurnId -ine $TurnId) { continue }
+                    $targetCompletes++
+                    if (-not $targetOpen -or $targetCompletes -ne 1) { throw 'Archived target completion does not have a unique start.' }
+                    $targetOpen = $false
+                }
+            }
+        }
+        if ($lineBuffer.Length -ne 0 -or $targetOpen -or -not $sawMatchingMetadata) {
+            throw 'Archive candidate is incomplete or lacks matching session metadata.'
+        }
+        $after = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        if (($after.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $after.Length -ne $initialLength -or $after.LastWriteTimeUtc.Ticks -ne $initialWriteTicks) {
+            throw 'Archive candidate changed while being read.'
+        }
+        return [pscustomobject]@{ HasTurn = ($targetStarts -eq 1 -and $targetCompletes -eq 1); Metadata = $targetMetadata }
+    }
+    finally {
+        if ($null -ne $stream) { $stream.Dispose() }
+        $lineBuffer.Dispose()
+    }
+}
+
+function Get-ArchivedSessionMetadataForTurn {
+    param([string]$ThreadId, [string]$TurnId)
+
+    $uuidPattern = '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+    if ($ThreadId -notmatch $uuidPattern -or $TurnId -notmatch $uuidPattern) { return $null }
+    try {
+        # Only the controlled sibling of sessions is searched; notification paths are never trusted.
+        $archiveRoot = Join-Path (Split-Path -Parent $sessionsPath) 'archived_sessions'
+        $root = Get-Item -LiteralPath $archiveRoot -Force -ErrorAction Stop
+        if (-not $root.PSIsContainer -or ($root.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $null }
+        $directories = New-Object 'System.Collections.Generic.Stack[string]'
+        $directories.Push($root.FullName)
+        $metadata = $null
+        $claimants = 0
+        $candidatePattern = '(?i)(?:^|[-_])' + [regex]::Escape($ThreadId) + '$'
+        while ($directories.Count -gt 0) {
+            $directory = Get-Item -LiteralPath $directories.Pop() -Force -ErrorAction Stop
+            if (-not $directory.PSIsContainer -or ($directory.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $null }
+            foreach ($candidate in @(Get-ChildItem -LiteralPath $directory.FullName -Force -ErrorAction Stop)) {
+                if ($candidate.PSIsContainer) {
+                    # An unreadable or linked subtree could conceal a second claimant.
+                    if (($candidate.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $null }
+                    $directories.Push($candidate.FullName)
+                    continue
+                }
+                if ($candidate.Extension -ine '.jsonl' -or $candidate.BaseName -notmatch $candidatePattern) { continue }
+                $result = Read-ArchivedRootTurnCandidate -Path $candidate.FullName -ThreadId $ThreadId -TurnId $TurnId
+                if ($result.HasTurn) {
+                    $claimants++
+                    if ($claimants -gt 1) { return $null }
+                    $metadata = $result.Metadata
+                }
+            }
+        }
+        if ($claimants -eq 1) { return $metadata }
+    }
+    catch {
+        # Any candidate that cannot be classified leaves uniqueness unproven.
+        return $null
+    }
+    return $null
+}
+
 function Get-TaskNotificationEligibility {
     param([object]$Notification)
 
@@ -248,6 +385,10 @@ function Get-TaskNotificationEligibility {
     }
 
     $metadata = Get-SessionMetadataForThread -ThreadId $threadId
+    if ($null -eq $metadata) {
+        $turnId = [string](Get-OptionalValue -Object $Notification -Name 'turn-id' -DefaultValue '')
+        $metadata = Get-ArchivedSessionMetadataForTurn -ThreadId $threadId -TurnId $turnId
+    }
     if ($null -eq $metadata) {
         return [pscustomobject]@{ Allowed = $false; Reason = 'matching session metadata is unavailable' }
     }
@@ -500,6 +641,23 @@ function Get-NotificationProjectName {
     return Split-Path -Leaf $cwd.TrimEnd('\', '/')
 }
 
+function Assert-CurrentProjectNotificationsEnabled {
+    # A dispatcher may outlive the console stop that changed its initial config.
+    # Re-read at each actual outbound boundary, including Discord's fallback route.
+    try {
+        $item = Get-Item -LiteralPath $configPath -Force -ErrorAction Stop
+        if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw 'Invalid notification configuration' }
+        $current = [Text.Json.JsonDocument]::Parse([IO.File]::ReadAllText($configPath))
+        try {
+            $enabled = [Text.Json.JsonElement]::new()
+            if ($current.RootElement.ValueKind -eq [Text.Json.JsonValueKind]::Object -and
+                $current.RootElement.TryGetProperty('enabled', [ref]$enabled) -and
+                $enabled.ValueKind -eq [Text.Json.JsonValueKind]::True) { return }
+        } finally { $current.Dispose() }
+    } catch {}
+    throw [OperationCanceledException]::new('Project notifications are disabled or configuration is unavailable')
+}
+
 function Invoke-JsonPost {
     param(
         [string]$Uri,
@@ -509,6 +667,7 @@ function Invoke-JsonPost {
 
     $json = $Payload | ConvertTo-Json -Depth 8 -Compress
     $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+    Assert-CurrentProjectNotificationsEnabled
     Invoke-RestMethod -Method Post -Uri $Uri -ContentType 'application/json; charset=utf-8' -Body $bytes -TimeoutSec $TimeoutSeconds | Out-Null
 }
 
@@ -1000,6 +1159,9 @@ function Send-DiscordBotMessage {
     if ([string]::IsNullOrWhiteSpace($tokenPath)) {
         throw 'Discord Bot token path is empty'
     }
+    if (-not [System.IO.Path]::IsPathRooted($tokenPath)) {
+        $tokenPath = [System.IO.Path]::GetFullPath((Join-Path $toolDir $tokenPath))
+    }
 
     $botToken = Unprotect-DiscordBotToken -Path $tokenPath
     try {
@@ -1007,6 +1169,7 @@ function Send-DiscordBotMessage {
         $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
         $headers = New-DiscordBotHeaders -Token $botToken
         $uri = "https://discord.com/api/v10/channels/$ChannelId/messages"
+        Assert-CurrentProjectNotificationsEnabled
         return Invoke-RestMethod -Method Post -Uri $uri -Headers $headers -ContentType 'application/json; charset=utf-8' -Body $bytes -TimeoutSec $TimeoutSeconds
     }
     finally {
@@ -1065,11 +1228,18 @@ function Invoke-PreviousNotifier {
 
     $executable = [string]$previous[0]
     if (-not (Test-Path -LiteralPath $executable)) {
-        $runtimeRoot = Join-Path $env:LOCALAPPDATA 'OpenAI\Codex\runtimes\cua_node'
-        $runtimePattern = Join-Path $runtimeRoot '*\bin\node_modules\@oai\sky\bin\windows\codex-computer-use.exe'
-        $replacement = Get-ChildItem -Path $runtimePattern -File -ErrorAction SilentlyContinue |
-            Sort-Object LastWriteTime -Descending |
-            Select-Object -First 1
+        $command = Get-Command -Name $executable -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -ne $command) { $executable = $command.Source }
+    }
+    if (-not (Test-Path -LiteralPath $executable)) {
+        $replacement = $null
+        if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT -and -not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+            $runtimeRoot = Join-Path $env:LOCALAPPDATA 'OpenAI\Codex\runtimes\cua_node'
+            $runtimePattern = Join-Path $runtimeRoot '*\bin\node_modules\@oai\sky\bin\windows\codex-computer-use.exe'
+            $replacement = Get-ChildItem -Path $runtimePattern -File -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending |
+                Select-Object -First 1
+        }
         if ($null -eq $replacement) {
             Write-NotifyLog "Previous notifier is missing: $executable"
             return
@@ -1087,7 +1257,11 @@ function Invoke-PreviousNotifier {
         $allArguments = @($arguments) + @($RawNotification)
         $startInfo = New-Object System.Diagnostics.ProcessStartInfo
         $startInfo.FileName = $executable
-        $startInfo.Arguments = (@($allArguments | ForEach-Object { ConvertTo-WindowsCommandLineArgument -Value ([string]$_) }) -join ' ')
+        if ($null -ne $startInfo.PSObject.Properties['ArgumentList']) {
+            foreach ($argument in $allArguments) { [void]$startInfo.ArgumentList.Add([string]$argument) }
+        } else {
+            $startInfo.Arguments = (@($allArguments | ForEach-Object { ConvertTo-WindowsCommandLineArgument -Value ([string]$_) }) -join ' ')
+        }
         $startInfo.UseShellExecute = $false
         $startInfo.CreateNoWindow = $true
 

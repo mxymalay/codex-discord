@@ -1,5 +1,13 @@
 config.json
 discord-token.dpapi
+discord-token.keychain
+*.discord-migration
+*.codex-discord-migration
+.discord-migration*
+*.keychain-db
+*.app/
+.discord-macos-supervisor.lock/
+.discord-macos-deploy.lock/
 *.log
 *.corrupt-*.json
 discord-inbox-state.json

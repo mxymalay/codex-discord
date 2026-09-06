@@ -1,6 +1,9 @@
 import { constants as fsConstants, promises as fs } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import os from 'node:os';
+import { resolveCodexHome } from './discord-runtime-lib.mjs';
+import { expandPathVariables, isAbsolutePath, normalizePath } from './discord-paths-lib.mjs';
 
 import {
   assertValidInboxStateV2,
@@ -74,13 +77,13 @@ const configPath = path.join(toolDir, 'config.json');
 const mappingPath = path.join(toolDir, 'discord-message-map.json');
 const inboxStatePath = path.join(toolDir, 'discord-inbox-state.json');
 const logPath = path.join(toolDir, 'discord-bridge.log');
-const codexRoot = path.dirname(toolDir);
+const codexRoot = resolveCodexHome({ toolDir });
 const sessionsRoot = path.join(codexRoot, 'sessions');
 const rolloutWatcherStatePath = path.join(toolDir, 'rollout-watcher-state.json');
 const taskIndexPath = path.join(toolDir, 'discord-task-index.json');
 const quotaStatePath = path.join(toolDir, 'quota-state.json');
 const bridgeHealthPath = path.join(toolDir, 'discord-bridge-health.json');
-const controlPath = path.join(toolDir, 'codex-control.ps1');
+const controlPath = path.join(toolDir, process.platform === 'darwin' ? 'discord-macos-control.mjs' : 'codex-control.ps1');
 const sessionIndexPath = path.join(codexRoot, 'session_index.jsonl');
 const pollIntervalMs = 4000;
 const pendingRetryIntervalMs = 30_000;
@@ -630,20 +633,18 @@ export async function loadInboxStateWithRecovery({
   }
 }
 
-function expandAbsoluteRoot(value, token, environmentValue) {
+function expandAbsoluteRoot(value) {
   const configured = String(value ?? '').trim();
-  const replacement = String(environmentValue ?? '').trim();
-  if (!configured || (new RegExp(token, 'iu').test(configured) && !replacement)) {
-    throw new Error('Discord task creation root is invalid');
-  }
-  const expanded = configured.replace(new RegExp(token, 'giu'), () => replacement);
-  if (/%[^%]+%/u.test(expanded) || !path.win32.isAbsolute(expanded)) {
+  const expanded = expandPathVariables(configured, { environment: {
+    ...process.env, USERPROFILE: process.env.USERPROFILE || os.homedir(), CODEX_HOME: codexRoot,
+  } });
+  if (!isAbsolutePath(expanded)) {
     throw new Error('Discord task creation root must be absolute');
   }
-  return path.win32.normalize(expanded);
+  return normalizePath(expanded);
 }
 
-function validateConfig(config, { registrationOnly = false } = {}) {
+export function validateConfig(config, { registrationOnly = false } = {}) {
   const required = registrationOnly ? [
     'discordApplicationId', 'discordGuildId', 'discordTokenPath',
   ] : [
@@ -663,12 +664,8 @@ function validateConfig(config, { registrationOnly = false } = {}) {
       String(config.discordQuotaChannelId) === String(config.discordConfirmationChannelId)) {
     throw new Error('Quota channel must be separate from task channels');
   }
-  config.discordProjectlessRoot = expandAbsoluteRoot(
-    config.discordProjectlessRoot, '%USERPROFILE%', process.env.USERPROFILE,
-  );
-  config.discordWorktreeRoot = expandAbsoluteRoot(
-    config.discordWorktreeRoot, '%CODEX_HOME%', process.env.CODEX_HOME,
-  );
+  config.discordProjectlessRoot = expandAbsoluteRoot(config.discordProjectlessRoot);
+  config.discordWorktreeRoot = expandAbsoluteRoot(config.discordWorktreeRoot);
 }
 
 async function existingDirectory(candidate) {
@@ -1348,14 +1345,14 @@ export function createProductionBridgeDependencies({
                 context.recordActivity('lastNotificationSentAt');
               },
             });
+          } catch {
+            context.setLatestErrorCategory('rollout-poll-failed');
+            await logImpl('rollout-poll-failed');
+          } finally {
             if (rolloutProgressFingerprint(rolloutState) !== progressBefore) {
               context.recordActivity('lastRolloutProgressAt');
               rolloutState.lastProgressAt = context.timestamps.lastRolloutProgressAt;
             }
-          } catch {
-              context.setLatestErrorCategory('rollout-poll-failed');
-            await logImpl('rollout-poll-failed');
-          } finally {
             await writeRolloutWatcherStateImpl(rolloutWatcherStatePath, rolloutState).catch(async () => {
               await logImpl('rollout-state-save-failed');
             });

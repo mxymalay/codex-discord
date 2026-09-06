@@ -263,6 +263,9 @@ if (-not $disableLongTerm.ok) { throw "long-term disable failed: $($disableLongT
 if ($bridgeState.running -or $bridgeState.enabled) { throw 'long-term disable did not persist' }
 
 $temporaryLaunchCapture = $null
+$missingDrive = @('Z','Y','X','W','V','U') | Where-Object { -not (Get-PSDrive -Name $_ -ErrorAction SilentlyContinue) } | Select-Object -First 1
+if (-not $missingDrive) { throw 'The path construction regression needs an unused drive letter' }
+$unmountedToolDir = $missingDrive + ':\tools\mobile-notify'
 function Start-Process {
     [CmdletBinding()]
     param(
@@ -278,13 +281,13 @@ function Start-Process {
 }
 try {
     $temporaryOperations = New-CodexControlOperations
-    & $temporaryOperations.StartDetached 'G:\tools\mobile-notify\start-discord-bridge.ps1' temporary
+    & $temporaryOperations.StartDetached ($unmountedToolDir + '\start-discord-bridge.ps1') temporary
 }
 finally {
     Remove-Item Function:Start-Process -Force
 }
 if ($null -eq $temporaryLaunchCapture -or
-    $temporaryLaunchCapture.FilePath -cne 'G:\tools\mobile-notify\CodexDiscordControl.exe' -or
+    $temporaryLaunchCapture.FilePath -cne ($unmountedToolDir + '\CodexDiscordControl.exe') -or
     [string]$temporaryLaunchCapture.WindowStyle -cne 'Hidden' -or
     ($temporaryLaunchCapture.Arguments -join '|') -cne '--bridge-supervisor|temporary') {
     throw 'temporary bridge start does not use the windowless controller supervisor'

@@ -37,7 +37,7 @@ function readSingleJson(text) {
   }
 }
 
-/** Run one fixed PowerShell action without exposing command output on failures. */
+/** Run one fixed platform action without exposing command output on failures. */
 export function runCodexControlAction({
   action,
   powershellPath,
@@ -79,7 +79,9 @@ export function runCodexControlAction({
     };
 
     try {
-      child = spawnImpl(powershellPath, ['-NoProfile', '-File', controlPath, '-Action', action], {
+      const nodeControl = String(controlPath).endsWith('.mjs');
+      child = spawnImpl(nodeControl ? process.execPath : powershellPath,
+        nodeControl ? [controlPath, '--action', action] : ['-NoProfile', '-File', controlPath, '-Action', action], {
         windowsHide: true,
         stdio: ['ignore', 'pipe', 'pipe'],
       });

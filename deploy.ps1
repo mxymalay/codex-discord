@@ -19,6 +19,8 @@ $ErrorActionPreference = 'Stop'
 $script:DeployFileAllowlist = @(
     'discord-bridge.mjs',
     'discord-bridge-lib.mjs',
+    'discord-runtime-lib.mjs',
+    'discord-paths-lib.mjs',
     'discord-commands-lib.mjs',
     'discord-interactions.mjs',
     'discord-gateway-lib.mjs',
@@ -32,6 +34,10 @@ $script:DeployFileAllowlist = @(
     'dispatcher.ps1',
     'discord-config.ps1',
     'discord-secret.ps1',
+    'discord-notification-control.ps1',
+    'discord-migration.ps1',
+    'export-discord-migration.ps1',
+    'import-discord-migration.ps1',
     'discord-state.ps1',
     'discord-http.ps1',
     'task-delivery-state.ps1',
@@ -720,6 +726,12 @@ function Restore-DeployBridgeState {
         # enable-long-term intentionally starts the scheduled instance; the following temporary
         # stop returns to the exact enabled-but-stopped state without changing the long-term flag.
         & $invokeAction 'enable-long-term'
+        & $invokeAction 'stop-temporary'
+    }
+    else {
+        # Older consoles stopped only the bridge, leaving native notify hooks enabled.
+        # Reapply stop through the updated controller so these hooks are muted too; this
+        # action neither installs a missing task nor changes the existing startup choice.
         & $invokeAction 'stop-temporary'
     }
 

@@ -10,7 +10,11 @@ $configPath = Join-Path $toolDir 'config.json'
 . (Join-Path $toolDir 'discord-secret.ps1')
 
 $config = Get-Content -Raw -LiteralPath $configPath -Encoding UTF8 | ConvertFrom-Json
-$token = Unprotect-DiscordBotToken -Path ([string]$config.discordTokenPath)
+$tokenPath = [string]$config.discordTokenPath
+if (-not [System.IO.Path]::IsPathRooted($tokenPath)) {
+    $tokenPath = [System.IO.Path]::GetFullPath((Join-Path $toolDir $tokenPath))
+}
+$token = Unprotect-DiscordBotToken -Path $tokenPath
 if (-not (Test-DiscordBotTokenShape -Token $token)) {
     throw 'Discord Bot Token 无法通过本地验证'
 }

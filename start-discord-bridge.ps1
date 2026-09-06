@@ -8,6 +8,7 @@ $toolDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $bridgePath = Join-Path $toolDir 'discord-bridge.mjs'
 $logPath = Join-Path $toolDir 'discord-bridge-guard.log'
 . (Join-Path $toolDir 'discord-bridge-startup.ps1')
+. (Join-Path $toolDir 'discord-notification-control.ps1')
 
 function Write-BridgeGuardLog {
     param(
@@ -32,9 +33,14 @@ if (-not $createdNew) {
 
 $runtimePath = Join-Path $toolDir 'discord-bridge-runtime.json'
 $jobHandle = [IntPtr]::Zero
+$notificationSnapshot = $null
+$bridgeLaunched = $false
 try {
     $supervisor = Get-Process -Id $PID -ErrorAction Stop
     $jobHandle = New-BridgeSupervisorJob -ToolDir $toolDir -Process $supervisor
+    # A new singleton owner restores notifications once, including the next login
+    # after temporary stop. Child retries must not undo a concurrent console stop.
+    $notificationSnapshot = Set-DiscordNotificationsEnabled -ToolDir $toolDir -Enabled $true
     $mode = if ($env:CODEX_DISCORD_START_MODE -eq 'temporary') { 'temporary' } else { 'scheduled' }
     Write-BridgeRuntimeIdentity -Path $runtimePath -Mode $mode -ProcessId $PID -CreationTimeUtc $supervisor.StartTime.ToUniversalTime() -ToolDir $toolDir | Out-Null
     Write-BridgeGuardLog -Category 'guard-started'
@@ -51,6 +57,7 @@ try {
                 $env:CODEX_DISCORD_CODEX_PATH = $codexCommand.Source
             }
             & $nodePath $bridgePath
+            $bridgeLaunched = $true
             $exitCode = $LASTEXITCODE
             $attempt.Stop()
             Write-BridgeGuardLog -Category 'bridge-exited' -ExitCode $exitCode -DurationMs $attempt.ElapsedMilliseconds
@@ -61,6 +68,12 @@ try {
         }
         Start-Sleep -Seconds 5
     }
+}
+catch {
+    if (-not $bridgeLaunched -and $null -ne $notificationSnapshot) {
+        Restore-DiscordNotificationsEnabled -ToolDir $toolDir -Snapshot $notificationSnapshot
+    }
+    throw
 }
 finally {
     [void](Remove-BridgeRuntimeIdentity -Path $runtimePath -ExpectedProcessId $PID)

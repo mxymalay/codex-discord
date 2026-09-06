@@ -20,13 +20,16 @@ try {
 }
 finally { if ($emptyJob -ne [IntPtr]::Zero) { [CodexBridgeJobNative]::CloseHandle($emptyJob) | Out-Null } }
 
-$definition = Get-DiscordBridgeTaskDefinition `
-    -ToolDir 'G:\tools\mobile-notify'
+# Task definition construction must not resolve or require a mounted drive.
+$missingDrive = @('Z','Y','X','W','V','U') | Where-Object { -not (Get-PSDrive -Name $_ -ErrorAction SilentlyContinue) } | Select-Object -First 1
+if (-not $missingDrive) { throw 'The path construction regression needs an unused drive letter' }
+$unmountedToolDir = $missingDrive + ':\tools\mobile-notify'
+$definition = Get-DiscordBridgeTaskDefinition -ToolDir $unmountedToolDir
 
 if ([string]$definition.TaskName -ne 'Codex Discord Bridge') {
     throw 'Discord bridge scheduled task name is incorrect'
 }
-if ([string]$definition.Execute -ne 'G:\tools\mobile-notify\CodexDiscordControl.exe') {
+if ([string]$definition.Execute -ne ($unmountedToolDir + '\CodexDiscordControl.exe')) {
     throw 'Discord bridge scheduled task does not use the windowless controller supervisor'
 }
 if ([string]$definition.Arguments -cne '--bridge-supervisor scheduled') {
@@ -38,7 +41,7 @@ if ([string]$definition.Arguments -match 'discord-bridge\.mjs|node\.exe|codex\.e
 if ([string]$definition.Arguments -match '(?i)discord-token|\bBot\s+[A-Za-z0-9_.-]+|webhooks/') {
     throw 'Discord bridge scheduled task arguments contain a secret'
 }
-if ([string]$definition.WorkingDirectory -ne 'G:\tools\mobile-notify') {
+if ([string]$definition.WorkingDirectory -ne $unmountedToolDir) {
     throw 'Discord bridge scheduled task working directory is incorrect'
 }
 

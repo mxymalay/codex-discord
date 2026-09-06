@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
+import { expandPathVariables, isAbsolutePath, isPathDescendant, normalizePath, pathApi, pathKey, pathsEqual } from './discord-paths-lib.mjs';
 
 const indexVersion = 1;
 const defaultReadLimits = Object.freeze({
@@ -21,15 +22,24 @@ function emptyIndex() {
   return { version: indexVersion, generatedAt: null, tasks: [] };
 }
 
-function parseJsonLines(content) {
-  return String(content ?? '').split(/\r?\n/).flatMap((raw) => {
-    if (!raw.trim()) return [];
+function parseJsonLineRegion(content) {
+  const entries = [], titleEntries = [];
+  let titlePrefixReliable = true;
+  for (const raw of String(content ?? '').split(/\r?\n/)) {
+    if (!raw.trim()) continue;
     try {
-      return [JSON.parse(raw)];
+      const entry = JSON.parse(raw);
+      entries.push(entry);
+      if (titlePrefixReliable) titleEntries.push(entry);
     } catch {
-      return [];
+      titlePrefixReliable = false;
     }
-  });
+  }
+  return { entries, titleEntries };
+}
+
+function parseJsonLines(content) {
+  return parseJsonLineRegion(content).entries;
 }
 
 function boundedPositiveInteger(value, fallback) {
@@ -65,11 +75,11 @@ function identityKey(value) {
   return String(value ?? '').trim().toLocaleLowerCase();
 }
 
-function canonicalWindowsPath(value) {
+function canonicalProjectPath(value) {
   const text = stringOrNull(value);
   if (!text) return null;
   try {
-    return path.win32.normalize(text.replaceAll('/', '\\')).replace(/[\\]+$/u, '').toLocaleLowerCase();
+    return pathKey(text);
   } catch {
     return null;
   }
@@ -78,7 +88,7 @@ function canonicalWindowsPath(value) {
 function projectRoots(project) {
   return (Array.isArray(project?.roots) ? project.roots : [])
     .map((root) => typeof root === 'string' ? root : root?.path)
-    .map(canonicalWindowsPath)
+    .map(canonicalProjectPath)
     .filter(Boolean);
 }
 
@@ -97,12 +107,12 @@ export function inferSavedProject({ cwd, worktreePath, projectId, projectName } 
     return { projectId: String(explicit.id), projectName: String(explicit.name ?? explicit.id) };
   }
 
-  const candidates = [canonicalWindowsPath(cwd), canonicalWindowsPath(worktreePath)].filter(Boolean);
+  const candidates = [canonicalProjectPath(cwd), canonicalProjectPath(worktreePath)].filter(Boolean);
   if (!candidates.length) return { projectId: null, projectName: null };
   let match = null;
   for (const project of saved) {
     for (const root of projectRoots(project)) {
-      if (!candidates.some((candidate) => candidate === root || candidate.startsWith(`${root}\\`))) continue;
+      if (!candidates.some((candidate) => pathsEqual(candidate, root) || isPathDescendant(root, candidate))) continue;
       if (!match || root.length > match.root.length) match = { project, root };
     }
   }
@@ -125,10 +135,52 @@ function cleanPageText(value) {
   return String(value ?? '').replaceAll('\u0000', '').replace(/\r\n?/g, '\n').trim();
 }
 
+/** Match the notification dispatcher's short input title without splitting surrogate pairs. */
+export function taskNameFromInput(value) {
+  const text = cleanPageText(value).replace(/\s+/gu, ' ');
+  const characters = [...text];
+  return characters.length > 30 ? `${characters.slice(0, 30).join('')}…` : text || '未命名任务';
+}
+
+function knownTaskName(sidebarEntry, createdRecord, previous) {
+  const sidebarName = stringOrNull(sidebarEntry?.thread_name ?? sidebarEntry?.threadName ?? sidebarEntry?.name);
+  if (sidebarName) return sidebarName;
+  const createdName = stringOrNull(createdRecord?.taskName);
+  if (createdName && createdName !== '生成中') return createdName;
+  const previousName = stringOrNull(previous?.taskName);
+  return previousName && !['生成中', '未命名任务'].includes(previousName) ? previousName : null;
+}
+
+function firstInputTaskName(entries) {
+  for (const entry of entries ?? []) {
+    // A compacted prefix or an input-free first turn cannot identify the original request.
+    if (entry?.type === 'compacted' || entry?.type === 'event_msg' && entry.payload?.type === 'task_complete') break;
+    if (!['event_msg', 'response_item'].includes(entry?.type)) continue;
+    const candidate = getUserAuthoredMessageText(entry.payload);
+    if (candidate) return taskNameFromInput(candidate);
+  }
+  return '未命名任务';
+}
+
 function isUserAuthoredMessage(payload, candidate) {
   const kinds = payload?.internal_chat_message_metadata_passthrough?.content_item_kinds;
   if (Array.isArray(kinds)) return kinds.includes('user.text');
   return !/^\s*<(?:recommended_plugins|environment_context|codex_internal_context|heartbeat)(?:\s|>)/iu.test(candidate);
+}
+
+export function getUserAuthoredMessageText(payload) {
+  if (payload?.type === 'user_message') {
+    const candidate = cleanPageText(textValue(payload.message ?? payload.content));
+    return candidate && isUserAuthoredMessage(payload, candidate) ? candidate : '';
+  }
+  if (payload?.type !== 'message' || String(payload.role ?? '').toLocaleLowerCase() !== 'user') return '';
+  const kinds = payload.internal_chat_message_metadata_passthrough?.content_item_kinds;
+  const items = Array.isArray(payload.content) ? payload.content : [payload.content];
+  const authored = items.filter((item, index) =>
+    (!Array.isArray(kinds) || kinds[index] === 'user.text') &&
+    (typeof item === 'string' || ['input_text', 'text'].includes(item?.type)));
+  const candidate = cleanPageText(textValue(authored));
+  return candidate && isUserAuthoredMessage(payload, candidate) ? candidate : '';
 }
 
 function normalizeSearch(value) {
@@ -243,16 +295,16 @@ async function readBytes(filePath, start, length, fileSystem) {
 async function readHeadRegion(filePath, offset, limits, fileSystem) {
   const length = Math.min(offset, limits.headBytes);
   const raw = await readBytes(filePath, 0, length, fileSystem);
-  if (length >= offset) return { entries: parseJsonLines(raw.toString('utf8')), parsedEnd: raw.length };
+  if (length >= offset) return { ...parseJsonLineRegion(raw.toString('utf8')), parsedEnd: raw.length };
   const lastNewline = raw.lastIndexOf(0x0a);
   const parsedEnd = lastNewline < 0 ? 0 : lastNewline + 1;
-  return { entries: parseJsonLines(raw.subarray(0, parsedEnd).toString('utf8')), parsedEnd };
+  return { ...parseJsonLineRegion(raw.subarray(0, parsedEnd).toString('utf8')), parsedEnd };
 }
 
 async function readBoundedEntries(filePath, offset, limits, fileSystem, headRegion) {
   if (offset <= limits.wholeFileBytes) {
     const content = await readBytes(filePath, 0, offset, fileSystem);
-    return { entries: parseJsonLines(content.toString('utf8')), middleSkipped: false };
+    return { ...parseJsonLineRegion(content.toString('utf8')), middleSkipped: false };
   }
   const head = headRegion ?? await readHeadRegion(filePath, offset, limits, fileSystem);
   const nominalTailStart = Math.max(0, offset - limits.tailBytes);
@@ -266,7 +318,8 @@ async function readBoundedEntries(filePath, offset, limits, fileSystem, headRegi
     }
   }
   return {
-    entries: [...head.entries, ...parseJsonLines(tail.toString('utf8'))],
+    entries: [...head.entries, ...parseJsonLineRegion(tail.toString('utf8')).entries],
+    titleEntries: head.titleEntries,
     middleSkipped: true,
   };
 }
@@ -301,15 +354,14 @@ function configuredWorktreeRoot(explicitRoot, previousIndex) {
   const configured = stringOrNull(explicitRoot) ??
     stringOrNull(previousIndex?.discordWorktreeRoot) ??
     stringOrNull(process.env.DISCORD_WORKTREE_ROOT);
-  if (configured) return path.resolve(configured);
-  if (process.env.CODEX_HOME) return path.resolve(process.env.CODEX_HOME, 'worktrees', 'discord');
+  if (configured) {
+    try {
+      const expanded = expandPathVariables(configured);
+      return isAbsolutePath(expanded) ? normalizePath(expanded) : null;
+    } catch { return null; }
+  }
+  if (isAbsolutePath(process.env.CODEX_HOME)) return pathApi(process.env.CODEX_HOME).join(process.env.CODEX_HOME, 'worktrees', 'discord');
   return null;
-}
-
-function isDescendant(root, candidate) {
-  if (!root || !candidate) return false;
-  const relative = path.relative(path.resolve(root), path.resolve(candidate));
-  return relative !== '' && relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
 }
 
 function projectMetadata(meta, sidebarEntry, previous) {
@@ -357,13 +409,13 @@ function worktreeMetadata(meta, worktreeRoot) {
   const candidatePath = stringOrNull(meta?.worktree_path ?? meta?.worktreePath) ??
     stringOrNull(Array.isArray(runtimeRoots) ? runtimeRoots[0] : null) ?? stringOrNull(meta?.cwd);
   const branch = stringOrNull(meta?.worktree_branch ?? meta?.worktreeBranch ?? meta?.git?.branch);
-  if (!branch?.startsWith('codex/discord-') || !isDescendant(worktreeRoot, candidatePath)) {
+  if (!branch?.startsWith('codex/discord-') || !isPathDescendant(worktreeRoot, candidatePath)) {
     return { worktreePath: null, worktreeBranch: null };
   }
-  return { worktreePath: path.resolve(candidatePath), worktreeBranch: branch };
+  return { worktreePath: pathApi(candidatePath).resolve(candidatePath), worktreeBranch: branch };
 }
 
-function buildRecord({ entries, middleSkipped, rolloutPath, offset, expectedThreadId, sidebarEntry, createdRecord, previous, nowMs, worktreeRoot, latestMapping, projects }) {
+function buildRecord({ entries, titleEntries, middleSkipped, rolloutPath, offset, expectedThreadId, sidebarEntry, createdRecord, previous, nowMs, worktreeRoot, latestMapping, projects }) {
   const metadataEntry = entries.find((entry) => entry?.type === 'session_meta' && entry?.payload);
   const meta = metadataEntry?.payload;
   if (!isUserRootSession(meta, sidebarEntry) && !isTrustedCreatedRoot(meta, createdRecord, expectedThreadId)) return null;
@@ -447,7 +499,7 @@ function buildRecord({ entries, middleSkipped, rolloutPath, offset, expectedThre
   const project = Array.isArray(projects) && projects.length > 0 ? inferredProject : explicitProject;
   const explicitlyProjectless = explicitProject.projectId == null && explicitProject.projectName === '无项目';
   const workspacePath = stringOrNull(meta?.cwd ?? createdRecord?.workspace?.cwd);
-  const workspaceName = workspacePath ? stringOrNull(path.win32.basename(workspacePath.replaceAll('/', '\\'))) : null;
+  const workspaceName = workspacePath ? stringOrNull(pathApi(workspacePath).basename(workspacePath)) : null;
   const displayProject = project.projectName ? project : {
     projectId: null,
     projectName: explicitlyProjectless ? '无项目' : workspaceName,
@@ -457,8 +509,7 @@ function buildRecord({ entries, middleSkipped, rolloutPath, offset, expectedThre
     threadId: String(meta.id),
     projectId: displayProject.projectId,
     projectName: displayProject.projectName,
-    taskName: stringOrNull(sidebarEntry?.thread_name ?? sidebarEntry?.threadName ?? sidebarEntry?.name) ??
-      stringOrNull(createdRecord?.taskName) ?? previous?.taskName ?? '未命名任务',
+    taskName: knownTaskName(sidebarEntry, createdRecord, previous) ?? firstInputTaskName(titleEntries),
     status,
     createdAt: isoTime(createdMs),
     lastActivityAt: isoTime(lastActivityMs),
@@ -477,14 +528,13 @@ function durableRecord(record) {
     .map((field) => [field, record[field]]));
 }
 
-function refreshedPreviousRecord(previous, sidebarEntry, latestMapping, projectOverride = null) {
+function refreshedPreviousRecord(previous, sidebarEntry, latestMapping, projectOverride = null, createdRecord = null) {
   const retained = durableRecord(previous);
   const sidebarCreatedMs = validTime(sidebarEntry?.created_at ?? sidebarEntry?.createdAt);
   const sidebarUpdatedMs = validTime(sidebarEntry?.updated_at ?? sidebarEntry?.updatedAt);
   const previousCreatedMs = validTime(retained.createdAt);
   const previousActivityMs = validTime(retained.lastActivityAt);
-  retained.taskName = stringOrNull(sidebarEntry?.thread_name ?? sidebarEntry?.threadName ?? sidebarEntry?.name) ??
-    retained.taskName ?? '未命名任务';
+  retained.taskName = knownTaskName(sidebarEntry, createdRecord, retained) ?? '未命名任务';
   const project = projectMetadata(null, sidebarEntry, retained);
   retained.projectId = projectOverride ? projectOverride.projectId : project.projectId;
   retained.projectName = projectOverride ? projectOverride.projectName : project.projectName;
@@ -558,17 +608,18 @@ export async function buildTaskIndex({
         projects.some((project) => (record?.projectId != null && String(project?.id ?? '') === String(record.projectId)) ||
           (record?.projectId == null && record?.projectName != null && String(project?.name ?? '') === String(record.projectName)));
       const hasStableProjectProvenance = projects.length === 0 || stableProject(previous) || stableProject(createdRecord);
-      if (previous && sidebarEntry && hasStableProjectProvenance &&
+      if (previous && sidebarEntry && hasStableProjectProvenance && knownTaskName(sidebarEntry, createdRecord, previous) &&
           path.resolve(String(previous.rolloutPath ?? '')) === path.resolve(rolloutPath) && Number(previous.offset) === offset) {
         const createdProject = stableProject(createdRecord)
           ? inferSavedProject({ projectId: createdRecord.projectId, projectName: createdRecord.projectName }, projects)
           : null;
-        recordsById.set(key, refreshedPreviousRecord(previous, sidebarEntry, mappings.get(key), createdProject));
+        recordsById.set(key, refreshedPreviousRecord(previous, sidebarEntry, mappings.get(key), createdProject, createdRecord));
         continue;
       }
       const parsed = await readBoundedEntries(rolloutPath, offset, limits, fileSystem, headRegion);
       const record = buildRecord({
         entries: parsed.entries,
+        titleEntries: parsed.titleEntries,
         middleSkipped: parsed.middleSkipped,
         rolloutPath,
         offset,
@@ -594,6 +645,8 @@ export async function buildTaskIndex({
           previous,
           sidebarEntry,
           mappings.get(identityKey(previous.threadId)),
+          null,
+          createdRecord,
         ));
       } else if (previous && sidebarEntry) {
         unsafePreviousKeys.add(identityKey(previous.threadId));
@@ -607,6 +660,9 @@ export async function buildTaskIndex({
     if (!previous) continue;
     const retained = durableRecord(previous);
     if (!stringOrNull(retained.threadId)) continue;
+    if (!knownTaskName(null, null, retained)) {
+      retained.taskName = knownTaskName(sidebarEntries.get(key), createdRoots.get(key), retained) ?? '未命名任务';
+    }
     recordsById.set(key, retained);
   }
 
@@ -669,8 +725,8 @@ export async function readTaskDetail(record, options = {}) {
     }
     if (entry?.type === 'event_msg') {
       if (payload.type === 'user_message' && !taskText) {
-        const candidate = cleanPageText(textValue(payload.message ?? payload.content));
-        if (candidate && isUserAuthoredMessage(payload, candidate)) taskText = candidate;
+        const candidate = getUserAuthoredMessageText(payload);
+        if (candidate) taskText = candidate;
         continue;
       }
       if (payload.type === 'agent_message') {
@@ -687,7 +743,7 @@ export async function readTaskDetail(record, options = {}) {
     if (entry?.type === 'response_item' && payload.type === 'message') {
       const role = String(payload.role ?? '').toLocaleLowerCase();
       const candidate = cleanPageText(textValue(payload.content));
-      if (role === 'user' && !taskText && candidate && isUserAuthoredMessage(payload, candidate)) taskText = candidate;
+      if (role === 'user' && !taskText) taskText = getUserAuthoredMessageText(payload);
       if (role === 'assistant' && candidate && (!payload.phase || payload.phase === 'final_answer')) resultText = candidate;
     }
   }

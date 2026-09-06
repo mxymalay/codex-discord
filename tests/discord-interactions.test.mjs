@@ -1792,6 +1792,25 @@ test('initial new-task modal reads only the non-refreshing project snapshot', as
   assert.deepEqual(calls, ['snapshot:project-1']);
 });
 
+test('new-task Astra ultra selection passes unchanged from command through modal to creation', async () => {
+  const { dependencies, responses } = makeDependencies();
+  const create = dependencies.createNewTaskOnce;
+  let creationInput;
+  dependencies.createNewTaskOnce = async (input) => {
+    creationInput = input;
+    return create(input);
+  };
+  const router = createInteractionRouter(dependencies);
+  await router.handle(commandInteraction('新建任务', {
+    项目: 'project-1', 模型: 'gpt-6-astra', 推理强度: 'ultra',
+  }));
+  assert.equal(responses[0].type, 9);
+  await router.handle(modalSubmit(responses[0].data.custom_id, '检查模型选择'));
+  assert.equal(creationInput.model, 'gpt-6-astra');
+  assert.equal(creationInput.effort, 'ultra');
+  assert.equal(creationInput.text, '检查模型选择');
+});
+
 test('modal submission defers before authoritative refresh and creation, passes persistence, and inserts immediately', async () => {
   const events = [];
   let creationInput;

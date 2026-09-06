@@ -56,7 +56,11 @@ function Get-LatestBotMessage {
 
 $originalRaw = [System.IO.File]::ReadAllText($configPath)
 $config = $originalRaw | ConvertFrom-Json
-$token = Unprotect-DiscordBotToken -Path ([string]$config.discordTokenPath)
+$tokenPath = [string]$config.discordTokenPath
+if (-not [System.IO.Path]::IsPathRooted($tokenPath)) {
+    $tokenPath = [System.IO.Path]::GetFullPath((Join-Path $toolDir $tokenPath))
+}
+$token = Unprotect-DiscordBotToken -Path $tokenPath
 
 try {
     $config.quotaNotifications = $false
@@ -98,7 +102,11 @@ $quotaNotification = [ordered]@{
 & $dispatcherPath ($quotaNotification | ConvertTo-Json -Depth 8 -Compress) -MobileOnly -SkipTaskNotification -SendQuotaStatus
 
 $restored = Get-Content -Raw -LiteralPath $configPath -Encoding UTF8 | ConvertFrom-Json
-$token = Unprotect-DiscordBotToken -Path ([string]$restored.discordTokenPath)
+$tokenPath = [string]$restored.discordTokenPath
+if (-not [System.IO.Path]::IsPathRooted($tokenPath)) {
+    $tokenPath = [System.IO.Path]::GetFullPath((Join-Path $toolDir $tokenPath))
+}
+$token = Unprotect-DiscordBotToken -Path $tokenPath
 try {
     $quotaMessage = Get-LatestBotMessage -ChannelId ([string]$restored.discordQuotaChannelId) -Token $token
     if ([string]$quotaMessage.author.id -ne [string]$restored.discordApplicationId -or [int]$quotaMessage.embeds[0].color -ne 3447003) {

@@ -58,6 +58,27 @@ function userMessage(text = '请检查 Discord 通知为什么漏发') {
   };
 }
 
+function goalContextMessage() {
+  return {
+    type: 'response_item',
+    payload: {
+      type: 'message', role: 'user',
+      content: [{ type: 'input_text', text: '<codex_internal_context source="goal">Continue the existing goal.</codex_internal_context>' }],
+      internal_chat_message_metadata_passthrough: { turn_id: turnId, content_item_kinds: ['goal.internal_context'] },
+    },
+  };
+}
+
+function taggedUserMessage(text) {
+  return {
+    type: 'response_item',
+    payload: {
+      type: 'message', role: 'user', content: [{ type: 'input_text', text }],
+      internal_chat_message_metadata_passthrough: { turn_id: turnId, content_item_kinds: ['user.text'] },
+    },
+  };
+}
+
 function taskComplete(message = '已经完成修复。') {
   return {
     timestamp: '2026-09-01T00:00:10.000Z',
@@ -737,6 +758,365 @@ test('keeps a failed fallback pending and retries it later', async () => {
   }
 });
 
+test('reconstructs current user response items without injected context, cross-turn text or mirrored duplicates', async () => {
+  const paths = await fixture();
+  const response = (texts, kinds, overrides = {}) => ({
+    type: 'response_item', payload: {
+      type: 'message', role: 'user', content: texts.map((text) => ({ type: 'input_text', text })),
+      ...(kinds ? { internal_chat_message_metadata_passthrough: { turn_id: turnId, content_item_kinds: kinds } } : {}),
+      ...overrides,
+    },
+  });
+  const entries = [
+    sessionMeta(), taskStarted(), turnContext('gpt-5.6-sol', 'high'),
+    response(['plugin context', 'environment context'], ['plugins.recommendations', 'environments.environment_context']),
+    response(['internal goal summary'], ['goal.internal_context']),
+    response(['<environment_context>unlabelled context</environment_context>']),
+    userMessage('<codex_internal_context>legacy injected context</codex_internal_context>'),
+    response(['other turn text'], ['user.text'], { internal_chat_message_metadata_passthrough: { turn_id: 'other-turn', content_item_kinds: ['user.text'] } }),
+    response(['developer text'], ['user.text'], {role:'developer'}),
+    response(['tool output'], ['user.text'], {role:'tool'}),
+    response(['assistant commentary'], ['user.text'], {role:'assistant', phase:'commentary'}),
+    response(['first real input'], ['user.text']), userMessage('first real input'),
+    response(['hidden context', 'second real input'], ['environments.environment_context', 'user.text']),
+    response(['first real input'], ['user.text']),
+    { type:'response_item', payload:{type:'message',role:'user',content:[{type:'input_image',image_url:'IMAGE-CANARY'},{type:'input_text',text:'latest real input'}],internal_chat_message_metadata_passthrough:{turn_id:turnId,content_item_kinds:['user.image','user.text']}} },
+    taskComplete('exact final assistant result'),
+    response(['later turn text'], ['user.text'], {internal_chat_message_metadata_passthrough:{turn_id:'later-turn',content_item_kinds:['user.text']}}),
+  ];
+  try {
+    await fs.writeFile(paths.rolloutPath, entries.map(jsonLine).join(''), 'utf8');
+    const state=createEmptyRolloutWatcherState();state.initialized=true;
+    const captured=[];
+    await pollRolloutCompletions({sessionsRoot:paths.sessionsRoot,state,nowMs:Date.parse('2026-09-01T00:00:20.000Z'),graceMs:0,retryMs:0,dispatchNotification:async(value)=>captured.push(value)});
+    assert.equal(captured.length,1);
+    assert.deepEqual(captured[0]['input-messages'], ['first real input','second real input','first real input','latest real input']);
+    assert.equal(captured[0]['last-assistant-message'],'exact final assistant result');
+    assert.equal(captured[0].model,'gpt-5.6-sol');
+    assert.equal(captured[0]['reasoning-effort'],'high');
+    assert.doesNotMatch(JSON.stringify(state), /first real input|latest real input|exact final assistant result/);
+  } finally { await fs.rm(paths.root,{recursive:true,force:true}); }
+});
+
+test('legacy and unlabelled response inputs preserve the last real message across repeated text', async () => {
+  const paths=await fixture();
+  const response=(text)=>({type:'response_item',payload:{type:'message',role:'user',content:[{type:'input_text',text}]}});
+  try {
+    await fs.writeFile(paths.rolloutPath,[sessionMeta(),taskStarted(),
+      response('<recommended_plugins>context</recommended_plugins>'),
+      userMessage('A'),response('A'),userMessage('B'),response('A'),taskComplete(),
+    ].map(jsonLine).join(''),'utf8');
+    const state=createEmptyRolloutWatcherState();state.initialized=true;
+    const captured=[];
+    await pollRolloutCompletions({sessionsRoot:paths.sessionsRoot,state,nowMs:Date.parse('2026-09-01T00:00:20.000Z'),graceMs:0,retryMs:0,dispatchNotification:async(value)=>captured.push(value)});
+    assert.deepEqual(captured[0]['input-messages'],['A','B','A']);
+  } finally { await fs.rm(paths.root,{recursive:true,force:true}); }
+});
+
+test('reconstructs exact tagged user inputs from compacted root turns without a task-started event', async (t) => {
+  for (const variant of ['two-text-messages', 'text-and-image']) {
+    await t.test(variant, async () => {
+      const paths = await fixture();
+      try {
+        const inherited = { ...sessionMeta(), payload: { ...sessionMeta().payload, id: 'inherited-child', thread_source: 'subagent', parent_thread_id: threadId } };
+        const inputs = variant === 'two-text-messages' ? [taggedUserMessage('first request'), taggedUserMessage('second request')] : [{
+          type: 'response_item', payload: { type: 'message', role: 'user',
+            content: [{ type: 'input_text', text: 'first text' }, { type: 'input_text', text: 'second text' }, { type: 'input_image', image_url: 'private-image-canary' }, { type: 'input_text', text: 'last text' }],
+            internal_chat_message_metadata_passthrough: { turn_id: turnId, content_item_kinds: ['user.text', 'user.text', 'user.image', 'user.text'] },
+          },
+        }];
+        await fs.writeFile(paths.rolloutPath, [inherited, sessionMeta(), { type: 'compacted', payload: {} }, { type: 'world_state', payload: {} },
+          turnContext(), ...inputs, taskComplete('compacted target result'),
+        ].map(jsonLine).join(''), 'utf8');
+        let state = createEmptyRolloutWatcherState(); state.initialized = true;
+        const captured = [];
+        for (let attempt = 0; attempt < 2; attempt++) {
+          await pollRolloutCompletions({ sessionsRoot: paths.sessionsRoot, state, nowMs: Date.parse('2026-09-01T00:00:20.000Z'), graceMs: 0, retryMs: 0,
+            dispatchNotification: async (notification) => captured.push(notification),
+          });
+          assert.equal(captured.length, 1);
+          assert.deepEqual(captured[0]['input-messages'], variant === 'two-text-messages' ? ['first request', 'second request'] : ['first text\nsecond text\nlast text']);
+          assert.equal(captured[0]['last-assistant-message'], 'compacted target result');
+          assert.equal(captured[0].model, 'gpt-5.6-sol');
+          assert.equal(captured[0]['reasoning-effort'], 'ultra');
+          assert.equal(state.suppressedInternalTurnCount, undefined);
+          assert.deepEqual(state.pending, {});
+          assert.doesNotMatch(JSON.stringify(state), /first request|last text|private-image-canary|compacted target result/);
+          state = JSON.parse(JSON.stringify(state));
+        }
+      } finally { await fs.rm(paths.root, { recursive: true, force: true }); }
+    });
+  }
+});
+
+test('later task starts preserve explicitly attributed inputs and their adjacent legacy mirrors', async (t) => {
+  for (const variant of ['tagged-before-start', 'legacy-mirror-promoted', 'same-text-after-boundary']) {
+    await t.test(variant, async () => {
+      const paths = await fixture();
+      try {
+        const first = variant === 'legacy-mirror-promoted' ? [taskStarted(), userMessage('first request'), taggedUserMessage('first request')] : [taggedUserMessage('first request')];
+        const nextText = variant === 'same-text-after-boundary' ? 'first request' : 'second request';
+        const mirrored = userMessage(nextText);
+        mirrored.payload.internal_chat_message_metadata_passthrough = { turn_id: turnId, content_item_kinds: ['user.text'] };
+        await fs.writeFile(paths.rolloutPath, [sessionMeta(), ...first,
+          { type: 'event_msg', payload: { type: 'task_started', turn_id: 'other-turn' } }, userMessage('unrelated untagged input'),
+          ...(variant === 'same-text-after-boundary' ? [mirrored] : [taggedUserMessage(nextText), mirrored]), taskComplete(),
+        ].map(jsonLine).join(''), 'utf8');
+        const state = createEmptyRolloutWatcherState(); state.initialized = true;
+        const captured = [];
+        await pollRolloutCompletions({ sessionsRoot: paths.sessionsRoot, state, nowMs: Date.parse('2026-09-01T00:00:20.000Z'), graceMs: 0, retryMs: 0,
+          dispatchNotification: async (notification) => captured.push(notification),
+        });
+        assert.equal(captured.length, 1);
+        assert.deepEqual(captured[0]['input-messages'], ['first request', nextText]);
+      } finally { await fs.rm(paths.root, { recursive: true, force: true }); }
+    });
+  }
+});
+
+test('later task starts retain every user input already attributed within the current root target span', async () => {
+  const paths = await fixture();
+  try {
+    await fs.writeFile(paths.rolloutPath, [sessionMeta(), taskStarted(), taggedUserMessage('first tagged request'),
+      userMessage('latest legacy request'), { type: 'event_msg', payload: { type: 'task_started', turn_id: 'other-turn' } },
+      userMessage('unrelated input'), taskComplete(),
+    ].map(jsonLine).join(''), 'utf8');
+    const state = createEmptyRolloutWatcherState(); state.initialized = true;
+    const captured = [];
+    await pollRolloutCompletions({ sessionsRoot: paths.sessionsRoot, state, nowMs: Date.parse('2026-09-01T00:00:20.000Z'), graceMs: 0, retryMs: 0,
+      dispatchNotification: async (notification) => captured.push(notification),
+    });
+    assert.equal(captured.length, 1);
+    assert.deepEqual(captured[0]['input-messages'], ['first tagged request', 'latest legacy request']);
+  } finally { await fs.rm(paths.root, { recursive: true, force: true }); }
+});
+
+test('explicit input recovery rejects wrong roots and ambiguous turn tags without weakening origin boundaries', async (t) => {
+  for (const variant of ['wrong-root', 'wrong-root-with-start', 'inherited-input-before-root', 'inherited-start-before-root', 'wrong-turn', 'conflicting-turn-tags', 'missing-tag', 'missing-tag-with-payload-id', 'discord-origin-without-start']) {
+    await t.test(variant, async () => {
+      const paths = await fixture();
+      try {
+        const input = taggedUserMessage('must not borrow this input');
+        if (variant === 'wrong-turn') input.payload.internal_chat_message_metadata_passthrough.turn_id = 'other-turn';
+        if (variant === 'conflicting-turn-tags') input.payload.turn_id = 'other-turn';
+        if (variant.startsWith('missing-tag')) delete input.payload.internal_chat_message_metadata_passthrough.turn_id;
+        if (variant === 'missing-tag-with-payload-id') input.payload.turn_id = turnId;
+        const wrongMeta = { ...sessionMeta(), payload: { ...sessionMeta().payload, id: 'other-root' } };
+        const entries = variant === 'inherited-input-before-root' ? [wrongMeta, taskStarted(), input, sessionMeta(), taskComplete()]
+          : variant === 'inherited-start-before-root' ? [wrongMeta, taskStarted(), sessionMeta(), userMessage('must not borrow this input'), taskComplete()]
+          : [variant.startsWith('wrong-root') ? wrongMeta : sessionMeta(), ...(variant === 'wrong-root-with-start' ? [taskStarted()] : []), input, taskComplete()];
+        const content = entries.map(jsonLine).join('');
+        await fs.writeFile(paths.rolloutPath, content, 'utf8');
+        const state = createEmptyRolloutWatcherState(); state.initialized = true;
+        state.files[path.resolve(paths.rolloutPath)] = { offset: Buffer.byteLength(content), threadId, cwd: sessionMeta().payload.cwd, activeTurnId: '', rootEligible: true };
+        state.pending[turnId] = { completedAtMs: Date.parse('2026-09-01T00:00:10.000Z'), lastAttemptAtMs: 0, rolloutPath: paths.rolloutPath, threadId, cwd: sessionMeta().payload.cwd };
+        const inboxState = createEmptyInboxState();
+        if (variant === 'discord-origin-without-start') inboxState.discordTurnOrigins[turnId] = {
+          threadId, guildId: '222222222222222222', channelId: '777777777777777777', source: 'slash',
+          createdAt: '2026-09-01T00:00:01.000Z', rolloutCursor: 0, deliveredEventIds: [], deliveryState: 'pending',
+        };
+        let dispatches = 0;
+        await pollRolloutCompletions({ sessionsRoot: paths.sessionsRoot, state, inboxState, persistInboxState: async () => {},
+          nowMs: Date.parse('2026-09-01T00:00:20.000Z'), graceMs: 0, retryMs: 0,
+          dispatchNotification: async (notification) => {
+            dispatches++;
+            assert.deepEqual(notification['input-messages'], []);
+            throw new Error('retain-ambiguous-explicit-input');
+          },
+        }).catch((error) => assert.match(error.message, /retain-ambiguous-explicit-input/));
+        assert.equal(Object.hasOwn(state.pending, turnId), true);
+        assert.equal(state.suppressedInternalTurnCount, undefined);
+        if (variant === 'discord-origin-without-start') {
+          assert.equal(dispatches, 0, 'input recovery must not bypass the existing exact origin terminal boundary');
+          assert.equal(inboxState.discordTurnOrigins[turnId].deliveryState, 'pending');
+        } else assert.equal(dispatches, 1);
+      } finally { await fs.rm(paths.root, { recursive: true, force: true }); }
+    });
+  }
+});
+
+test('one failed terminal dispatch preserves its retry while later completions are delivered and the error propagates', async () => {
+  const paths=await fixture();
+  const laterTurn='33333333-3333-4333-8333-333333333333';
+  try {
+    await fs.writeFile(paths.rolloutPath,[sessionMeta(),taskStarted(),userMessage('first'),taskComplete(),
+      {...taskStarted(),payload:{type:'task_started',turn_id:laterTurn}},userMessage('later'),
+      {...taskComplete(),timestamp:'2026-09-01T00:00:11.000Z',payload:{type:'task_complete',turn_id:laterTurn,last_agent_message:'later result'}},
+    ].map(jsonLine).join(''),'utf8');
+    const state=createEmptyRolloutWatcherState();state.initialized=true;
+    const attempts=[];
+    const failed=new Error('isolated-first-dispatch-failure');
+    await assert.rejects(()=>pollRolloutCompletions({sessionsRoot:paths.sessionsRoot,state,nowMs:Date.parse('2026-09-01T00:00:20.000Z'),graceMs:0,retryMs:10_000,
+      dispatchNotification:async(value)=>{attempts.push(value['turn-id']);if(value['turn-id']===turnId)throw failed;},
+    }),(error)=>error===failed);
+    assert.deepEqual(attempts,[turnId,laterTurn]);
+    assert.deepEqual(Object.keys(state.pending),[turnId]);
+    await pollRolloutCompletions({sessionsRoot:paths.sessionsRoot,state,nowMs:Date.parse('2026-09-01T00:00:21.000Z'),graceMs:0,retryMs:10_000,dispatchNotification:async()=>assert.fail('failed item retried before its deadline')});
+    await pollRolloutCompletions({sessionsRoot:paths.sessionsRoot,state,nowMs:Date.parse('2026-09-01T00:00:30.000Z'),graceMs:0,retryMs:10_000,dispatchNotification:async(value)=>attempts.push(value['turn-id'])});
+    assert.deepEqual(attempts,[turnId,laterTurn,turnId]);
+    assert.deepEqual(state.pending,{});
+  } finally { await fs.rm(paths.root,{recursive:true,force:true}); }
+});
+
+test('retires a proven inter-agent-only root turn without claiming a notification delivery', async () => {
+  const paths=await fixture();
+  try {
+    await fs.writeFile(paths.rolloutPath,[{...sessionMeta(),payload:{...sessionMeta().payload,id:'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',thread_source:'subagent',parent_thread_id:'inherited-parent'}},sessionMeta(),taskStarted(),
+      {type:'response_item',payload:{type:'message',role:'developer',content:[{type:'input_text',text:'internal environment'}]}},
+      {type:'inter_agent_communication_metadata',payload:{kind:'synthetic-agent-result'}},
+      {type:'response_item',payload:{type:'agent_message',message:'internal agent response'}},
+      taskComplete('internal automatic follow-up'),
+    ].map(jsonLine).join(''),'utf8');
+    const state=createEmptyRolloutWatcherState();state.initialized=true;
+    await pollRolloutCompletions({sessionsRoot:paths.sessionsRoot,state,nowMs:Date.parse('2026-09-01T00:00:20.000Z'),graceMs:0,retryMs:0,
+      dispatchNotification:async()=>assert.fail('internal-only completion must not be delivered'),
+    });
+    assert.deepEqual(state.pending,{});
+    assert.equal(state.suppressedInternalTurnCount,1);
+    assert.equal(state.lastSuppressedReason,'inter-agent-only-turn');
+    assert.doesNotMatch(JSON.stringify(state),/internal automatic follow-up|internal agent response/);
+  } finally { await fs.rm(paths.root,{recursive:true,force:true}); }
+});
+
+test('retires exact internal goal continuations with or without inter-agent results', async (t) => {
+  for (const withAgentResults of [true, false]) {
+    await t.test(withAgentResults ? 'with-agent-results' : 'without-agent-results', async () => {
+      const paths = await fixture();
+      try {
+        const agentResults = withAgentResults ? [
+          { type: 'inter_agent_communication_metadata', payload: { trigger_turn: turnId } },
+          { type: 'response_item', payload: { type: 'agent_message', message: 'internal result' } },
+        ] : [];
+        const earlierUserInput = { type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'unrelated earlier turn input' }], internal_chat_message_metadata_passthrough: { turn_id: 'earlier-turn', content_item_kinds: ['user.text'] } } };
+        await fs.writeFile(paths.rolloutPath, [sessionMeta(), earlierUserInput, taskStarted(), turnContext(), goalContextMessage(),
+          ...agentResults, taskComplete('internal goal continuation result'),
+        ].map(jsonLine).join(''), 'utf8');
+        let state = createEmptyRolloutWatcherState();
+        state.initialized = true;
+        for (let attempt = 0; attempt < 2; attempt++) {
+          await pollRolloutCompletions({
+            sessionsRoot: paths.sessionsRoot, state, nowMs: Date.parse('2026-09-01T00:00:20.000Z'), graceMs: 0, retryMs: 0,
+            dispatchNotification: async () => assert.fail('proven internal goal continuation must not reach the dispatcher'),
+          });
+          assert.deepEqual(state.pending, {});
+          assert.equal(state.suppressedInternalTurnCount, 1);
+          assert.equal(state.lastSuppressedReason, 'goal-internal-context-only-turn');
+          assert.doesNotMatch(JSON.stringify(state), /Continue the existing goal|internal goal continuation result/);
+          state = JSON.parse(JSON.stringify(state));
+        }
+      } finally { await fs.rm(paths.root, { recursive: true, force: true }); }
+    });
+  }
+});
+
+test('goal context cannot retire a real, ambiguous, damaged or Discord-origin turn', async (t) => {
+  const variants = [
+    'user-text', 'user-response-text', 'authored-goal-wrapper', 'image-only', 'legacy-user', 'unknown-user-shape', 'unknown-kind', 'mixed-kinds',
+    'kind-count-mismatch', 'non-text-content', 'no-metadata', 'no-turn-tag', 'wrong-turn-tag', 'conflicting-turn-tags',
+    'unwrapped', 'wrong-wrapper-source', 'extra-wrapper-attribute', 'text-outside-wrapper', 'multiple-wrappers',
+    'goal-evidence-other-turn', 'target-user-before-start', 'no-start', 'no-completion-id', 'interleaved-turn', 'duplicate-start',
+    'compacted', 'malformed-line', 'oversized-line', 'truncated-completion', 'conflicting-root', 'discord-origin',
+  ];
+  for (const variant of variants) {
+    await t.test(variant, async () => {
+      const paths = await fixture();
+      try {
+        const goal = goalContextMessage();
+        const metadata = goal.payload.internal_chat_message_metadata_passthrough;
+        const middle = [goal];
+        if (variant === 'user-text') middle.push(userMessage('actual user request'));
+        if (variant === 'user-response-text') middle.push({ type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'actual user request' }], internal_chat_message_metadata_passthrough: { turn_id: turnId, content_item_kinds: ['user.text'] } } });
+        if (variant === 'authored-goal-wrapper') metadata.content_item_kinds = ['user.text'];
+        if (variant === 'image-only') middle.push({ type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_image', image_url: 'image-canary' }], internal_chat_message_metadata_passthrough: { turn_id: turnId, content_item_kinds: ['user.image'] } } });
+        if (variant === 'legacy-user') middle.push(userMessage(''));
+        if (variant === 'unknown-user-shape') middle.push({ type: 'response_item', payload: { type: 'future_message', role: 'user', content: [] } });
+        if (variant === 'unknown-kind') metadata.content_item_kinds = ['goal.future_context'];
+        if (variant === 'mixed-kinds') { metadata.content_item_kinds.push('user.text'); goal.payload.content.push({ type: 'input_text', text: '' }); }
+        if (variant === 'kind-count-mismatch') metadata.content_item_kinds.push('goal.internal_context');
+        if (variant === 'non-text-content') goal.payload.content = [{ type: 'input_image', image_url: 'image-canary' }];
+        if (variant === 'no-metadata') delete goal.payload.internal_chat_message_metadata_passthrough;
+        if (variant === 'no-turn-tag') delete metadata.turn_id;
+        if (variant === 'wrong-turn-tag') metadata.turn_id = 'other-turn';
+        if (variant === 'conflicting-turn-tags') goal.payload.turn_id = 'other-turn';
+        if (variant === 'unwrapped') goal.payload.content[0].text = 'not a complete goal context';
+        if (variant === 'wrong-wrapper-source') goal.payload.content[0].text = goal.payload.content[0].text.replace('source="goal"', 'source="user"');
+        if (variant === 'extra-wrapper-attribute') goal.payload.content[0].text = goal.payload.content[0].text.replace('source="goal"', 'source="goal" extra="unknown"');
+        if (variant === 'text-outside-wrapper') goal.payload.content[0].text += ' actual user request';
+        if (variant === 'multiple-wrappers') goal.payload.content[0].text += goal.payload.content[0].text;
+        if (variant === 'interleaved-turn') middle.push({ type: 'event_msg', payload: { type: 'task_started', turn_id: 'other-turn' } });
+        if (variant === 'duplicate-start') middle.push(taskStarted());
+        if (variant === 'compacted') middle.push({ type: 'compacted', payload: {} });
+        if (variant === 'conflicting-root') middle.push({ ...sessionMeta(), payload: { ...sessionMeta().payload, id: 'other-root' } });
+        const complete = taskComplete();
+        if (variant === 'no-completion-id') delete complete.payload.turn_id;
+        const prefix = variant === 'goal-evidence-other-turn'
+          ? [sessionMeta(), { type: 'event_msg', payload: { type: 'task_started', turn_id: 'other-turn' } }, { ...goalContextMessage(), payload: { ...goalContextMessage().payload, internal_chat_message_metadata_passthrough: { turn_id: 'other-turn', content_item_kinds: ['goal.internal_context'] } } }, taskStarted()]
+          : [sessionMeta(), ...(variant === 'target-user-before-start' ? [{
+            type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'explicit target input before start' }], internal_chat_message_metadata_passthrough: { turn_id: turnId, content_item_kinds: ['user.text'] } },
+          }] : []), ...(variant === 'no-start' ? [] : [taskStarted()])];
+        const unreadable = variant === 'malformed-line' ? '{broken-json}\n' : variant === 'oversized-line' ? jsonLine({ type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'x'.repeat(8 * 1024 * 1024) }] } }) : '';
+        const content = [...prefix, ...(variant === 'goal-evidence-other-turn' ? [] : middle)].map(jsonLine).join('') + unreadable +
+          (variant === 'truncated-completion' ? JSON.stringify(complete).slice(0, -1) : jsonLine(complete));
+        await fs.writeFile(paths.rolloutPath, content, 'utf8');
+        const state = createEmptyRolloutWatcherState();
+        state.initialized = true;
+        state.files[path.resolve(paths.rolloutPath)] = { offset: Buffer.byteLength(content), threadId, cwd: sessionMeta().payload.cwd, activeTurnId: '', rootEligible: true };
+        state.pending[turnId] = { completedAtMs: Date.parse('2026-09-01T00:00:10.000Z'), lastAttemptAtMs: 0, rolloutPath: paths.rolloutPath, threadId, cwd: sessionMeta().payload.cwd };
+        const inboxState = createEmptyInboxState();
+        if (variant === 'discord-origin') inboxState.discordTurnOrigins[turnId] = {
+          threadId, guildId: '222222222222222222', channelId: '777777777777777777', source: 'slash',
+          createdAt: '2026-09-01T00:00:01.000Z', rolloutCursor: 0, deliveredEventIds: [], deliveryState: 'pending',
+        };
+        let dispatches = 0;
+        await pollRolloutCompletions({
+          sessionsRoot: paths.sessionsRoot, state, inboxState, persistInboxState: async () => {},
+          nowMs: Date.parse('2026-09-01T00:00:20.000Z'), graceMs: 0, retryMs: 0,
+          dispatchNotification: async (notification) => {
+            dispatches++;
+            if (['user-text', 'user-response-text'].includes(variant)) assert.deepEqual(notification['input-messages'], ['actual user request']);
+            if (variant === 'authored-goal-wrapper') assert.deepEqual(notification['input-messages'], [goal.payload.content[0].text]);
+            if (variant === 'discord-origin') assert.equal(notification['discord-origin-channel-id'], '777777777777777777');
+            throw new Error('retain-ambiguous-goal-turn');
+          },
+        }).catch((error) => assert.match(error.message, /retain-ambiguous-goal-turn/));
+        assert.equal(Object.hasOwn(state.pending, turnId), true);
+        assert.equal(state.suppressedInternalTurnCount, undefined);
+        if (['user-text', 'user-response-text', 'authored-goal-wrapper', 'discord-origin'].includes(variant)) assert.equal(dispatches, 1);
+        if (variant === 'discord-origin') assert.notEqual(inboxState.discordTurnOrigins[turnId].deliveryState, 'terminal-delivered');
+      } finally { await fs.rm(paths.root, { recursive: true, force: true }); }
+    });
+  }
+});
+
+test('empty input without complete proof of an internal-only turn remains retryable', async (t) => {
+  for(const variant of ['no-agent-evidence','other-turn-agent-evidence','user-message-present','malformed-line','oversized-line','compacted','interleaved-turn','missing-completion-id','conflicting-root-metadata']) {
+    await t.test(variant,async()=>{
+      const paths=await fixture();
+      try {
+        const evidence=[
+          {type:'inter_agent_communication_metadata',payload:{}},
+          {type:'response_item',payload:{type:'agent_message',message:'agent result'}},
+        ];
+        const middle=variant==='no-agent-evidence'?[]:evidence;
+        if(variant==='other-turn-agent-evidence'){evidence[0].payload.turn_id='other-turn';evidence[1].payload.internal_chat_message_metadata_passthrough={turn_id:'other-turn'};}
+        if(variant==='user-message-present')middle.push({type:'response_item',payload:{type:'message',role:'user',content:[{type:'input_image',image_url:'private-image'}],internal_chat_message_metadata_passthrough:{turn_id:turnId,content_item_kinds:['user.image']}}});
+        if(variant==='compacted')middle.push({type:'compacted',payload:{}});
+        if(variant==='interleaved-turn')middle.push({type:'event_msg',payload:{type:'task_started',turn_id:'other-turn'}});
+        if(variant==='conflicting-root-metadata')middle.push({...sessionMeta(),payload:{...sessionMeta().payload,id:'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'}});
+        const unreadableLine=variant==='malformed-line'?'{broken-json}\n':variant==='oversized-line'?jsonLine({type:'response_item',payload:{type:'message',role:'user',content:[{type:'input_text',text:'x'.repeat(8*1024*1024)}]}}):'';
+        const completed=taskComplete();if(variant==='missing-completion-id')delete completed.payload.turn_id;
+        await fs.writeFile(paths.rolloutPath,[sessionMeta(),taskStarted(),...middle].map(jsonLine).join('')+unreadableLine+jsonLine(completed),'utf8');
+        const state=createEmptyRolloutWatcherState();state.initialized=true;
+        await assert.rejects(()=>pollRolloutCompletions({sessionsRoot:paths.sessionsRoot,state,nowMs:Date.parse('2026-09-01T00:00:20.000Z'),graceMs:0,retryMs:0,
+          dispatchNotification:async(notification)=>{assert.deepEqual(notification['input-messages'],[]);throw new Error('ambiguous-empty-input-retry');},
+        }),/ambiguous-empty-input-retry/);
+        assert.equal(Object.hasOwn(state.pending,turnId),true);
+        assert.equal(state.suppressedInternalTurnCount,undefined);
+      } finally { await fs.rm(paths.root,{recursive:true,force:true}); }
+    });
+  }
+});
+
 test('reconstructs a huge pending rollout without a whole-file read', { concurrency: false }, async () => {
   const paths = await fixture();
   const largeThreadId = '33333333-3333-4333-8333-333333333333';
@@ -807,6 +1187,67 @@ test('an unreconstructable pending rollout does not block a later completion', a
     assert.equal(Object.hasOwn(state.pending, turnId), false);
   } finally {
     await fs.rm(paths.root, { recursive: true, force: true });
+  }
+});
+
+test('recovers an archived exact rollout locator and retains it when delivery must retry', async () => {
+  const paths=await fixture();
+  const archivedRoot=path.join(paths.root,'archived_sessions');
+  const archivedPath=path.join(archivedRoot,path.basename(paths.rolloutPath));
+  try {
+    await fs.writeFile(paths.rolloutPath,[sessionMeta(),taskStarted(),userMessage('archived user task'),taskComplete('archived final result')].map(jsonLine).join(''),'utf8');
+    const state=createEmptyRolloutWatcherState();await initializeRolloutWatcherState({sessionsRoot:paths.sessionsRoot,state});
+    state.pending[turnId]={completedAtMs:0,lastAttemptAtMs:0,rolloutPath:paths.rolloutPath,threadId,cwd:'C:\\workspace\\demo'};
+    await fs.mkdir(archivedRoot);await fs.rename(paths.rolloutPath,archivedPath);
+    const historicalEntries=[sessionMeta(),taskStarted(),userMessage('unrelated historical user task'),taskComplete('historical final result')];
+    historicalEntries[1].payload.turn_id='historical-turn';historicalEntries[3].payload.turn_id='historical-turn';
+    await fs.writeFile(path.join(archivedRoot,'rollout-unrelated-history.jsonl'),historicalEntries.map(jsonLine).join(''),'utf8');
+    let attempts=0;
+    const dispatchNotification=async(notification)=>{
+      attempts++;assert.equal(notification['turn-id'],turnId);assert.deepEqual(notification['input-messages'],['archived user task']);
+      assert.equal(notification['last-assistant-message'],'archived final result');
+      if(attempts===1)throw new Error('archived-delivery-retry');
+    };
+    await assert.rejects(()=>pollRolloutCompletions({sessionsRoot:paths.sessionsRoot,state,nowMs:Date.parse('2026-09-01T00:00:20.000Z'),graceMs:0,retryMs:0,dispatchNotification}),/archived-delivery-retry/);
+    assert.equal(state.pending[turnId].rolloutPath,archivedPath);
+    assert.doesNotMatch(JSON.stringify(state),/archived user task|archived final result/);
+    await pollRolloutCompletions({sessionsRoot:paths.sessionsRoot,state,nowMs:Date.parse('2026-09-01T00:00:30.000Z'),graceMs:0,retryMs:0,dispatchNotification});
+    assert.equal(attempts,2);assert.deepEqual(state.pending,{});
+    await pollRolloutCompletions({sessionsRoot:paths.sessionsRoot,state,nowMs:Date.parse('2026-09-01T00:00:40.000Z'),graceMs:0,retryMs:0,dispatchNotification});
+    assert.equal(attempts,2);assert.deepEqual(state.pending,{});
+  } finally { await fs.rm(paths.root,{recursive:true,force:true}); }
+});
+
+test('archive recovery refuses uncertain, mismatched and unowned locator candidates', async(t)=>{
+  for(const variant of ['different-basename','wrong-root','wrong-turn','ambiguous','valid-with-unreadable-candidate','outside-sessions','malformed','active-file-still-exists','symlink-archive-root','symlink-archive-directory']) {
+    await t.test(variant,async()=>{
+      const paths=await fixture();
+      const archivedRoot=path.join(paths.root,'archived_sessions');
+      try {
+        await fs.mkdir(archivedRoot);
+        let originalPath=paths.rolloutPath;
+        if(variant==='outside-sessions')originalPath=path.join(paths.root,'outside',path.basename(paths.rolloutPath));
+        const entries=[sessionMeta(),taskStarted(),userMessage(),taskComplete()];
+        if(variant==='wrong-root')entries[0].payload.id='aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+        if(variant==='wrong-turn'){entries[1].payload.turn_id='other-turn';entries[3].payload.turn_id='other-turn';}
+        const basename=variant==='different-basename'?'rollout-other-name.jsonl':path.basename(paths.rolloutPath);
+        const bytes=entries.map(jsonLine).join('')+(variant==='malformed'?'{broken-json}\n':'');
+        await fs.writeFile(path.join(archivedRoot,basename),bytes,'utf8');
+        if(variant.startsWith('symlink-archive')){
+          const outside=path.join(paths.root,'outside-archive');
+          await fs.rename(archivedRoot,outside);
+          if(variant==='symlink-archive-root')await fs.symlink(outside,archivedRoot,process.platform==='win32'?'junction':'dir');
+          else{await fs.mkdir(archivedRoot);await fs.symlink(outside,path.join(archivedRoot,'alias'),process.platform==='win32'?'junction':'dir');}
+        }
+        if(variant==='ambiguous'){await fs.mkdir(path.join(archivedRoot,'another'));await fs.writeFile(path.join(archivedRoot,'another',basename),bytes,'utf8');}
+        if(variant==='valid-with-unreadable-candidate'){await fs.mkdir(path.join(archivedRoot,'another'));await fs.writeFile(path.join(archivedRoot,'another',basename),'{broken-json}\n','utf8');}
+        if(variant==='active-file-still-exists')await fs.writeFile(originalPath,'{incomplete-original','utf8');
+        const state=createEmptyRolloutWatcherState();state.initialized=true;
+        state.pending[turnId]={completedAtMs:0,lastAttemptAtMs:0,rolloutPath:originalPath,threadId,cwd:''};
+        await pollRolloutCompletions({sessionsRoot:paths.sessionsRoot,state,nowMs:Date.parse('2026-09-01T00:00:20.000Z'),graceMs:0,retryMs:0,dispatchNotification:async()=>assert.fail('unverified archive must not deliver')});
+        assert.equal(state.pending[turnId].rolloutPath,originalPath);
+      } finally { await fs.rm(paths.root,{recursive:true,force:true}); }
+    });
   }
 });
 

@@ -20,6 +20,8 @@ $sourceFiles = @(
     'assets\codex-discord-control.png',
     'assets\codex-discord-control.ico',
     'discord-bridge-lib.mjs',
+    'discord-runtime-lib.mjs',
+    'discord-paths-lib.mjs',
     'discord-bridge-startup.ps1',
     'discord-bridge.mjs',
     'discord-commands-lib.mjs',
@@ -30,6 +32,10 @@ $sourceFiles = @(
     'discord-http.ps1',
     'discord-interactions.mjs',
     'discord-secret.ps1',
+    'discord-notification-control.ps1',
+    'discord-migration.ps1',
+    'export-discord-migration.ps1',
+    'import-discord-migration.ps1',
     'discord-state.ps1',
     'discord-task-create-lib.mjs',
     'discord-task-index-lib.mjs',
@@ -153,6 +159,65 @@ if (process.env.CODEX_DEPLOY_TEST_FAIL_REGISTRATION === '__ROLE__') process.exit
 '@.Replace('__ROLE__', $Role)
 }
 
+function Assert-BoundedRegistrationProcess {
+    param(
+        [Parameter(Mandatory)][string]$Mode,
+        [Parameter(Mandatory)][string]$BridgePath,
+        [Parameter(Mandatory)][string]$ArtifactRoot
+    )
+    New-Item -ItemType Directory -Path $ArtifactRoot -Force | Out-Null
+    $actionPath = Join-Path $ArtifactRoot 'actions.txt'
+    $pidPath = Join-Path $ArtifactRoot 'pids.txt'
+    $testEnvironment = @{
+        CODEX_DEPLOY_TEST_ACTION_PATH = $actionPath
+        CODEX_DEPLOY_TEST_REMOTE_PATH = $null
+        CODEX_DEPLOY_TEST_PID_PATH = $pidPath
+        CODEX_DEPLOY_TEST_REGISTRATION_MODE = $Mode
+        CODEX_DEPLOY_TEST_OUTPUT_SENTINEL = 'DO-NOT-LEAK-REGISTRATION-OUTPUT'
+    }
+    $savedEnvironment = @{}
+    foreach ($name in $testEnvironment.Keys) {
+        $savedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+    }
+    try {
+        foreach ($name in $testEnvironment.Keys) {
+            [Environment]::SetEnvironmentVariable($name, $testEnvironment[$name], 'Process')
+        }
+        $nodePath = (Get-Command node -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+        # Time only the production process runner, independently of stage checks
+        # and the separate processes needed for deployment and rollback.
+        $processClock = [System.Diagnostics.Stopwatch]::StartNew()
+        try { $result = [CodexDeployBoundedProcess]::Run($nodePath, $BridgePath, 1400, 4096) }
+        finally { $processClock.Stop() }
+        Assert-True ($processClock.ElapsedMilliseconds -lt 5000) "bounded $Mode process exceeded its direct deadline tolerance ($($processClock.ElapsedMilliseconds)ms)"
+        Assert-True (-not $result.Success) "bounded $Mode process unexpectedly succeeded"
+        if ($Mode -in @('huge-stdout-new','huge-stderr-new')) {
+            Assert-True $result.OutputLimitExceeded "bounded $Mode process did not enforce its output cap"
+        } else {
+            Assert-True $result.TimedOut "bounded $Mode process did not enforce its deadline"
+        }
+        $expectedActions = if ($Mode -eq 'slow-retry-new') {
+            'register:new,register:synthetic-429-long-retry'
+        } else { 'register:new' }
+        Assert-True ((@(Get-Content -LiteralPath $actionPath) -join ',') -eq $expectedActions) "bounded $Mode process did not reach its fault fixture"
+        if ($Mode -eq 'hang-new') {
+            $processIds = @(Get-Content -LiteralPath $pidPath)
+            Assert-True ($processIds.Count -eq 2) 'direct bounded registration did not record its parent and descendant'
+            foreach ($pidText in $processIds) {
+                $processId = 0
+                Assert-True ([int]::TryParse($pidText, [ref]$processId)) 'direct bounded registration recorded an invalid process id'
+                Assert-True ($null -eq (Get-Process -Id $processId -ErrorAction SilentlyContinue)) 'direct bounded registration left a process-tree member alive'
+            }
+        }
+        Write-Output "PASS: bounded $Mode process ($($processClock.ElapsedMilliseconds)ms; configured deadline 1400ms)"
+    }
+    finally {
+        foreach ($name in $savedEnvironment.Keys) {
+            [Environment]::SetEnvironmentVariable($name, $savedEnvironment[$name], 'Process')
+        }
+    }
+}
+
 function Install-IsolatedDeploySource {
     param([Parameter(Mandatory)][string]$Destination)
     Copy-DeploymentSource -Destination $Destination
@@ -261,6 +326,75 @@ function Assert-DirectoryUnchanged {
     }
 }
 
+function Test-StoppedDeployNotificationRestoration {
+    # Exercise the actual restoration and notification-control functions while replacing only
+    # Windows process/task boundaries. This also runs independently on macOS during review.
+    $parseTokens = $null; $parseErrors = $null
+    $deployAst = [Management.Automation.Language.Parser]::ParseFile($deployScript, [ref]$parseTokens, [ref]$parseErrors)
+    Assert-True ($parseErrors.Count -eq 0) 'Deployment script could not be parsed for restoration regression'
+    foreach ($name in @('Test-DeployBridgeStateEqual', 'Restore-DeployBridgeState')) {
+        $definition = $deployAst.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name }, $true)
+        Assert-True ($null -ne $definition) "Missing deployment function: $name"
+        . ([scriptblock]::Create($definition.Extent.Text))
+    }
+    . (Join-Path $sourceRoot 'codex-control-lib.ps1')
+    function Invoke-DeployControl {
+        param($PowerShellPath, $ControlPath, $Action)
+        $result = Invoke-CodexBridgeServiceAction -Action $Action -ToolDir $fixtureDirectory -Operations $fixtureOperations -PollAttempts 1 -PollMilliseconds 0
+        if (-not $result.ok) { throw "control action failed: $Action" }
+        return $result
+    }
+    function Invoke-DeployServiceProbe {
+        param($PowerShellPath, $ProbePath, $Action, $ToolDir)
+        Assert-True ($Action -eq 'status') 'Restoration unexpectedly used the staged action fallback'
+        $status = Get-CodexBridgeServiceStatus -Operations $fixtureOperations -ToolDir $ToolDir
+        return [pscustomobject]@{ok=$status.ok;service=[pscustomobject]@{
+            taskInstalled=$status.taskInstalled; autoStartEnabled=$status.autoStartEnabled
+            taskRunning=$status.taskRunning; running=$status.running; mode='unknown'
+        }}
+    }
+    foreach ($installed in @($true, $false)) {
+        $fixtureDirectory = Join-Path $testRoot "stopped notification regression $installed"
+        [void][IO.Directory]::CreateDirectory($fixtureDirectory)
+        $fixtureControl = Join-Path $fixtureDirectory 'codex-control.ps1'
+        [IO.File]::WriteAllText($fixtureControl, '# All task boundaries are injected by this test.')
+        $fixtureConfig = Join-Path $fixtureDirectory 'config.json'
+        $beforeJson = '{"enabled":true,"previousNotify":["synthetic-previous-notifier","--keep"],"nested":{"value":[1,"two",true]},"huge":9007199254740993,"exponent":1e400,"negativeZero":-0}'
+        [IO.File]::WriteAllText($fixtureConfig, $beforeJson)
+        $fixtureToken = Join-Path $fixtureDirectory 'discord-token.dpapi'
+        [IO.File]::WriteAllBytes($fixtureToken, [byte[]](0,255,1,22))
+        $fixtureOperations = @{
+            GetTask = { [pscustomobject]@{installed=$installed; enabled=$false; running=$false; definitionCurrent=$true} }.GetNewClosure()
+            GetRuntime = { $null }
+            StopTask = { throw 'Already stopped task should not be stopped again' }
+            InstallTask = { throw 'Stopped deployment must never create a task' }
+            EnableTask = { throw 'Stopped deployment must preserve disabled startup' }
+            StartTask = { throw 'Stopped deployment must not start a task' }
+            StartDetached = { throw 'Stopped deployment must not start a bridge' }
+        }
+        $expected = [pscustomobject]@{taskInstalled=$installed;autoStartEnabled=$false;taskRunning=$false;running=$false;mode='unknown'}
+        $restored = Restore-DeployBridgeState -PowerShellPath 'unused' -ProbePath 'unused' -ToolDir $fixtureDirectory -Expected $expected -ControlPath $fixtureControl
+        $before = [Text.Json.JsonDocument]::Parse($beforeJson)
+        $after = [Text.Json.JsonDocument]::Parse([IO.File]::ReadAllText($fixtureConfig))
+        try {
+            Assert-True ($after.RootElement.GetProperty('enabled').ValueKind -eq [Text.Json.JsonValueKind]::False) "Stopped deployment left legacy hook notifications enabled (taskInstalled=$installed)"
+            foreach ($property in $before.RootElement.EnumerateObject()) {
+                if ($property.Name -ceq 'enabled') { continue }
+                Assert-True ($after.RootElement.GetProperty($property.Name).GetRawText() -ceq $property.Value.GetRawText()) "Stopped deployment changed unrelated configuration: $($property.Name)"
+            }
+        } finally { $before.Dispose(); $after.Dispose() }
+        Assert-True ((Get-BytesHex $fixtureToken) -ceq '00FF0116') 'Stopped deployment changed the encrypted token'
+        Assert-True (Test-DeployBridgeStateEqual -Actual $restored.service -Expected $expected) 'Stopped deployment changed task existence or startup preference'
+        # A malformed config must produce a failed update, never claim that notifications stopped.
+        [IO.File]::WriteAllText($fixtureConfig, '{broken')
+        $failed = $false
+        try { [void](Restore-DeployBridgeState -PowerShellPath 'unused' -ProbePath 'unused' -ToolDir $fixtureDirectory -Expected $expected -ControlPath $fixtureControl) }
+        catch { $failed = $true }
+        Assert-True $failed 'Stopped deployment ignored a notification configuration failure'
+    }
+    Write-Output 'PASS: stopped deployment mutes legacy hooks while preserving configuration, token and task preferences'
+}
+
 function Get-TestShortPath {
     param([Parameter(Mandatory)][string]$Path)
 
@@ -284,6 +418,7 @@ public static class CodexDeployTestPathNative {
 try {
     Assert-True (Test-Path -LiteralPath $deployScript -PathType Leaf) 'deploy.ps1 is missing'
     New-Item -ItemType Directory -Path $testRoot -Force | Out-Null
+    Test-StoppedDeployNotificationRestoration
 
     foreach ($relativePath in $sourceFiles) {
         Assert-True (Test-Path -LiteralPath (Join-Path $sourceRoot $relativePath) -PathType Leaf) "deployment source is missing: $relativePath"
@@ -748,11 +883,11 @@ try {
     Install-IsolatedDeploySource -Destination $nonSkipSource
 
     $guardCases = @(
-        [pscustomobject]@{Name='absent'; Initial=@{exists=$false;trusted=$true;enabled=$false;running=$false}; Expected=@('guard:status','probe:status','install:shortcut','register:new','probe:status','guard:status')},
-        [pscustomobject]@{Name='enabled running auto restart'; Initial=@{exists=$true;trusted=$true;enabled=$true;running=$true;autoRestartWhenEnabled=$true}; Expected=@('guard:status','guard:disable','guard:stop','guard:status','probe:status','install:shortcut','register:new','probe:status','guard:status','guard:enable','guard:start','guard:status')},
-        [pscustomobject]@{Name='enabled stopped'; Initial=@{exists=$true;trusted=$true;enabled=$true;running=$false}; Expected=@('guard:status','guard:disable','guard:stop','guard:status','probe:status','install:shortcut','register:new','probe:status','guard:status','guard:status','guard:enable','guard:status')},
-        [pscustomobject]@{Name='disabled running'; Initial=@{exists=$true;trusted=$true;enabled=$false;running=$true}; Expected=@('guard:status','guard:disable','guard:stop','guard:status','probe:status','install:shortcut','register:new','probe:status','guard:status','guard:enable','guard:start','guard:disable','guard:status')},
-        [pscustomobject]@{Name='disabled stopped'; Initial=@{exists=$true;trusted=$true;enabled=$false;running=$false}; Expected=@('guard:status','guard:disable','guard:stop','guard:status','probe:status','install:shortcut','register:new','probe:status','guard:status','guard:status')}
+        [pscustomobject]@{Name='absent'; Initial=@{exists=$false;trusted=$true;enabled=$false;running=$false}; Expected=@('guard:status','probe:status','install:shortcut','register:new','control:new:stop-temporary','probe:status','guard:status')},
+        [pscustomobject]@{Name='enabled running auto restart'; Initial=@{exists=$true;trusted=$true;enabled=$true;running=$true;autoRestartWhenEnabled=$true}; Expected=@('guard:status','guard:disable','guard:stop','guard:status','probe:status','install:shortcut','register:new','control:new:stop-temporary','probe:status','guard:status','guard:enable','guard:start','guard:status')},
+        [pscustomobject]@{Name='enabled stopped'; Initial=@{exists=$true;trusted=$true;enabled=$true;running=$false}; Expected=@('guard:status','guard:disable','guard:stop','guard:status','probe:status','install:shortcut','register:new','control:new:stop-temporary','probe:status','guard:status','guard:status','guard:enable','guard:status')},
+        [pscustomobject]@{Name='disabled running'; Initial=@{exists=$true;trusted=$true;enabled=$false;running=$true}; Expected=@('guard:status','guard:disable','guard:stop','guard:status','probe:status','install:shortcut','register:new','control:new:stop-temporary','probe:status','guard:status','guard:enable','guard:start','guard:disable','guard:status')},
+        [pscustomobject]@{Name='disabled stopped'; Initial=@{exists=$true;trusted=$true;enabled=$false;running=$false}; Expected=@('guard:status','guard:disable','guard:stop','guard:status','probe:status','install:shortcut','register:new','control:new:stop-temporary','probe:status','guard:status','guard:status')}
     )
     foreach ($case in $guardCases) {
         $caseLive = Join-Path $testRoot ("guard $($case.Name) live")
@@ -860,9 +995,9 @@ try {
     $serviceCases = @(
         [pscustomobject]@{ Name='scheduled'; Initial=@{taskInstalled=$true;autoStartEnabled=$true;taskRunning=$true;running=$true;mode='scheduled'}; Expected=@('probe:status','probe:stop-temporary','install:shortcut','register:new','control:new:enable-long-term','probe:status'); Installed=$true; TaskRunning=$true; Running=$true; AutoStart=$true; Mode='scheduled' },
         [pscustomobject]@{ Name='enabled stopped'; Initial=@{taskInstalled=$true;autoStartEnabled=$true;taskRunning=$false;running=$false;mode='unknown'}; Expected=@('probe:status','install:shortcut','register:new','control:new:enable-long-term','control:new:stop-temporary','probe:status'); Installed=$true; TaskRunning=$false; Running=$false; AutoStart=$true; Mode='unknown' },
-        [pscustomobject]@{ Name='disabled'; Initial=@{taskInstalled=$true;autoStartEnabled=$false;taskRunning=$false;running=$false;mode='unknown'}; Expected=@('probe:status','install:shortcut','register:new','probe:status'); Installed=$true; TaskRunning=$false; Running=$false; AutoStart=$false; Mode='unknown' },
+        [pscustomobject]@{ Name='disabled'; Initial=@{taskInstalled=$true;autoStartEnabled=$false;taskRunning=$false;running=$false;mode='unknown'}; Expected=@('probe:status','install:shortcut','register:new','control:new:stop-temporary','probe:status'); Installed=$true; TaskRunning=$false; Running=$false; AutoStart=$false; Mode='unknown' },
         [pscustomobject]@{ Name='temporary'; Initial=@{taskInstalled=$true;autoStartEnabled=$false;taskRunning=$false;running=$true;mode='temporary'}; Expected=@('probe:status','probe:stop-temporary','install:shortcut','register:new','control:new:start-temporary','probe:status'); Installed=$true; TaskRunning=$false; Running=$true; AutoStart=$false; Mode='temporary' },
-        [pscustomobject]@{ Name='no task'; Initial=@{taskInstalled=$false;autoStartEnabled=$false;taskRunning=$false;running=$false;mode='unknown'}; Expected=@('probe:status','install:shortcut','register:new','probe:status'); Installed=$false; TaskRunning=$false; Running=$false; AutoStart=$false; Mode='unknown' }
+        [pscustomobject]@{ Name='no task'; Initial=@{taskInstalled=$false;autoStartEnabled=$false;taskRunning=$false;running=$false;mode='unknown'}; Expected=@('probe:status','install:shortcut','register:new','control:new:stop-temporary','probe:status'); Installed=$false; TaskRunning=$false; Running=$false; AutoStart=$false; Mode='unknown' }
     )
     foreach ($case in $serviceCases) {
         $caseLive = Join-Path $testRoot ("non skip $($case.Name) live")
@@ -1067,6 +1202,7 @@ try {
     foreach ($registrationMode in @('hang-new','huge-stdout-new','huge-stderr-new','slow-retry-new')) {
         $boundedSource = Join-Path $testRoot ("bounded $registrationMode source")
         Install-IsolatedDeploySource -Destination $boundedSource
+        Assert-BoundedRegistrationProcess -Mode $registrationMode -BridgePath (Join-Path $boundedSource 'discord-bridge.mjs') -ArtifactRoot (Join-Path $testRoot "bounded $registrationMode process")
         $boundedLive = Join-Path $testRoot ("bounded $registrationMode live")
         $boundedDesktop = Join-Path $testRoot ("bounded $registrationMode Desktop")
         New-Item -ItemType Directory -Path $boundedLive,$boundedDesktop -Force | Out-Null
@@ -1111,9 +1247,11 @@ try {
             Remove-Item Env:CODEX_DEPLOY_TEST_OUTPUT_SENTINEL -ErrorAction SilentlyContinue
         }
         Assert-True ($boundedError -eq 'Discord command registration failed') "bounded $registrationMode registration did not preserve the fixed primary error"
-        # Registration itself is capped at 1.4s; the larger outer bound also includes the
-        # intentionally separate old-command, bridge, shortcut, file, and Guard compensations.
-        Assert-True ($clock.ElapsedMilliseconds -lt 30000) "bounded $registrationMode registration plus full recovery exceeded its outer bound ($($clock.ElapsedMilliseconds)ms)"
+        # The direct test above checks the 1.4s registration budget within a 5s tolerance.
+        # This whole transaction also copies and verifies the stage and backups, and
+        # launches separate old-command, bridge, shortcut, file, and Guard compensations.
+        # Those operations exceeded 30s on the Windows CI runner even with bounded registration.
+        Assert-True ($clock.ElapsedMilliseconds -lt 120000) "bounded $registrationMode deployment plus full recovery exceeded its transaction bound ($($clock.ElapsedMilliseconds)ms)"
         Assert-True (-not (($boundedText -join "`n").Contains($secretSentinel))) "bounded $registrationMode registration leaked child output"
         Assert-True ((Get-Content -Raw -LiteralPath $boundedRemote) -eq 'old') "bounded $registrationMode rollback did not restore remote Guild commands"
         $boundedRegistrationActions = @(Get-Content -LiteralPath $boundedActions | Where-Object { $_ -like 'register:*' })

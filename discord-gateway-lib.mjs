@@ -154,6 +154,11 @@ export function createGatewayClient({
       setState('ready', null);
       return;
     }
+    // A successful session resume finishes with RESUMED instead of another READY.
+    if (frame.t === 'RESUMED' && status.sessionId !== null && sequence !== null) {
+      setState('ready', null);
+      return;
+    }
     publish();
     if (frame.t === 'INTERACTION_CREATE' && typeof frame.d?.id === 'string' && rememberInteraction(frame.d.id)) {
       const interaction = frame.d;

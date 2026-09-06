@@ -17,6 +17,7 @@ import {
   recordTaskCreationReceiptOutcome,
   recoverInterruptedTaskCreations,
   resolveProjectSelection,
+  runGitWithSpawn,
   startNewCodexTask,
 } from '../discord-task-create-lib.mjs';
 
@@ -134,8 +135,9 @@ function fakeFileSystem({
   nonDirectoryRoots = [],
   inaccessibleMarkers = [],
 } = {}) {
-  const normalize = (value) => path.resolve(value).toLocaleLowerCase();
-  const gitMarkers = new Set(gitRoots.map((root) => normalize(path.join(root, '.git'))));
+  const api = (value) => /^[A-Za-z]:|^\\/u.test(value) ? path.win32 : path.posix;
+  const normalize = (value) => api(value) === path.win32 ? api(value).resolve(value).toLowerCase() : api(value).resolve(value);
+  const gitMarkers = new Set(gitRoots.map((root) => normalize(api(root).join(root, '.git'))));
   const missing = new Set(missingRoots.map(normalize));
   const nonDirectories = new Set(nonDirectoryRoots.map(normalize));
   const inaccessible = new Set(inaccessibleMarkers.map(normalize));
@@ -411,7 +413,7 @@ test('resolves the fixed projectless selection without creating its expanded dir
       kind: 'projectless',
       projectId: null,
       projectName: '无项目',
-      roots: [path.win32.join(root, 'Documents', 'Codex', 'Discord Tasks')],
+      roots: [path.join(root, 'Documents', 'Codex', 'Discord Tasks')],
     });
     await assert.rejects(() => fs.stat(missing), { code: 'ENOENT' });
   } finally {
@@ -790,7 +792,7 @@ test('starts a durable thread before its first turn with exact workspace metadat
   });
   assert.equal(result.threadId, 'thread-1');
   assert.equal(result.turnId, 'turn-1');
-  assert.equal(result.taskName, '生成中');
+  assert.equal(result.taskName, '检查支付流程');
   assert.equal(result.workspace.cwd, 'C:\\repo');
   assert.equal(typeof result.close, 'function');
   assert.equal(typeof result.cancel, 'function');
@@ -813,6 +815,43 @@ test('uses an explicit null project ID for projectless durable threads', async (
   assert.equal(messages[2].params.projectId, null);
   assert.equal(result.taskName, 'Named');
   await result.completion;
+});
+
+test('unnamed new tasks use a compact input title without another model or naming request', async (t) => {
+  for (const [text, expected] of [
+    ['  检查\n 支付\t流程  ', '检查 支付 流程'],
+    ['a'.repeat(29) + '😀😀', 'a'.repeat(29) + '😀…'],
+    ['😀'.repeat(30), '😀'.repeat(30)],
+    [' \n\t', '未命名任务'],
+  ]) {
+    await t.test(expected, async () => {
+      const methods = [];
+      const result = await startNewCodexTask({
+        selection: { kind: 'projectless', projectId: null },
+        workspace: { mode: 'projectless', cwd: 'C:\\tasks', runtimeWorkspaceRoots: ['C:\\tasks'] },
+        text, interactionId: 'title-test', codexPath: 'codex', processCwd: 'C:\\tasks',
+        clientFactory: () => fakeAppServer(methods, {
+          'thread/start': { thread: { id: 'thread-title', name: null } },
+          'turn/start': { turn: { id: 'turn-title' } },
+        }),
+      });
+      await result.completion;
+      assert.equal(result.taskName, expected);
+      assert.deepEqual(methods, ['initialize', 'initialized', 'thread/start', 'turn/start', 'close']);
+    });
+  }
+});
+
+test('a failed first turn keeps its input-derived title', async () => {
+  await assert.rejects(() => startNewCodexTask({
+    selection: { kind: 'projectless', projectId: null },
+    workspace: { mode: 'projectless', cwd: 'C:\\tasks', runtimeWorkspaceRoots: ['C:\\tasks'] },
+    text: '检查支付流程', interactionId: 'failed-title', codexPath: 'codex', processCwd: 'C:\\tasks',
+    clientFactory: () => fakeAppServer([], {
+      'thread/start': { thread: { id: 'thread-title', name: null } },
+      'turn/start': new Error('first turn unavailable'),
+    }),
+  }), (error) => error.taskName === '检查支付流程');
 });
 
 test('persists each creation state before the corresponding external mutation and deduplicates the Interaction', async () => {
@@ -1908,4 +1947,71 @@ test('Windows repository and worktree identities compare case-insensitively duri
   });
   assert.equal(result[0].cleaned, true);
   assert.equal(calls.filter(({ args }) => args.includes('remove') || args.includes('-D')).length, 2);
+});
+
+test('projectless selection preserves POSIX paths and expands native home forms', () => {
+  const previous = process.env.HOME;
+  const previousProfile = process.env.USERPROFILE;
+  process.env.HOME = '/Users/operator';
+  process.env.USERPROFILE = '/Users/operator';
+  try {
+    for (const configured of ['/Users/operator/Documents/Tasks', '$HOME/Documents/Tasks', '${HOME}/Documents/Tasks', '~/Documents/Tasks']) {
+      const selected = resolveProjectSelection({ selectionId: NO_PROJECT, projectlessRoot: configured });
+      assert.deepEqual(selected.roots, ['/Users/operator/Documents/Tasks']);
+    }
+  } finally {
+    if (previous === undefined) delete process.env.HOME;
+    else process.env.HOME = previous;
+    if (previousProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousProfile;
+  }
+});
+
+test('POSIX Git workspaces create a real worktree and recover its exact branch before thread creation', async () => {
+  const temporary = await fs.mkdtemp(path.join(os.tmpdir(), 'discord-native-worktree-'));
+  const root = await fs.realpath(temporary);
+  const repositoryRoot = path.join(root, 'Source Repo');
+  const worktreeRoot = path.join(root, 'Managed Worktrees');
+  try {
+    await fs.mkdir(repositoryRoot);
+    await runGitWithSpawn({ args: ['init', repositoryRoot] });
+    await runGitWithSpawn({ args: ['-C', repositoryRoot, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '--allow-empty', '-m', 'Initial'] });
+    const workspace = await prepareTaskWorkspace({
+      selection: { kind: 'project', roots: [repositoryRoot] }, worktreeRoot, operationId: 'native1',
+    });
+    assert.equal(workspace.worktreePath, path.join(worktreeRoot, 'native1'));
+    assert.equal((await fs.stat(path.join(workspace.worktreePath, '.git'))).isFile(), true);
+    const { cleanupBeforeThreadStart: _cleanup, ...persistentWorkspace } = workspace;
+    const state = { createdTasksByInteraction: { native1: { status: 'workspace-ready', workspace: persistentWorkspace } } };
+    const recovered = await recoverInterruptedTaskCreations({ state, worktreeRoot, persistState: async () => {} });
+    assert.equal(recovered[0].cleaned, true);
+    await assert.rejects(fs.access(workspace.worktreePath), { code: 'ENOENT' });
+    const branches = await runGitWithSpawn({ args: ['-C', repositoryRoot, 'branch', '--list', workspace.branchName] });
+    assert.equal(branches.stdout.trim(), '');
+  } finally {
+    await fs.rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test('POSIX cleanup rejects worktree and repository names that only match after case folding', async () => {
+  for (const variant of ['configured-root', 'repository', 'worktree']) {
+    const workspace = generatedWorkspace('posixcase1', {
+      worktreePath: '/Users/operator/Worktrees/posixcase1',
+      cwd: '/Users/operator/Worktrees/posixcase1',
+      sourceRoot: '/Users/operator/Repo', repositoryRoot: '/Users/operator/Repo',
+    });
+    const calls = [];
+    const state = { createdTasksByInteraction: { posixcase1: { status: 'workspace-ready', workspace } } };
+    const result = await recoverInterruptedTaskCreations({
+      state,
+      worktreeRoot: variant === 'configured-root' ? '/Users/operator/worktrees' : '/Users/operator/Worktrees',
+      persistState: async () => {},
+      gitRunner: fakeGitRunner(calls, {
+        repositoryRoot: variant === 'repository' ? '/Users/operator/repo' : workspace.repositoryRoot,
+        worktrees: [{ path: variant === 'worktree' ? '/Users/operator/Worktrees/POSIXCASE1' : workspace.worktreePath, branch: workspace.branchName }],
+      }),
+    });
+    assert.equal(result[0].cleaned, false, variant);
+    assert.equal(calls.some(({ args }) => args.includes('remove') || args.includes('-D')), false, variant);
+  }
 });

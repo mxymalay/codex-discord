@@ -226,7 +226,7 @@ function Get-DiscordBridgeTaskDefinition {
     $fullToolDir = [System.IO.Path]::GetFullPath($ToolDir)
     return [pscustomobject][ordered]@{
         TaskName = 'Codex Discord Bridge'
-        Execute = Join-Path $fullToolDir 'CodexDiscordControl.exe'
+        Execute = [System.IO.Path]::Combine($fullToolDir, 'CodexDiscordControl.exe')
         Arguments = '--bridge-supervisor scheduled'
         WorkingDirectory = $fullToolDir
     }

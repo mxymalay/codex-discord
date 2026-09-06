@@ -163,6 +163,34 @@ test('Discord managed worktree project provenance wins over generated path match
   }, projects), { projectId: 'example-project', projectName: 'example-project' });
 });
 
+test('POSIX project inference keeps case and backslash filenames distinct while finding the longest root', () => {
+  const projects = [
+    { id: 'upper', name: 'Upper', roots: ['/Users/operator/Repo'] },
+    { id: 'lower', name: 'Lower', roots: ['/Users/operator/repo'] },
+    { id: 'nested', name: 'Nested', roots: ['/Users/operator/repo/apps/'] },
+    { id: 'literal', name: 'Literal', roots: ['/Users/operator/repo\\archive'] },
+  ];
+  assert.equal(inferSavedProject({ cwd: '/Users/operator/repo/task' }, projects).projectId, 'lower');
+  assert.equal(inferSavedProject({ cwd: '/Users/operator/repo/apps/cashier' }, projects).projectId, 'nested');
+  assert.equal(inferSavedProject({ cwd: '/Users/operator/repo\\archive/task' }, projects).projectId, 'literal');
+  assert.equal(inferSavedProject({ cwd: '/Users/operator/REPO/task' }, projects).projectId, null);
+  assert.equal(inferSavedProject({ cwd: '/Users/operator/repo-old/task' }, projects).projectId, null);
+  assert.equal(inferSavedProject({ cwd: '/Users/operator/task' }, [{ id: 'root', name: 'Root', roots: ['/'] }]).projectId, 'root');
+});
+
+test('index recognizes Windows managed worktrees independently of the host platform', async () => {
+  const paths = await fixture();
+  try {
+    await writeJsonl(paths.sessionIndexPath, [{ id: 'windows-managed', thread_name: 'Windows task' }]);
+    await writeJsonl(paths.rollout('windows-managed'), [meta('windows-managed', {
+      cwd: 'd:/Codex/worktrees/discord/operation', git: { branch: 'codex/discord-operation' },
+    })]);
+    const index = await buildTaskIndex({ ...paths, discordWorktreeRoot: 'D:\\codex\\worktrees\\discord' });
+    assert.equal(index.tasks[0].worktreePath, 'd:\\Codex\\worktrees\\discord\\operation');
+    assert.equal(index.tasks[0].worktreeBranch, 'codex/discord-operation');
+  } finally { await fs.rm(paths.root, { recursive: true, force: true }); }
+});
+
 test('index project display falls back to the workspace name but preserves explicit no-project tasks', async () => {
   const paths = await fixture();
   try {
@@ -1079,6 +1107,69 @@ test('task detail skips app-injected user context and keeps the first real user 
     assert.equal(detail.markdown.includes('recommended_plugins'), false);
   } finally {
     await fs.rm(paths.root, { recursive: true, force: true });
+  }
+});
+
+test('old generating titles recover the first authored input even when the rollout offset is unchanged', async (t) => {
+  for (const format of ['response', 'event']) {
+    await t.test(format, async () => {
+      const paths = await fixture();
+      const threadId = 'legacy-title';
+      const rolloutPath = paths.rollout(threadId);
+      try {
+        const injected = responseMessage('2026-09-01T00:00:01Z', 'user', 'private injected context');
+        injected.payload.internal_chat_message_metadata_passthrough = { content_item_kinds: ['environments.environment_context'] };
+        const first = format === 'response'
+          ? responseMessage('2026-09-01T00:00:02Z', 'user', '  修复\n 支付\t通知  ')
+          : event('2026-09-01T00:00:02Z', 'user_message', { message: '  修复\n 支付\t通知  ' });
+        await writeJsonl(rolloutPath, [meta(threadId), injected,
+          event('2026-09-01T00:00:01Z', 'user_message', { message: '<recommended_plugins>context</recommended_plugins>' }),
+          first, responseMessage('2026-09-01T00:00:03Z', 'user', 'later continuation must not become the title'),
+        ]);
+        await writeJsonl(paths.sessionIndexPath, [{ id: threadId }]);
+        const created = { status: 'started', threadId, turnId: 'turn-title', taskName: '生成中' };
+        const previous = { threadId, taskName: '生成中', rolloutPath, offset: (await fs.stat(rolloutPath)).size };
+        const options = { ...paths, createdTasksByInteraction: { creation: created }, previousIndex: { tasks: [previous] } };
+        const index = await buildTaskIndex(options);
+        assert.equal(index.tasks[0].taskName, '修复 支付 通知');
+        assert.equal(created.taskName, '生成中', 'index display recovery must not mutate historical inbox records');
+        assert.equal(previous.taskName, '生成中');
+        await writeJsonl(paths.sessionIndexPath, [{ id: threadId, thread_name: '用户选择的真实标题' }]);
+        assert.equal((await buildTaskIndex(options)).tasks[0].taskName, '用户选择的真实标题');
+        await writeJsonl(paths.sessionIndexPath, [{ id: threadId }]);
+        created.taskName = 'App Server 提供的真实标题';
+        assert.equal((await buildTaskIndex({ ...options, previousIndex: { tasks: [] } })).tasks[0].taskName, 'App Server 提供的真实标题');
+      } finally { await fs.rm(paths.root, { recursive: true, force: true }); }
+    });
+  }
+});
+
+test('title recovery uses only reliable head input and never a later bounded tail message', async (t) => {
+  for (const variant of ['head-input', 'tail-only', 'malformed-prefix', 'unreadable', 'missing']) {
+    await t.test(variant, async () => {
+      const paths = await fixture();
+      const threadId = 'bounded-title';
+      const rolloutPath = paths.rollout(threadId);
+      try {
+        const first = event('2026-09-01T00:00:01Z', 'user_message', { message: '可靠的原始任务' });
+        const entries = [meta(threadId), ...(['head-input', 'malformed-prefix'].includes(variant) ? [first] : []),
+          event('2026-09-01T00:00:02Z', 'agent_message', { message: 'filler'.repeat(2_000) }),
+          responseMessage('2026-09-01T00:00:03Z', 'user', '尾部续接不能作为原始标题'),
+        ];
+        await writeJsonl(rolloutPath, entries, variant === 'malformed-prefix' ? '{unreadable-json}\n' : '');
+        await writeJsonl(paths.sessionIndexPath, [{ id: threadId }]);
+        const previous = { threadId, taskName: '生成中', rolloutPath, offset: (await fs.stat(rolloutPath)).size };
+        if (variant === 'missing') await fs.unlink(rolloutPath);
+        const fileSystem = variant === 'unreadable' ? observingFileSystem({ onOpen(file) {
+          if (path.resolve(file) === path.resolve(rolloutPath)) throw Object.assign(new Error('fixture unavailable'), { code: 'EACCES' });
+        } }) : fs;
+        const index = await buildTaskIndex({ ...paths, fileSystem, readLimits: forcedBoundedReadLimits,
+          createdTasksByInteraction: { creation: { status: 'started', threadId, taskName: '生成中' } },
+          previousIndex: { tasks: [previous] },
+        });
+        assert.equal(index.tasks[0].taskName, variant === 'head-input' ? '可靠的原始任务' : '未命名任务');
+      } finally { await fs.rm(paths.root, { recursive: true, force: true }); }
+    });
   }
 });
 

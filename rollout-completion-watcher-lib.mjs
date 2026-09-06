@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
+import { getUserAuthoredMessageText } from './discord-task-index-lib.mjs';
 
 import {
   advanceDiscordTurnOrigin,
@@ -132,7 +133,7 @@ function parseLinesWithOffsets(buffer) {
   return { entries, completeEnd: start };
 }
 
-async function scanJsonLines(filePath, visit, { maxLineBytes = maxNotificationLineBytes } = {}) {
+async function scanJsonLines(filePath, visit, { maxLineBytes = maxNotificationLineBytes, onSkippedLine } = {}) {
   const handle = await fs.open(filePath, 'r');
   const buffer = Buffer.allocUnsafe(256 * 1024);
   let fileOffset = 0;
@@ -160,7 +161,10 @@ async function scanJsonLines(filePath, visit, { maxLineBytes = maxNotificationLi
               if (visit(JSON.parse(line.toString('utf8')), { start: pendingStart, end }) === false) return;
             } catch (error) {
               if (!(error instanceof SyntaxError)) throw error;
+              onSkippedLine?.();
             }
+          } else if (raw.length > maxLineBytes) {
+            onSkippedLine?.();
           }
         }
         pending = Buffer.alloc(0);
@@ -172,6 +176,7 @@ async function scanJsonLines(filePath, visit, { maxLineBytes = maxNotificationLi
         if (pending.length + remainder.length > maxLineBytes) {
           pending = Buffer.alloc(0);
           dropping = true;
+          onSkippedLine?.();
         } else {
           pending = pending.length ? Buffer.concat([pending, remainder]) : Buffer.from(remainder);
         }
@@ -708,6 +713,62 @@ async function consumeFile(filePath, fileState, info, pending) {
   fileState.offset = start + complete.length;
 }
 
+async function archivedLocatorMatches(item, turnId) {
+  let currentRoot = false, activeTurnId = '', targetRoot = false;
+  let starts = 0, completions = 0, invalid = false, unreadable = false;
+  try {
+    await scanJsonLines(item.rolloutPath, (entry) => {
+      if (entry?.type === 'session_meta') {
+        currentRoot = rootSessionMeta(entry, item.threadId);
+        if (activeTurnId === String(turnId)) targetRoot = targetRoot && currentRoot;
+      }
+      if (entry?.type !== 'event_msg') return;
+      const payload = entry.payload ?? {};
+      if (payload.type === 'task_started') {
+        activeTurnId = String(payload.turn_id ?? '');
+        if (activeTurnId === String(turnId)) { starts++; targetRoot = currentRoot; }
+      }
+      if (payload.type === 'task_complete' && String(payload.turn_id ?? '') === String(turnId)) {
+        if (activeTurnId !== String(turnId) || !targetRoot || !currentRoot) invalid = true;
+        completions++;
+      }
+    }, { onSkippedLine: () => { unreadable = true; } });
+  } catch { return null; }
+  if (unreadable) return null;
+  return !invalid && starts === 1 && completions === 1;
+}
+
+async function recoverArchivedPendingLocator({ sessionsRoot, item, turnId }) {
+  const originalPath = path.resolve(String(item.rolloutPath ?? ''));
+  const sessionDirectory = path.resolve(sessionsRoot);
+  const relative = path.relative(sessionDirectory, originalPath);
+  if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return;
+  try { await fs.stat(originalPath); return; }
+  catch (error) { if (error?.code !== 'ENOENT') return; }
+  // Codex moves archived sessions under this sibling directory. Never search arbitrary
+  // locations or choose by thread ID alone: a fork can share inherited historical turns.
+  const archiveRoot = path.join(path.dirname(sessionDirectory), 'archived_sessions');
+  let candidates;
+  try {
+    const rootInfo = await fs.lstat(archiveRoot);
+    if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) return;
+    candidates = (await listRolloutFiles(archiveRoot)).filter((candidate) => path.basename(candidate) === path.basename(originalPath));
+  } catch { return; }
+  const matches = [];
+  for (const candidate of candidates) {
+    try {
+      const info = await fs.lstat(candidate);
+      if (!info.isFile() || info.isSymbolicLink()) continue;
+      const match = await archivedLocatorMatches({ ...item, rolloutPath: candidate }, turnId);
+      // An unreadable same-name candidate may also be the target: keep the original
+      // pending locator until every candidate can be classified without ambiguity.
+      if (match === null) return;
+      if (match) matches.push(candidate);
+    } catch { return; }
+  }
+  if (matches.length === 1) item.rolloutPath = matches[0];
+}
+
 export async function pollRolloutCompletions({
   sessionsRoot,
   state,
@@ -731,57 +792,74 @@ export async function pollRolloutCompletions({
   const ready = Object.entries(state.pending)
     .filter(([, item]) => nowMs - Number(item.completedAtMs) >= graceMs && nowMs - Number(item.lastAttemptAtMs ?? 0) >= retryMs)
     .sort((left, right) => Number(left[1].completedAtMs) - Number(right[1].completedAtMs));
+  let firstError = null;
   for (const [turnId, item] of ready) {
     item.lastAttemptAtMs = nowMs;
-    let notification;
+    let reconstructed;
     try {
-      notification = await reconstructNotification(item, turnId);
+      await recoverArchivedPendingLocator({ sessionsRoot, item, turnId });
+      reconstructed = await reconstructNotification(item, turnId);
     } catch {
       continue;
     }
-    const enrichedNotification = enrichDiscordOriginNotification(notification, inboxState);
-    const origin = enrichedNotification ? resolveDiscordOrigin(enrichedNotification, inboxState) : null;
-    if (origin?.deliveryState === 'terminal-delivered') {
+    try {
+      const { notification, internalOnly, internalSuppressionReason } = reconstructed;
+      const enrichedNotification = enrichDiscordOriginNotification(notification, inboxState);
+      const origin = enrichedNotification ? resolveDiscordOrigin(enrichedNotification, inboxState) : null;
+      if (internalOnly && !origin) {
+        delete state.pending[turnId];
+        const count = Number(state.suppressedInternalTurnCount);
+        state.suppressedInternalTurnCount = Number.isSafeInteger(count) && count >= 0 ? Math.min(1_000_000, count + 1) : 1;
+        state.lastSuppressedReason = internalSuppressionReason;
+        continue;
+      }
+      if (origin?.deliveryState === 'terminal-delivered') {
+        delete state.pending[turnId];
+        continue;
+      }
+      if (origin) {
+        const boundary = await exactTerminalBoundary(item, turnId);
+        if (boundary === null) continue;
+        await advanceDiscordTurnOrigin({
+          state: inboxState,
+          persistState: persistInboxState,
+          turnId,
+          rolloutCursor: boundary,
+          discardPendingProgress: true,
+        });
+      }
+      let terminalEventId = null;
+      if (origin) {
+        if (typeof persistInboxState !== 'function') throw new Error('Discord origin terminal persistence is unavailable');
+        terminalEventId = createHash('sha256')
+          .update(`${turnId}\0${item.threadId}\0terminal`, 'utf8').digest('hex');
+        await prepareDiscordOriginTerminalDelivery({
+          state: inboxState,
+          persistState: persistInboxState,
+          turnId,
+          eventId: terminalEventId,
+        });
+        notification['discord-origin-channel-id'] = enrichedNotification['discord-origin-channel-id'];
+        notification['discord-guild-id'] = enrichedNotification['discord-guild-id'];
+      }
+      await dispatchNotification(notification);
+      if (origin) {
+        await advanceDiscordTurnOrigin({
+          state: inboxState,
+          persistState: persistInboxState,
+          turnId,
+          rolloutCursor: origin.rolloutCursor,
+          terminalDeliveredAt: new Date(nowMs).toISOString(),
+        });
+      }
       delete state.pending[turnId];
-      continue;
+    } catch (error) {
+      // Retain this pending item and its retry timestamp, but let independent completions
+      // proceed. The caller still receives a failure and persists the partially advanced state.
+      firstError ??= error;
     }
-    if (origin) {
-      const boundary = await exactTerminalBoundary(item, turnId);
-      if (boundary === null) continue;
-      await advanceDiscordTurnOrigin({
-        state: inboxState,
-        persistState: persistInboxState,
-        turnId,
-        rolloutCursor: boundary,
-        discardPendingProgress: true,
-      });
-    }
-    let terminalEventId = null;
-    if (origin) {
-      if (typeof persistInboxState !== 'function') throw new Error('Discord origin terminal persistence is unavailable');
-      terminalEventId = createHash('sha256')
-        .update(`${turnId}\0${item.threadId}\0terminal`, 'utf8').digest('hex');
-      await prepareDiscordOriginTerminalDelivery({
-        state: inboxState,
-        persistState: persistInboxState,
-        turnId,
-        eventId: terminalEventId,
-      });
-      notification['discord-origin-channel-id'] = enrichedNotification['discord-origin-channel-id'];
-      notification['discord-guild-id'] = enrichedNotification['discord-guild-id'];
-    }
-    await dispatchNotification(notification);
-    if (origin) {
-      await advanceDiscordTurnOrigin({
-        state: inboxState,
-        persistState: persistInboxState,
-        turnId,
-        rolloutCursor: origin.rolloutCursor,
-        terminalDeliveredAt: new Date(nowMs).toISOString(),
-      });
-    }
-    delete state.pending[turnId];
   }
+  if (firstError) throw firstError;
   return state;
 }
 
@@ -807,14 +885,84 @@ async function exactTerminalBoundary(item, turnId) {
   return boundary;
 }
 
+function isExactGoalContextInput(payload, turnId) {
+  const metadata = payload?.internal_chat_message_metadata_passthrough;
+  const content = payload?.content;
+  const kinds = metadata?.content_item_kinds;
+  if (payload?.type !== 'message' || payload.role !== 'user' || metadata?.turn_id !== String(turnId) ||
+      !Array.isArray(content) || content.length === 0 || !Array.isArray(kinds) || kinds.length !== content.length) return false;
+  const opening = '<codex_internal_context source="goal">';
+  const closing = '</codex_internal_context>';
+  return content.every((item, index) => {
+    if (kinds[index] !== 'goal.internal_context' || item?.type !== 'input_text' || typeof item.text !== 'string') return false;
+    const text = item.text.trim();
+    if (!text.startsWith(opening) || !text.endsWith(closing)) return false;
+    const body = text.slice(opening.length, -closing.length);
+    return body.trim().length > 0 && !body.includes('<codex_internal_context') && !body.includes(closing);
+  });
+}
+
 async function reconstructNotification(item, turnId) {
   let activeTurnId = '';
   let inputMessages = [];
+  let lastInput = null;
+  let rootMetadataCount = 0, targetStarts = 0;
+  let currentRootEligible = false, rootEligible = false, skippedLine = false, sawCompaction = false, exactActiveCompletion = false;
+  let sawUserMessage = false, sawAgentMetadata = false, sawAgentMessage = false;
+  let sawGoalContext = false, sawOtherUserInput = false;
   let model = '';
   let effort = '';
   let notification = null;
+  const payloadBelongsToTurn = (payload) => [payload?.internal_chat_message_metadata_passthrough?.turn_id, payload?.turn_id]
+    .every((value) => value == null || value === '' || String(value) === String(turnId));
+  const appendInput = (payload, source) => {
+    if (!currentRootEligible || !payloadBelongsToTurn(payload)) return;
+    // Compacted history can retain explicit user turn tags while omitting task_started.
+    const explicitlyAttributed = payload?.internal_chat_message_metadata_passthrough?.turn_id === String(turnId);
+    if (activeTurnId !== String(turnId) && !explicitlyAttributed) return;
+    const message = boundedText(getUserAuthoredMessageText(payload));
+    if (!message) return;
+    if (lastInput && !lastInput.mirrored && lastInput.source !== source && lastInput.message === message) {
+      lastInput.mirrored = true;
+      return;
+    }
+    inputMessages = [...inputMessages, message].slice(-maxInputMessages);
+    lastInput = { message, source, mirrored: false };
+  };
   try {
     await scanJsonLines(String(item.rolloutPath ?? ''), (entry) => {
+      if (entry?.type === 'session_meta') {
+        rootMetadataCount++;
+        const previousRootEligible = currentRootEligible;
+        currentRootEligible = rootSessionMeta(entry, item.threadId);
+        if (!previousRootEligible || !currentRootEligible) {
+          // A target root must not inherit an active turn or inputs from another root.
+          activeTurnId = '';
+          inputMessages = [];
+          lastInput = null;
+          rootEligible = false;
+        }
+      }
+      if (activeTurnId !== String(turnId) && ['event_msg', 'response_item'].includes(entry?.type) &&
+          (entry.payload?.type === 'user_message' || entry.type === 'response_item' && String(entry.payload?.role ?? '').toLocaleLowerCase() === 'user') &&
+          [entry.payload?.internal_chat_message_metadata_passthrough?.turn_id, entry.payload?.turn_id]
+            .some((value) => value != null && String(value) === String(turnId))) sawOtherUserInput = true;
+      if (activeTurnId === String(turnId)) {
+        if (entry?.type === 'inter_agent_communication_metadata' && payloadBelongsToTurn(entry.payload)) sawAgentMetadata = true;
+        if (entry?.type === 'compacted') sawCompaction = true;
+        if (entry?.type === 'response_item' && entry.payload?.type === 'agent_message' && payloadBelongsToTurn(entry.payload)) sawAgentMessage = true;
+        if (entry?.type === 'response_item' && entry.payload?.type === 'message' && String(entry.payload?.role ?? '').toLocaleLowerCase() === 'user') sawUserMessage = true;
+        if (entry?.type === 'event_msg' && entry.payload?.type === 'user_message') sawUserMessage = true;
+        if (entry?.type === 'response_item' && String(entry.payload?.role ?? '').toLocaleLowerCase() === 'user') {
+          if (payloadBelongsToTurn(entry.payload) && isExactGoalContextInput(entry.payload, turnId)) sawGoalContext = true;
+          else sawOtherUserInput = true;
+        }
+        if (['event_msg', 'response_item'].includes(entry?.type) && entry.payload?.type === 'user_message') sawOtherUserInput = true;
+      }
+      if (entry?.type === 'response_item') {
+        appendInput(entry.payload ?? {}, 'response');
+        return undefined;
+      }
       if (entry?.type === 'turn_context' && String(entry.payload?.turn_id ?? '') === String(turnId)) {
         model = String(entry.payload?.model ?? model).trim();
         effort = String(entry.payload?.effort ?? entry.payload?.reasoning_effort ?? effort).trim();
@@ -824,15 +972,17 @@ async function reconstructNotification(item, turnId) {
       const payload = entry.payload ?? {};
       if (payload.type === 'task_started') {
         activeTurnId = String(payload.turn_id ?? '');
-        inputMessages = [];
+        if (activeTurnId === String(turnId)) { targetStarts++; rootEligible = currentRootEligible; }
+        // Collected inputs already belong to this target; only mirror adjacency ends here.
+        lastInput = null;
         return undefined;
       }
-      if (payload.type === 'user_message' && activeTurnId === String(turnId)) {
-        const message = boundedText(payload.message);
-        if (message.trim()) inputMessages = [...inputMessages, message].slice(-maxInputMessages);
+      if (payload.type === 'user_message') {
+        appendInput(payload, 'event');
         return undefined;
       }
       if (payload.type === 'task_complete' && String(payload.turn_id ?? activeTurnId ?? '') === String(turnId)) {
+        exactActiveCompletion = activeTurnId === String(turnId) && String(payload.turn_id ?? '') === String(turnId);
         notification = {
           type: 'agent-turn-complete',
           'thread-id': String(item.threadId ?? ''),
@@ -846,11 +996,20 @@ async function reconstructNotification(item, turnId) {
         return false;
       }
       return undefined;
-    });
+    }, { onSkippedLine: () => { skippedLine = true; } });
   } catch {
     throw new Error('Rollout content is unavailable; fallback notification will retry');
   }
-  if (notification) return notification;
+  if (notification) {
+    // Empty input alone proves nothing. Retire only a complete exact root span containing
+    // a pure agent-result wakeup or exclusively typed, wrapped goal-context user inputs.
+    const completeRootSpan = rootMetadataCount > 0 && rootEligible && targetStarts === 1 && exactActiveCompletion &&
+      !sawCompaction && !skippedLine && inputMessages.length === 0;
+    const internalSuppressionReason = !completeRootSpan ? null
+      : sawAgentMetadata && sawAgentMessage && !sawUserMessage ? 'inter-agent-only-turn'
+        : sawGoalContext && !sawOtherUserInput ? 'goal-internal-context-only-turn' : null;
+    return { notification, internalOnly: internalSuppressionReason !== null, internalSuppressionReason };
+  }
   throw new Error('Rollout completion content is unavailable; fallback notification will retry');
 }
 

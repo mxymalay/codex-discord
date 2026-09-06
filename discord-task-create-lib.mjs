@@ -2,6 +2,8 @@ import { randomBytes } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import { expandPathVariables, isAbsolutePath, isPathDescendant, normalizePath, pathApi, pathsEqual } from './discord-paths-lib.mjs';
+import { taskNameFromInput } from './discord-task-index-lib.mjs';
 
 import {
   AppServerClient,
@@ -180,13 +182,14 @@ export function createProjectCatalog({ loader, ttlMs = 60_000, now = Date.now } 
 function expandProjectlessRoot(projectlessRoot) {
   const configured = String(projectlessRoot ?? '').trim();
   if (!configured) throw new Error('Projectless root is required');
-  const profile = String(process.env.USERPROFILE ?? '').trim();
-  if (/%USERPROFILE%/i.test(configured) && !profile) {
+  let expanded;
+  try {
+    expanded = expandPathVariables(configured);
+  } catch {
     throw new Error('Projectless root could not be expanded');
   }
-  const expanded = configured.replace(/%USERPROFILE%/gi, () => profile);
-  if (!expanded || /%[^%]+%/.test(expanded)) throw new Error('Projectless root could not be expanded');
-  return path.win32.normalize(expanded);
+  if (!isAbsolutePath(expanded)) throw new Error('Projectless root must be absolute');
+  return normalizePath(expanded);
 }
 
 function normalizeProjectRoots(project) {
@@ -274,37 +277,21 @@ function formatBranchTimestamp(value) {
   return date.toISOString().replace(/[-:]/g, '').replace('T', '-').slice(0, 15);
 }
 
-function windowsPathKey(value) {
-  return path.win32.resolve(String(value ?? '')).toLocaleLowerCase('en-US');
-}
-
-function windowsPathEqual(left, right) {
-  return windowsPathKey(left) === windowsPathKey(right);
-}
-
-function resolvedDescendant(root, candidate) {
-  const resolvedRoot = windowsPathKey(root);
-  const resolvedCandidate = windowsPathKey(candidate);
-  const relative = path.win32.relative(resolvedRoot, resolvedCandidate);
-  return relative !== '' && !relative.startsWith('..') && !path.isAbsolute(relative);
-}
-
 function expandWorktreeRoot(worktreeRoot) {
   const configured = String(worktreeRoot ?? '').trim();
   if (!configured) throw new Error('Configured worktree root is required');
-  const codexHome = String(process.env.CODEX_HOME ?? '').trim();
-  if (/%CODEX_HOME%/i.test(configured) && !codexHome) {
+  let expanded;
+  try {
+    expanded = expandPathVariables(configured);
+  } catch {
     throw new Error('Configured worktree root could not be expanded');
   }
-  const expanded = configured.replace(/%CODEX_HOME%/gi, () => codexHome);
-  if (/%[^%]+%/.test(expanded)) throw new Error('Configured worktree root could not be expanded');
-  const normalized = path.win32.normalize(expanded);
-  if (!path.win32.isAbsolute(normalized)) throw new Error('Configured worktree root must be an absolute worktree root');
-  return normalized;
+  if (!isAbsolutePath(expanded)) throw new Error('Configured worktree root must be an absolute worktree root');
+  return normalizePath(expanded);
 }
 
 async function validateSavedProjectRoots(roots, fileSystem) {
-  if (roots.some((root) => !path.win32.isAbsolute(root))) {
+  if (roots.some((root) => !isAbsolutePath(root))) {
     const error = new Error('Saved project root is unavailable');
     error.code = 'PROJECT_ROOT_UNAVAILABLE';
     throw error;
@@ -322,15 +309,16 @@ async function validateSavedProjectRoots(roots, fileSystem) {
 }
 
 async function hasGitMarker(root, fileSystem) {
-  let current = path.resolve(root);
+  const api = pathApi(root);
+  let current = api.resolve(root);
   for (;;) {
     try {
-      await fileSystem.lstat(path.join(current, '.git'));
+      await fileSystem.lstat(api.join(current, '.git'));
       return true;
     } catch (error) {
       if (error?.code !== 'ENOENT') throw error;
     }
-    const parent = path.dirname(current);
+    const parent = api.dirname(current);
     if (parent === current) return false;
     current = parent;
   }
@@ -359,8 +347,8 @@ async function inspectSavedProjectGit({ sourceRoot, gitRunner, fileSystem }) {
   try {
     const result = await gitRunner({ command: 'git', args: ['-C', sourceRoot, 'rev-parse', '--show-toplevel'] });
     const repositoryRoot = String(result?.stdout ?? '').trim();
-    if (!repositoryRoot || !path.win32.isAbsolute(repositoryRoot)) throw new Error('invalid repository root');
-    return { isRepo: true, repositoryRoot: path.win32.normalize(repositoryRoot) };
+    if (!isAbsolutePath(repositoryRoot)) throw new Error('invalid repository root');
+    return { isRepo: true, repositoryRoot: normalizePath(repositoryRoot) };
   } catch (error) {
     if (error?.code === 'GIT_NOT_REPOSITORY' && !markerPresent) return { isRepo: false, repositoryRoot: null };
     throw sanitizedGitInspectionError();
@@ -393,16 +381,16 @@ function structurallyOwnedWorkspace({ workspace, worktreeRoot, operationId }) {
   } catch {
     return false;
   }
-  const expectedPath = path.win32.resolve(configuredRoot, operationId);
+  const expectedPath = pathApi(configuredRoot).resolve(configuredRoot, operationId);
   const actualPath = String(workspace.worktreePath ?? '');
   const repositoryRoot = String(workspace.repositoryRoot ?? '').trim();
   const sourceRoot = String(workspace.sourceRoot ?? '').trim();
   const branchName = String(workspace.branchName ?? '');
   const structurallyOwned = workspace.operationId === operationId
-    && windowsPathEqual(actualPath, expectedPath)
-    && resolvedDescendant(configuredRoot, actualPath)
-    && path.win32.isAbsolute(repositoryRoot)
-    && path.win32.isAbsolute(sourceRoot)
+    && pathsEqual(actualPath, expectedPath)
+    && isPathDescendant(configuredRoot, actualPath)
+    && isAbsolutePath(repositoryRoot)
+    && isAbsolutePath(sourceRoot)
     && branchName.startsWith('codex/discord-');
   return structurallyOwned;
 }
@@ -432,12 +420,12 @@ async function proveOwnedWorkspace({ workspace, worktreeRoot, operationId, gitRu
     const sourceProbe = await gitRunner({
       command: 'git', args: ['-C', workspace.sourceRoot, 'rev-parse', '--show-toplevel'],
     });
-    if (!windowsPathEqual(String(sourceProbe?.stdout ?? '').trim(), workspace.repositoryRoot)) return null;
+    if (!pathsEqual(String(sourceProbe?.stdout ?? '').trim(), workspace.repositoryRoot)) return null;
     const metadata = await gitRunner({
       command: 'git', args: ['-C', workspace.repositoryRoot, 'worktree', 'list', '--porcelain', '-z'],
     });
     const matches = parseWorktreePorcelain(metadata?.stdout).filter((item) => (
-      windowsPathEqual(item.path, workspace.worktreePath) && item.branch === branchRef && validObjectId(item.head)
+      pathsEqual(item.path, workspace.worktreePath) && item.branch === branchRef && validObjectId(item.head)
     ));
     if (matches.length !== 1) return null;
     const branch = await exactBranchOid({
@@ -462,9 +450,9 @@ async function proveOwnedWorkspace({ workspace, worktreeRoot, operationId, gitRu
 function validCleanupProof({ proof, workspace, worktreeRoot, operationId }) {
   return structurallyOwnedWorkspace({ workspace, worktreeRoot, operationId })
     && proof && typeof proof === 'object'
-    && windowsPathEqual(proof.repositoryRoot, workspace.repositoryRoot)
-    && windowsPathEqual(proof.sourceRoot, workspace.sourceRoot)
-    && windowsPathEqual(proof.worktreePath, workspace.worktreePath)
+    && pathsEqual(proof.repositoryRoot, workspace.repositoryRoot)
+    && pathsEqual(proof.sourceRoot, workspace.sourceRoot)
+    && pathsEqual(proof.worktreePath, workspace.worktreePath)
     && proof.branchName === workspace.branchName
     && proof.branchRef === `refs/heads/${workspace.branchName}`
     && validObjectId(proof.branchOid);
@@ -475,19 +463,19 @@ async function inspectProvenWorktree({ proof, gitRunner }) {
     const sourceProbe = await gitRunner({
       command: 'git', args: ['-C', proof.sourceRoot, 'rev-parse', '--show-toplevel'],
     });
-    if (!windowsPathEqual(String(sourceProbe?.stdout ?? '').trim(), proof.repositoryRoot)) return 'crossed';
+    if (!pathsEqual(String(sourceProbe?.stdout ?? '').trim(), proof.repositoryRoot)) return 'crossed';
     const metadata = await gitRunner({
       command: 'git', args: ['-C', proof.repositoryRoot, 'worktree', 'list', '--porcelain', '-z'],
     });
     const records = parseWorktreePorcelain(metadata?.stdout);
     const exact = records.filter((item) => (
-      windowsPathEqual(item.path, proof.worktreePath)
+      pathsEqual(item.path, proof.worktreePath)
       && item.branch === proof.branchRef
       && String(item.head).toLocaleLowerCase('en-US') === proof.branchOid.toLocaleLowerCase('en-US')
     ));
     if (exact.length === 1) return 'present';
     const crossed = records.some((item) => (
-      windowsPathEqual(item.path, proof.worktreePath) || item.branch === proof.branchRef
+      pathsEqual(item.path, proof.worktreePath) || item.branch === proof.branchRef
     ));
     return crossed ? 'crossed' : 'removed';
   } catch {
@@ -565,8 +553,8 @@ export async function prepareTaskWorkspace({
   }
 
   const branchName = `codex/discord-${formatBranchTimestamp(now)}-${randomBytes(3).toString('hex')}`;
-  const worktreePath = path.win32.resolve(configuredWorktreeRoot, operationId);
-  if (!resolvedDescendant(configuredWorktreeRoot, worktreePath)) throw new Error('Unsafe worktree path');
+  const worktreePath = pathApi(configuredWorktreeRoot).resolve(configuredWorktreeRoot, operationId);
+  if (!isPathDescendant(configuredWorktreeRoot, worktreePath)) throw new Error('Unsafe worktree path');
   const workspace = {
     mode: 'worktree',
     cwd: worktreePath,
@@ -677,7 +665,7 @@ async function sourceMatchesProof({ proof, gitRunner }) {
     const sourceProbe = await gitRunner({
       command: 'git', args: ['-C', proof.sourceRoot, 'rev-parse', '--show-toplevel'],
     });
-    return windowsPathEqual(String(sourceProbe?.stdout ?? '').trim(), proof.repositoryRoot);
+    return pathsEqual(String(sourceProbe?.stdout ?? '').trim(), proof.repositoryRoot);
   } catch {
     return false;
   }
@@ -785,7 +773,7 @@ export async function startNewCodexTask({
   const client = createClient({ clientFactory, codexPath, processCwd });
   const resource = clientResource(client);
   let threadId = null;
-  let taskName = '生成中';
+  let taskName = taskNameFromInput(text);
   try {
     await initializeAppServerClient(client);
     await onThreadStarting?.({ workspace });
@@ -1008,7 +996,7 @@ export async function createNewTaskOnce({
         const record = {
           status: 'first-turn-failed',
           threadId: error?.threadId ?? current.threadId,
-          taskName: error?.taskName ?? current.taskName ?? '生成中',
+          taskName: error?.taskName ?? current.taskName ?? taskNameFromInput(text),
           ...projectIdentity,
           workspace: persistableWorkspace(error?.workspace ?? prepared ?? current.workspace),
           errorCategory: taskCreationErrorCategory(error),

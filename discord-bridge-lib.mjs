@@ -4,6 +4,8 @@ import { createInterface } from 'node:readline';
 import { promises as fs } from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
+import os from 'node:os';
+import { codexRouterEndpoint, desktopEndpoint, findExecutable, listDesktopEndpoints } from './discord-runtime-lib.mjs';
 
 export function compareSnowflakes(left, right) {
   const a = BigInt(String(left));
@@ -81,7 +83,7 @@ async function requestFramedJsonPipe({
     };
     const timer = setTimeout(() => finish(new Error('Codex desktop pipe timed out')), timeoutMs);
     try {
-      socket = connectImpl(`\\\\.\\pipe\\${pipeName}`);
+      socket = connectImpl(desktopEndpoint(pipeName));
     } catch (error) {
       finish(error);
       return;
@@ -126,16 +128,16 @@ async function requestFramedJsonPipe({
 }
 
 async function findDesktopToolPipe({
-  listPipes = () => fs.readdir('\\\\.\\pipe\\'),
+  listPipes = listDesktopEndpoints,
   requestPipe = requestFramedJsonPipe,
 } = {}) {
   let names;
   try {
-    names = (await listPipes()).filter((name) => String(name).startsWith(DESKTOP_TOOL_PIPE_PREFIX));
+    names = (await listPipes()).filter((name) => String(name).startsWith(DESKTOP_TOOL_PIPE_PREFIX) || path.posix.isAbsolute(String(name)));
   } catch (error) {
     throw desktopUnavailable(error);
   }
-  const candidates = [...new Set([cachedDesktopToolPipe, ...names].filter(Boolean))];
+  const candidates = [...new Set([names.includes(cachedDesktopToolPipe) ? cachedDesktopToolPipe : null, ...names].filter(Boolean))];
   for (const pipeName of candidates) {
     try {
       const response = await requestPipe({
@@ -283,11 +285,11 @@ export async function steerCodexThread({
   throw error;
 }
 
-function createCodexRouterSession({
+export function createCodexRouterSession({
   connectImpl = (target) => net.createConnection(target),
   timeoutMs = 3_000,
 } = {}) {
-  const socket = connectImpl('\\\\.\\pipe\\codex-ipc');
+  const socket = connectImpl(codexRouterEndpoint());
   const pending = new Map();
   let buffer = Buffer.alloc(0);
   let closed = false;
@@ -307,6 +309,7 @@ function createCodexRouterSession({
   const fail = (error) => {
     if (closed) return;
     closed = true;
+    clearTimeout(connectionTimer);
     readyReject(error);
     for (const entry of pending.values()) {
       clearTimeout(entry.timer);
@@ -314,7 +317,14 @@ function createCodexRouterSession({
     }
     pending.clear();
   };
-  socket.once('connect', readyResolve);
+  const connectionTimer = setTimeout(() => {
+    fail(new Error('Codex router connection timed out'));
+    socket.destroy();
+  }, timeoutMs);
+  socket.once('connect', () => {
+    clearTimeout(connectionTimer);
+    readyResolve();
+  });
   socket.on('data', (chunk) => {
     buffer = Buffer.concat([buffer, chunk]);
     while (buffer.length >= 4) {
@@ -2040,9 +2050,16 @@ export async function writeJsonAtomic(filePath, value) {
 export async function resolveCodexExecutable({
   configuredPath = 'codex',
   localAppData = process.env.LOCALAPPDATA,
+  platform = process.platform,
+  environment = process.env,
+  applicationRoots = ['/Applications', path.join(os.homedir(), 'Applications')],
 } = {}) {
   const configured = String(configuredPath ?? '').trim() || 'codex';
   if (path.isAbsolute(configured)) {
+    if (platform === 'darwin') {
+      if (!await findExecutable(configured, { environment, platform })) throw new Error('Configured Codex executable is unavailable');
+      return configured;
+    }
     try {
       if ((await fs.stat(configured)).isFile()) return configured;
     } catch {
@@ -2071,12 +2088,25 @@ export async function resolveCodexExecutable({
       // Fall back to the configured command when discovery is unavailable.
     }
   }
+  if (platform === 'darwin') {
+    const bundled = configured === 'codex' ? applicationRoots.flatMap((root) => ['Codex.app', 'ChatGPT.app']
+      .map((name) => path.join(root, name, 'Contents', 'Resources', 'codex'))) : [];
+    return await findExecutable(configured, { environment, platform, candidates: bundled }) ?? configured;
+  }
   return configured;
 }
 
 export async function resolvePowerShellExecutable({
   programFiles = process.env.ProgramFiles,
+  platform = process.platform,
+  environment = process.env,
 } = {}) {
+  const override = String(environment.CODEX_DISCORD_PWSH_PATH ?? '').trim();
+  if (override) {
+    const resolved = await findExecutable(override, { environment, platform });
+    if (!resolved) throw new Error('Configured PowerShell 7 executable is unavailable');
+    return resolved;
+  }
   if (programFiles) {
     const installed = path.join(programFiles, 'PowerShell', '7', 'pwsh.exe');
     try {
@@ -2085,7 +2115,8 @@ export async function resolvePowerShellExecutable({
       // Fall back to PATH when PowerShell 7 is installed elsewhere.
     }
   }
-  return 'pwsh';
+  return await findExecutable('pwsh', { environment, platform, candidates: platform === 'darwin'
+    ? ['/opt/homebrew/bin/pwsh', '/usr/local/bin/pwsh', '/usr/local/microsoft/powershell/7/pwsh'] : [] }) ?? 'pwsh';
 }
 
 export async function discordRequest({ token, route, method = 'GET', body, fetchImpl = fetch, maxRetries = 5 }) {
@@ -2176,7 +2207,7 @@ export async function loadDiscordToken({ toolDir, powershellPath = 'pwsh' }) {
       const token = stdout.trim();
       stdout = '';
       if (code !== 0 || !token) {
-        reject(new Error('Unable to decrypt the Discord Bot token for this Windows account'));
+        reject(new Error('Unable to decrypt the Discord Bot token for this user account'));
         return;
       }
       resolve(token);
@@ -2197,7 +2228,7 @@ async function transformPendingReplyText({ toolDir, powershellPath = 'pwsh', scr
     child.stdout.on('data', (chunk) => { stdout += chunk; });
     child.on('error', () => reject(new Error('Unable to start the Discord pending-reply secret helper')));
     child.on('close', (code) => {
-      if (code !== 0 || !stdout) reject(new Error('Unable to process Discord pending-reply text for this Windows account'));
+      if (code !== 0 || !stdout) reject(new Error('Unable to process Discord pending-reply text for this user account'));
       else resolve(stdout);
     });
     child.stdin.end(String(value));
