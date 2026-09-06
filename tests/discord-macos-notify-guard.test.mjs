@@ -8,6 +8,28 @@ import {promisify} from 'node:util';
 import {findExecutable} from '../discord-runtime-lib.mjs';
 import {invokeMacNotifyGuard, makeMacNotifyGuardAgent, validateOwnedMacNotifyGuardAgent} from '../discord-macos-notify-guard.mjs';
 const exec = promisify(execFile);
+const guardCompilerTimeoutMs = 60000;
+async function prepareGuardSignalHandler(toolDir,powerShellPath) {
+  const compiler=path.join(toolDir,'compile-dummy-guard.ps1');
+  const assembly=path.join(toolDir,'dummy-guard.dll');
+  await fs.writeFile(compiler,`$ErrorActionPreference = 'Stop'
+Add-Type -OutputAssembly (Join-Path $PSScriptRoot 'dummy-guard.dll') -TypeDefinition @'
+using System;using System.Runtime.InteropServices;using System.Threading;
+public static class DelayedGuardExit {
+  private static PosixSignalRegistration handler;
+  public static void Install(){handler=PosixSignalRegistration.Create(PosixSignal.SIGTERM, context=>{context.Cancel=true;new Thread(()=>{Thread.Sleep(1200);Environment.Exit(0);}).Start();});}
+}
+'@
+`);
+  const startedAt=Date.now();
+  try {
+    await exec(powerShellPath,['-NoProfile','-File',compiler],{timeout:guardCompilerTimeoutMs,killSignal:'SIGKILL'});
+  } catch(error) {
+    assert.fail(`Isolated signal-handler compilation failed (setup budget ${guardCompilerTimeoutMs}ms, PowerShell ${powerShellPath}, code ${error.code}, signal ${error.signal}).\n${String(error.stdout||'').slice(-6000)}\n${String(error.stderr||'').slice(-6000)}`);
+  }
+  assert.ok((await fs.stat(assembly)).size>0,'fixture compiler did not produce its signal-handler assembly');
+  return Date.now()-startedAt;
+}
 async function waitForUnloaded(target) {
   for(let attempt=0;attempt<100;attempt++) {
     try { await exec('/bin/launchctl',['print',target]); }
@@ -80,7 +102,7 @@ test('notification guard targets only the PowerShell watcher and persists its na
   assert.equal(validateOwnedMacNotifyGuardAgent(substituted,spec),false);
 });
 
-test('real launchd guard enables, repairs, and disables only an isolated dummy watcher', {skip:process.platform!=='darwin',timeout:90000}, async()=>{
+test('real launchd guard enables, repairs, and disables only an isolated dummy watcher', {skip:process.platform!=='darwin',timeout:90000+guardCompilerTimeoutMs}, async(t)=>{
   const root=await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(),'codex-notify-guard-')));
   const toolDir=path.join(root,'mobile-notify'),home=path.join(root,'test-home');
   const powerShellPath=await findExecutable(process.env.CODEX_DISCORD_PWSH_PATH||'pwsh');
@@ -93,10 +115,13 @@ test('real launchd guard enables, repairs, and disables only an isolated dummy w
   const marker=path.join(toolDir,'dummy-guard.json');
   const ready=pid=>waitForWatcherReady({marker,phases:path.join(toolDir,'dummy-guard-phases.log'),log:path.join(toolDir,'notify-guard.log'),target,powerShellPath,firstPathExecutable,pid,codexHome:options.environment.CODEX_HOME});
   try {
+    // Roslyn cold compilation has a separate setup budget. The launchd readiness
+    // deadline below still measures a real PowerShell process, DLL load and environment.
+    const compilationMs=await prepareGuardSignalHandler(toolDir,powerShellPath);
+    t.diagnostic(`Signal-handler fixture compiled in ${compilationMs}ms (setup budget ${guardCompilerTimeoutMs}ms); watcher readiness remains 20000ms.`);
     // launchctl bootout returns before a terminating process disappears. A
     // deliberate delay makes that real lifecycle boundary deterministic.
-    // Cold PowerShell/Add-Type initialization may also outlast five seconds;
-    // exercise that boundary independently of the host's actual startup speed.
+    // Exercise a six-second cold startup independently of host compilation speed.
     await fs.writeFile(path.join(toolDir,'watch-notify.ps1'),`$ErrorActionPreference = 'Stop'
 function Write-Phase([string]$phase) { [IO.File]::AppendAllText((Join-Path $PSScriptRoot 'dummy-guard-phases.log'), ('{0:o} pid={1} phase={2}' -f [DateTime]::UtcNow, $PID, $phase) + [Environment]::NewLine) }
 Write-Phase 'entered'
@@ -106,14 +131,8 @@ if (-not (Test-Path -LiteralPath $firstStart)) {
   Start-Sleep -Milliseconds 6000
 }
 Write-Phase 'delay-complete'
-Add-Type @'
-using System;using System.Runtime.InteropServices;using System.Threading;
-public static class DelayedGuardExit {
-  private static PosixSignalRegistration handler;
-  public static void Install(){handler=PosixSignalRegistration.Create(PosixSignal.SIGTERM, context=>{context.Cancel=true;new Thread(()=>{Thread.Sleep(1200);Environment.Exit(0);}).Start();});}
-}
-'@
-Write-Phase 'compiled'
+Add-Type -Path (Join-Path $PSScriptRoot 'dummy-guard.dll')
+Write-Phase 'assembly-loaded'
 [DelayedGuardExit]::Install()
 Write-Phase 'signal-handler-installed'
 [IO.File]::WriteAllText((Join-Path $PSScriptRoot "dummy-guard.json"),(@{pid=$PID;codexHome=$env:CODEX_HOME} | ConvertTo-Json))
