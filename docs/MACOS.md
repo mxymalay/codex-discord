@@ -1,6 +1,6 @@
-# macOS 安装与 Windows 迁移
+# 码驿 · CodexRelay：macOS 安装与 Windows 迁移
 
-[PR #1](https://github.com/mxymalay/codex-discord/pull/1) 已于 2026-09-06 合并到 `main`（`0453c82`）。安装和更新使用 `main` 的代码；完整流程见 [入门指南](GETTING-STARTED.md)，合并与 CI 基线见 [验收记录](ACCEPTANCE.md)。
+[PR #1](https://github.com/mxymalay/CodexRelay/pull/1) 已于 2026-09-06 合并到 `main`（`0453c82`）。安装和更新使用 `main` 的代码；完整流程见 [入门指南](GETTING-STARTED.md)，合并与 CI 基线见 [验收记录](ACCEPTANCE.md)。
 
 两套系统共用 11 个 Slash Commands、通知格式与路由、回复队列、任务索引、新建任务、额度快照和 rollout 补发逻辑。Windows 使用 DPAPI、计划任务和 WinForms；macOS 使用 Keychain、launchd 和 AppKit 控制台。仍需 PowerShell 7 来运行完整通知逻辑。
 
@@ -18,6 +18,8 @@ xcode-select -p
 找不到开发工具时，先运行 `xcode-select --install` 并完成系统安装。Codex 可从 PATH、`/Applications/Codex.app`、`/Applications/ChatGPT.app` 或用户 Applications 目录发现，也可用 `CODEX_DISCORD_CODEX_PATH` 指定绝对路径。非标准 PowerShell 安装设置 `CODEX_DISCORD_PWSH_PATH` 为其可执行文件绝对路径。
 
 `CODEX_HOME` 优先指定 Codex 数据目录，默认是 `~/.codex`。运行文件默认安装到其 `mobile-notify` 子目录。仓库检出目录不会被误认为 Codex 数据目录。自启保存安装时所需环境变量，之后修改运行时路径应重新部署。
+
+桌面显示为 **码驿 · CodexRelay 控制台**。新的桌面入口 `码驿 · CodexRelay 控制台.app` 指向运行目录内保留原名的 `Codex Discord 控制台.app`；运行目录、服务和加密标识无需迁移，详见 [兼容说明](../README.md#兼容标识)。
 
 ## 从旧 Windows 电脑恢复配置和 Token
 
@@ -59,8 +61,10 @@ pwsh -NoProfile -File ./save-discord-token.ps1 -FromClipboard -AllowedUserId '<D
 pwsh -NoProfile -File ./activate-discord-bot.ps1
 node ./discord-bridge.mjs --register-commands --once
 node ./discord-macos-control.mjs --action enable-long-term
-open './Codex Discord 控制台.app'
+open "$HOME/Desktop/码驿 · CodexRelay 控制台.app"
 ```
+
+上述 `open` 使用默认桌面入口；若安装时指定了其他桌面目录，使用其中的 `码驿 · CodexRelay 控制台.app`。
 
 `-FromStdin` 也可从受信任的密码管理器安全接收 Token；不要用带 Token 字面量的 Shell 命令。macOS 密文文件为 `discord-token.keychain`，AES-GCM 密钥保存在当前账户 Keychain 中。Keychain 必须已解锁；首次访问时系统可能要求允许访问。若配置 `CODEX_DISCORD_KEYCHAIN` 使用独立 Keychain，应让该 Keychain 在服务运行时可访问。
 
@@ -94,7 +98,7 @@ guard 只修复通知 hook，独立于桥接服务，不会改变桥接服务的
 
 ## 更新和隔离验收
 
-取得 `main` 最新代码后，在仓库根目录执行：
+从公开的 [码驿 · CodexRelay 仓库](https://github.com/mxymalay/CodexRelay) 取得 `main` 最新代码后，在仓库根目录执行；旧 Git 克隆先按[更新指南](GETTING-STARTED.md#6-更新与常见恢复)修改 remote 地址：
 
 ```sh
 node ./deploy-macos.mjs --source-root "$PWD" \

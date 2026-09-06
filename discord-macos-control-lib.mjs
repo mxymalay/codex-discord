@@ -9,6 +9,7 @@ import {setNotificationsEnabled,restoreNotificationsEnabled} from './discord-not
 
 const exec = promisify(execFile);
 export const MAC_APP_NAME = 'Codex Discord 控制台.app';
+export const MAC_DESKTOP_APP_NAME = '码驿 · CodexRelay 控制台.app';
 export const MAC_CONTROL_ACTIONS = new Set(['status','stop-codex','start-temporary','stop-temporary','enable-long-term','disable-long-term']);
 const DEFAULT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const delay = ms => new Promise(resolve => setTimeout(resolve,ms));

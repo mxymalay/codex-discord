@@ -98,7 +98,7 @@ test('identifies after HELLO and dispatches an interaction only once', async () 
     d: {
       token: 'test-token',
       intents: 1,
-      properties: { os: 'windows', browser: 'codex-discord', device: 'codex-discord' },
+      properties: { os: process.platform, browser: 'CodexRelay', device: 'CodexRelay' },
     },
   });
 
@@ -195,7 +195,7 @@ test('invalid session clears resumable state and identifies on the next connecti
     d: {
       token: 'test-token',
       intents: 1,
-      properties: { os: 'windows', browser: 'codex-discord', device: 'codex-discord' },
+      properties: { os: process.platform, browser: 'CodexRelay', device: 'CodexRelay' },
     },
   });
   assert.equal(client.getStatus().sessionId, null);

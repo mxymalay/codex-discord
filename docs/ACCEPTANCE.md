@@ -1,6 +1,16 @@
-# 双系统验收记录
+# 码驿 · CodexRelay 双系统验收记录
 
-2026-09-06，[PR #1](https://github.com/mxymalay/codex-discord/pull/1) 已合并到 `main`，合并提交为 `0453c8213e32c1ef642e2c15c3cf98d5f9478310`。合并前最终验收提交为 `0131f333420f952d1fcb681f88b21079ee646bd7`，其文件树与合并提交一致。安装和更新使用 `main`；合并不代表下文保留的真实环境验收项目已经通过。
+2026-09-06，[PR #1](https://github.com/mxymalay/CodexRelay/pull/1) 已合并到 `main`，合并提交为 `0453c8213e32c1ef642e2c15c3cf98d5f9478310`。合并前最终验收提交为 `0131f333420f952d1fcb681f88b21079ee646bd7`，其文件树与合并提交一致。安装和更新使用 `main`；合并不代表下文保留的真实环境验收项目已经通过。
+
+本记录保留更名前的提交与验收事实，仓库链接已使用 CodexRelay 新地址。下文的提交号和统计属于对应历史版本；当前版本的双平台结果见 [GitHub Actions](https://github.com/mxymalay/CodexRelay/actions/workflows/test.yml)。
+
+## 品牌与桌面入口迁移
+
+产品展示名统一为“码驿 · CodexRelay”，Windows 与 macOS 桌面入口统一为“码驿 · CodexRelay 控制台”。更新只迁移指向同一安装的旧入口；陌生旧入口保留，陌生同名新入口会阻止覆盖。新增回归覆盖首次安装、Unicode 名称、已有入口升级、部署后注册或服务恢复失败、并发替换和回滚清理，原生界面与快捷方式由相应平台测试验证。
+
+运行目录、可执行文件、服务标识及 DPAPI/Keychain 密文格式保留，完整列表见 [兼容标识](../README.md#兼容标识)。此次更名不重新计入此前的真实 Discord 命令、两轮模型任务、休眠与断网验收，也不改变文末未完成项目的状态。
+
+## 双系统适配历史
 
 历史开发基线：从 `main` 的 `d4726be` 创建 `codex/windows-macos-support`。本次保留原来的 Discord/通知业务逻辑，补齐系统适配与配置迁移。自动化测试不会连接真实 Discord 发送消息，也不会主动退出用户正在使用的 Codex。
 
@@ -59,14 +69,14 @@ macOS 本机验证使用 Apple Silicon、Node.js 24 和 PowerShell 7.6。基线 
 
 合并前最终本机完整验收通过：Node 共 567 项，563 项通过，4 项 Windows 原生启动器测试跳过；26 套适用于 macOS 的 PowerShell 测试、Node/PowerShell 语法检查和仓库隐私检查通过。四套 Windows API 专用 PowerShell 测试及 Windows 原生启动器用例由 Windows CI 运行。
 
-最终提交 `0131f33` 的 [PR CI](https://github.com/mxymalay/codex-discord/actions/runs/34004962297) 和 [push CI](https://github.com/mxymalay/codex-discord/actions/runs/34004960447) 共四个 job 全部通过，两组结果一致：
+最终提交 `0131f33` 的 [PR CI](https://github.com/mxymalay/CodexRelay/actions/runs/34004962297) 和 [push CI](https://github.com/mxymalay/CodexRelay/actions/runs/34004960447) 共四个 job 全部通过，两组结果一致：
 
 | 平台 | Node 总数 | 通过 | 失败 | 跳过 | PowerShell 套数 |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | macOS | 567 | 563 | 0 | 4 | 26 |
 | Windows | 567 | 559 | 0 | 8 | 30 |
 
-合并提交 `0453c82` 的 [main CI](https://github.com/mxymalay/codex-discord/actions/runs/34005447078) 也已完成，Windows、macOS 两个 job 均通过。历史对照：[此前提交 `08a45b8` 的双平台 CI](https://github.com/mxymalay/codex-discord/actions/runs/33990116433) 为 macOS 497 项 Node / 26 套 PowerShell、Windows 489 项 Node / 30 套 PowerShell，均为 0 失败。运行方法：
+合并提交 `0453c82` 的 [main CI](https://github.com/mxymalay/CodexRelay/actions/runs/34005447078) 也已完成，Windows、macOS 两个 job 均通过。历史对照：[此前提交 `08a45b8` 的双平台 CI](https://github.com/mxymalay/CodexRelay/actions/runs/33990116433) 为 macOS 497 项 Node / 26 套 PowerShell、Windows 489 项 Node / 30 套 PowerShell，均为 0 失败。运行方法：
 
 ```sh
 pwsh -NoProfile -File ./tests/run-tests.ps1

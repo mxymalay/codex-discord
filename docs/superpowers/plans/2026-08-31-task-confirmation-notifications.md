@@ -1,5 +1,7 @@
 # Task Confirmation Notifications Implementation Plan
 
+历史设计与实现记录：本文属于现名“码驿 · CodexRelay”的项目，保留当时的目录、服务标识、界面名称和示例。当前安装与更新请看[入门指南](../../GETTING-STARTED.md)，更名时保留的兼容标识见 [README](../../../README.md#兼容标识)。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Route Codex turns that still need user action to a dedicated ntfy confirmation topic while preserving final-task and quota topics.

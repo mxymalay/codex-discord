@@ -565,7 +565,7 @@ namespace CodexDiscordControl
 
         internal ControlForm()
         {
-            Text = "Codex Discord 控制台";
+            Text = "码驿 · CodexRelay 控制台";
             using (Icon executableIcon = Icon.ExtractAssociatedIcon(Application.ExecutablePath))
             {
                 if (executableIcon != null) { Icon = (Icon)executableIcon.Clone(); }

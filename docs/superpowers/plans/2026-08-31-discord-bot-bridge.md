@@ -1,5 +1,7 @@
 # Discord Bot 双向 Codex 桥接 Implementation Plan
 
+历史设计与实现记录：本文属于现名“码驿 · CodexRelay”的项目，保留当时的目录、服务标识、界面名称和示例。当前安装与更新请看[入门指南](../../GETTING-STARTED.md)，更名时保留的兼容标识见 [README](../../../README.md#兼容标识)。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 用一个私有 Discord Bot 替换三条 Incoming Webhook，并把授权用户对任务通知的自由文字回复续接到原 Codex 根任务。

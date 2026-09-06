@@ -18,7 +18,7 @@ function identifyPayload(token) {
     d: {
       token,
       intents: 1,
-      properties: { os: 'windows', browser: 'codex-discord', device: 'codex-discord' },
+      properties: { os: process.platform, browser: 'CodexRelay', device: 'CodexRelay' },
     },
   };
 }

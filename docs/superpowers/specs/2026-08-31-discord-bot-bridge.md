@@ -1,5 +1,7 @@
 # Discord Bot 双向 Codex 桥接设计
 
+历史设计与实现记录：本文属于现名“码驿 · CodexRelay”的项目，保留当时的目录、服务标识、界面名称和示例。当前安装与更新请看[入门指南](../../GETTING-STARTED.md)，更名时保留的兼容标识见 [README](../../../README.md#兼容标识)。
+
 ## 目标
 
 把现有三条 Discord Incoming Webhook 替换为一个私有 Discord Bot。Bot 继续向“任务完成”“任务待确认”“额度变化”三个频道发送富文本通知，并允许唯一授权用户通过回复具体任务通知，向原 Codex 主任务追加任意中文或英文文本。

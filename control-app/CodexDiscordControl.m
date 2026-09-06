@@ -144,7 +144,7 @@ static NSDictionary *DesktopAction(BOOL stop) {
 -(NSTextField*)label:(NSString*)text {NSTextField *v=[NSTextField labelWithString:text];v.font=[NSFont systemFontOfSize:14];return v;}
 -(void)applicationDidFinishLaunching:(NSNotification*)note {
     self.window=[[NSWindow alloc]initWithContentRect:NSMakeRect(0,0,700,410) styleMask:NSWindowStyleMaskTitled|NSWindowStyleMaskClosable|NSWindowStyleMaskMiniaturizable backing:NSBackingStoreBuffered defer:NO];
-    self.window.title=@"Codex Discord 控制台";[self.window center];
+    self.window.title=@"码驿 · CodexRelay 控制台";[self.window center];
     NSView *view=self.window.contentView;
     NSTextField *title=[self label:@"Discord 服务与通知"];title.font=[NSFont boldSystemFontOfSize:23];title.frame=NSMakeRect(25,355,450,32);[view addSubview:title];
     self.refreshIndicator=[[NSProgressIndicator alloc]initWithFrame:NSMakeRect(537,362,16,16)];self.refreshIndicator.style=NSProgressIndicatorStyleSpinning;self.refreshIndicator.controlSize=NSControlSizeSmall;self.refreshIndicator.indeterminate=YES;self.refreshIndicator.displayedWhenStopped=YES;[view addSubview:self.refreshIndicator];[self.refreshIndicator startAnimation:nil];

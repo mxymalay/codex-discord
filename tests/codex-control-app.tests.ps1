@@ -272,6 +272,13 @@ namespace CodexDiscordControl
                 }));
                 return 0;
             }
+            if (args[0] == "form-title") {
+                using (ControlForm form = new ControlForm()) {
+                    bool branded = form.Text == "码驿 · CodexRelay 控制台";
+                    Console.WriteLine(branded ? "true" : "false");
+                    return branded ? 0 : 1;
+                }
+            }
             if (args[0] == "form-icon") {
                 using (ControlForm form = new ControlForm())
                 using (Icon executableIcon = Icon.ExtractAssociatedIcon(Assembly.GetExecutingAssembly().Location))
@@ -306,6 +313,8 @@ namespace CodexDiscordControl
     finally { $ErrorActionPreference = $savedPreference }
     Assert-True ($harnessCompileExit -eq 0 -and (Test-Path -LiteralPath $harnessExe -PathType Leaf)) 'testable status renderer/backend seam did not compile'
 
+    $formTitleResult = @(& $harnessExe form-title)
+    Assert-True ($LASTEXITCODE -eq 0 -and ($formTitleResult -join '') -ceq 'true') 'WinForms window does not display the current product brand'
     $formIconResult = @(& $harnessExe form-icon)
     Assert-True ($LASTEXITCODE -eq 0 -and ($formIconResult -join '') -ceq 'true') 'WinForms window does not use the executable controller icon'
 
@@ -382,7 +391,7 @@ namespace CodexDiscordControl
     $installedExe = Join-Path $installRoot 'CodexDiscordControl.exe'
     $installedBackend = Join-Path $installRoot 'codex-control.ps1'
     $installedLibrary = Join-Path $installRoot 'codex-control-lib.ps1'
-    $shortcutPath = Join-Path $desktopRoot 'Codex Discord 控制台.lnk'
+    $shortcutPath = Join-Path $desktopRoot '码驿 · CodexRelay 控制台.lnk'
 
     # Run the real installer before rollback fixture setup. WScript.Shell.Save
     # converts these paths to the system ANSI codepage on English Windows.
@@ -399,8 +408,8 @@ namespace CodexDiscordControl
     Set-Content -LiteralPath $installedExe -Value 'old-executable' -Encoding ASCII
     Set-Content -LiteralPath $installedBackend -Value 'old-backend' -Encoding ASCII
     Set-Content -LiteralPath $installedLibrary -Value 'old-library' -Encoding ASCII
-    $oldShortcutTarget = Join-Path $env:WINDIR 'System32\notepad.exe'
-    [CodexControlShortcut]::Save($shortcutPath, $oldShortcutTarget, $desktopRoot, '', '旧快捷方式', $oldShortcutTarget, 0)
+    $oldShortcutTarget = $installedExe
+    [CodexControlShortcut]::Save($shortcutPath, $oldShortcutTarget, $installRoot, '', '旧快捷方式', $oldShortcutTarget, 0)
     $oldBundleHashes = @{
         exe = (Get-FileHash -LiteralPath $installedExe).Hash
         backend = (Get-FileHash -LiteralPath $installedBackend).Hash
@@ -408,7 +417,7 @@ namespace CodexDiscordControl
         shortcut = (Get-FileHash -LiteralPath $shortcutPath).Hash
     }
 
-    foreach ($failureStep in @('after-executable','after-backend','after-library','before-shortcut')) {
+    foreach ($failureStep in @('after-executable','after-backend','after-library','before-shortcut','after-shortcut','after-legacy-shortcut')) {
         $injectedFailure = $null
         try { & $installScript -ToolDir $installRoot -DesktopPath $desktopRoot -SourceRoot $stagedSource -FailureInjectionStep $failureStep | Out-Null }
         catch { $injectedFailure = $_.Exception.Message }
@@ -419,7 +428,7 @@ namespace CodexDiscordControl
         Assert-True ((Get-FileHash -LiteralPath $shortcutPath).Hash -eq $oldBundleHashes.shortcut) "$failureStep changed the old shortcut"
         $rolledBackShortcut = [CodexControlShortcut]::Read($shortcutPath)
         Assert-FullPathEqual $rolledBackShortcut.TargetPath $oldShortcutTarget "$failureStep did not restore the shortcut target"
-        Assert-FullPathEqual $rolledBackShortcut.WorkingDirectory $desktopRoot "$failureStep did not restore the shortcut working directory"
+        Assert-FullPathEqual $rolledBackShortcut.WorkingDirectory $installRoot "$failureStep did not restore the shortcut working directory"
         Assert-True (@(Get-ChildItem -LiteralPath $installRoot,$desktopRoot -Force | Where-Object { $_.Name -match '(?i)codex-control-install|\.stage|\.backup|\.bak|\.tmp' }).Count -eq 0) "$failureStep rollback left transaction artifacts"
     }
 
@@ -434,7 +443,7 @@ namespace CodexDiscordControl
         (Join-Path $emptyInstallRoot 'CodexDiscordControl.exe'),
         (Join-Path $emptyInstallRoot 'codex-control.ps1'),
         (Join-Path $emptyInstallRoot 'codex-control-lib.ps1'),
-        (Join-Path $emptyDesktopRoot 'Codex Discord 控制台.lnk')
+        (Join-Path $emptyDesktopRoot '码驿 · CodexRelay 控制台.lnk')
     )) { Assert-True (-not (Test-Path -LiteralPath $unexpected)) 'failed first install left a partial bundle' }
     Assert-True (@(Get-ChildItem -LiteralPath $emptyInstallRoot,$emptyDesktopRoot -Force).Count -eq 0) 'failed first install left staging or backup artifacts'
 
@@ -484,7 +493,14 @@ namespace CodexDiscordControl
         $restoredEmbeddedIcon.Dispose()
     }
 
-    [CodexControlShortcut]::Save($shortcutPath, (Join-Path $env:WINDIR 'System32\cmd.exe'), $env:WINDIR, '', '旧快捷方式', (Join-Path $env:WINDIR 'System32\cmd.exe'), 0)
+    [CodexControlShortcut]::Save($shortcutPath, (Join-Path $env:WINDIR 'System32\cmd.exe'), $env:WINDIR, '', '用户其他快捷方式', (Join-Path $env:WINDIR 'System32\cmd.exe'), 0)
+    $foreignShortcutHash=(Get-FileHash -LiteralPath $shortcutPath).Hash
+    $foreignShortcutError=$null
+    try { & $installScript -ToolDir $installRoot -DesktopPath $desktopRoot -SourceRoot $stagedSource | Out-Null }
+    catch { $foreignShortcutError=$_.Exception.Message }
+    Assert-True ($foreignShortcutError -match 'not owned') 'installer accepted a shortcut for another target'
+    Assert-True ((Get-FileHash -LiteralPath $shortcutPath).Hash -ceq $foreignShortcutHash) 'installer replaced a user shortcut for another target'
+    [CodexControlShortcut]::Save($shortcutPath, $installedExe, $installRoot, '', '旧描述', $installedExe, 0)
     & $installScript -ToolDir $installRoot -DesktopPath $desktopRoot -SourceRoot $stagedSource | Out-Null
     $updatedShortcut = [CodexControlShortcut]::Read($shortcutPath)
     Assert-FullPathEqual $updatedShortcut.TargetPath $installedExe 'installer did not atomically update a stale shortcut'

@@ -2197,7 +2197,8 @@ test('task, quota, status, and help renderers own consistent Markdown labels aro
   for (const label of ['Gateway', '任务索引', '继续队列', '最近错误类别']) {
     assert.match(status, new RegExp(`\\*\\*${label}：\\*\\*`, 'u'));
   }
-  assert.match(help, /^# Codex Discord 命令帮助/mu);
+  assert.match(help, /^# 码驿 · CodexRelay 命令帮助/mu);
+  assert.match(help, /码驿 · CodexRelay 控制台/u);
   assert.match(help, /\*\*\/任务列表\*\*/u);
 });
 

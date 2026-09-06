@@ -1,5 +1,7 @@
 # Task 1 实现报告
 
+码驿 · CodexRelay 历史实现报告：以下结果对应记录中的提交，不代表当前完整验收。最新项目见 [码驿 · CodexRelay](https://github.com/mxymalay/CodexRelay)，当前验收见[验收记录](../../../docs/ACCEPTANCE.md)。
+
 ## 结果
 
 - 新增 `codex-takeover-lib.mjs`：提供活动任务快照、活动任务变更检测、五分钟 TTL 的接管 UI 状态创建与租户/过期校验。

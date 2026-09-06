@@ -807,7 +807,7 @@ function New-DiscordWebhookPayload {
     }
 
     return [ordered]@{
-        username = 'Codex 通知'
+        username = '码驿 · CodexRelay 通知'
         allowed_mentions = [ordered]@{
             parse = @()
         }
@@ -2514,13 +2514,13 @@ try {
         }
         switch ($SystemTestEvent) {
             'task' {
-                Send-MobileMessage -Config $config -Title 'Codex 系统测试：任务完成通知' -Body "系统测试通知：任务完成出站链路。`n此消息不可用于回复续接任务。" -Priority 3 -Tags @('test_tube') -EventName 'user-task-complete' -Notification $notification
+                Send-MobileMessage -Config $config -Title '码驿 · CodexRelay 系统测试：任务完成通知' -Body "系统测试通知：任务完成出站链路。`n此消息不可用于回复续接任务。" -Priority 3 -Tags @('test_tube') -EventName 'user-task-complete' -Notification $notification
             }
             'confirmation' {
-                Send-MobileMessage -Config $config -Title 'Codex 系统测试：任务待确认通知' -Body "系统测试通知：任务待确认出站链路。`n此消息不可用于回复续接任务。" -Priority 4 -Tags @('test_tube') -EventName 'user-task-confirmation-required' -Notification $notification
+                Send-MobileMessage -Config $config -Title '码驿 · CodexRelay 系统测试：任务待确认通知' -Body "系统测试通知：任务待确认出站链路。`n此消息不可用于回复续接任务。" -Priority 4 -Tags @('test_tube') -EventName 'user-task-confirmation-required' -Notification $notification
             }
             'quota' {
-                Send-MobileMessage -Config $config -Title 'Codex 系统测试：额度变化通知' -Body "系统测试通知：额度变化出站链路。`n此测试不读取或修改额度历史。" -Priority 3 -Tags @('test_tube') -EventName 'quota-changed' -Notification $notification
+                Send-MobileMessage -Config $config -Title '码驿 · CodexRelay 系统测试：额度变化通知' -Body "系统测试通知：额度变化出站链路。`n此测试不读取或修改额度历史。" -Priority 3 -Tags @('test_tube') -EventName 'quota-changed' -Notification $notification
             }
         }
         return

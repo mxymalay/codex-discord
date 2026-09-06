@@ -4,7 +4,7 @@ import { execFile,spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { MAC_APP_NAME,invokeMacControlAction } from './discord-macos-control-lib.mjs';
+import { MAC_APP_NAME,MAC_DESKTOP_APP_NAME,invokeMacControlAction } from './discord-macos-control-lib.mjs';
 const exec=promisify(execFile);
 export const MAC_DEPLOY_FILES=Object.freeze([
   'discord-bridge.mjs','discord-bridge-lib.mjs','discord-commands-lib.mjs','discord-interactions.mjs','discord-gateway-lib.mjs','discord-health-lib.mjs','discord-task-create-lib.mjs','discord-task-index-lib.mjs','rollout-completion-watcher-lib.mjs','codex-takeover-lib.mjs','discord-control-client.mjs','discord-runtime-lib.mjs','discord-paths-lib.mjs','discord-notification-control.mjs',
@@ -31,6 +31,69 @@ async function fileEquals(file,expected) {const current=await snapshot(file);ret
 async function leaves(root,prefix=''){const entries=await fs.readdir(path.join(root,prefix),{withFileTypes:true}),result=[];for(const e of entries){const relative=path.join(prefix,e.name);if(e.isSymbolicLink())throw Error('app-build-symlink');if(e.isDirectory())result.push(...await leaves(root,relative));else if(e.isFile())result.push(relative);else throw Error('app-build-invalid-file');}return result;}
 const xml=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&apos;'}[c]));
 
+export async function createMacDesktopShortcut({liveRoot,desktopPath}) {
+  const live=await directory(liveRoot),desktop=await directory(desktopPath);
+  const destination=await safePath(live.path,MAC_APP_NAME),target=path.join(desktop.path,MAC_DESKTOP_APP_NAME),legacy=path.join(desktop.path,MAC_APP_NAME);
+  async function linkRecord(file){
+    try{const s=await fs.lstat(file);return {dev:s.dev,ino:s.ino,kind:s.isSymbolicLink()?'link':s.isFile()?'file':'other',link:s.isSymbolicLink()?await fs.readlink(file):null};}
+    catch(error){if(error.code==='ENOENT')return null;throw error;}
+  }
+  const owned=record=>record?.link===destination;
+  const matches=(current,expected)=>current&&expected&&current.dev===expected.dev&&current.ino===expected.ino&&current.kind===expected.kind&&current.link===expected.link;
+  async function sameLink(file,expected){if(!matches(await linkRecord(file),expected))throw Error('desktop-shortcut-changed');}
+  async function removeCaptured(file,expected){
+    await sameDirectory(desktop);
+    const temporary=await directory(await fs.mkdtemp(path.join(desktop.path,'.codexrelay-shortcut.'))),held=path.join(temporary.path,'entry');
+    let captured=null,moved=false;
+    try{
+      await sameDirectory(desktop);await sameDirectory(temporary);
+      // Capture the object atomically before deciding whether it belongs to us.
+      await fs.rename(file,held);moved=true;captured=await linkRecord(held);
+      if(!matches(captured,expected))throw Error('desktop-shortcut-changed');
+      await sameDirectory(temporary);await sameLink(held,captured);await fs.unlink(held);moved=false;
+    }catch(primary){
+      if(moved)try{
+        await sameDirectory(desktop);await sameDirectory(temporary);await sameLink(held,captured);
+        // Neither operation replaces an object that appeared at the original path.
+        if(captured.kind==='link')await fs.symlink(captured.link,file);
+        else if(captured.kind==='file')await fs.link(held,file);
+        else throw Error('desktop-shortcut-unknown-object');
+        await sameDirectory(temporary);await sameLink(held,captured);await fs.unlink(held);moved=false;
+      }catch{throw Error(`${primary.message}; desktop-shortcut-preserved: ${held}`);}
+      throw primary;
+    }finally{
+      // Cleanup cannot hide a completed removal or destroy unexpected contents.
+      if(!moved)try{await sameDirectory(temporary);await fs.rmdir(temporary.path);}catch{}
+    }
+  }
+  const original=await linkRecord(target),old=await linkRecord(legacy);
+  if(original&&!owned(original))throw Error('desktop-shortcut-unowned');
+  let created=null,legacyRemoved=false;
+  async function rollback(){
+    await sameDirectory(live);await sameDirectory(desktop);
+    // Restore the old entry first, using exclusive creation to preserve any new owner.
+    if(legacyRemoved){await fs.symlink(old.link,legacy);legacyRemoved=false;}
+    if(created){await sameLink(target,created);await removeCaptured(target,created);created=null;}
+  }
+  try{
+    await sameDirectory(live);await sameDirectory(desktop);await safePath(live.path,MAC_APP_NAME);
+    if(!original){
+      // symlink is exclusive; unlike rename, it cannot replace an intervening file.
+      await fs.symlink(destination,target);
+      const current=await linkRecord(target);if(!owned(current))throw Error('desktop-shortcut-changed');created=current;
+    }
+    await sameLink(target,original||created);
+    if(owned(old)){
+      await sameDirectory(desktop);await sameLink(legacy,old);await sameLink(target,original||created);
+      await removeCaptured(legacy,old);legacyRemoved=true;
+    }
+    return {rollback};
+  }catch(primary){
+    try{await rollback();}catch{throw Error(`${primary.message}; rollback-incomplete: shortcut-restore`);}
+    throw primary;
+  }
+}
+
 export async function buildMacControlApp({sourceRoot,outputDirectory,nodePath=process.execPath,toolDir=outputDirectory}) {
   if(process.platform!=='darwin')throw Error('macos-build-required');
   const app=path.join(outputDirectory,MAC_APP_NAME),contents=path.join(app,'Contents'),macos=path.join(contents,'MacOS'),resources=path.join(contents,'Resources');
@@ -46,7 +109,7 @@ export async function buildMacControlApp({sourceRoot,outputDirectory,nodePath=pr
   } catch(error){throw Error(`control-icon-build-failed: ${error.code||'invalid-icon'}`);}
   const environmentKeys=['PATH','CODEX_HOME','CODEX_DISCORD_PWSH_PATH','CODEX_DISCORD_CODEX_PATH','CODEX_DISCORD_KEYCHAIN'];
   const environmentXml=environmentKeys.filter(key=>process.env[key]).map(key=>`<key>${xml(key)}</key><string>${xml(process.env[key])}</string>`).join('');
-  const info=`<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>CFBundleName</key><string>Codex Discord 控制台</string><key>CFBundleIdentifier</key><string>com.openai.codex-discord.control</string><key>CFBundleExecutable</key><string>CodexDiscordControl</string><key>CFBundlePackageType</key><string>APPL</string><key>CFBundleVersion</key><string>1</string><key>CFBundleShortVersionString</key><string>1.0</string><key>CFBundleIconFile</key><string>CodexDiscordControl</string><key>NSHighResolutionCapable</key><true/><key>CodexDiscordEnvironment</key><dict>${environmentXml}</dict><key>CodexDiscordNodePath</key><string>${xml(await fs.realpath(nodePath))}</string><key>CodexDiscordToolDir</key><string>${xml(path.resolve(toolDir))}</string></dict></plist>`;
+  const info=`<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>CFBundleName</key><string>码驿 · CodexRelay 控制台</string><key>CFBundleIdentifier</key><string>com.openai.codex-discord.control</string><key>CFBundleExecutable</key><string>CodexDiscordControl</string><key>CFBundlePackageType</key><string>APPL</string><key>CFBundleVersion</key><string>1</string><key>CFBundleShortVersionString</key><string>1.0</string><key>CFBundleIconFile</key><string>CodexDiscordControl</string><key>NSHighResolutionCapable</key><true/><key>CodexDiscordEnvironment</key><dict>${environmentXml}</dict><key>CodexDiscordNodePath</key><string>${xml(await fs.realpath(nodePath))}</string><key>CodexDiscordToolDir</key><string>${xml(path.resolve(toolDir))}</string></dict></plist>`;
   await fs.writeFile(path.join(contents,'Info.plist'),info,{mode:0o644});
   await exec('/usr/bin/codesign',['--force','--sign','-',app],{timeout:30000,maxBuffer:65536});
   await exec('/usr/bin/codesign',['--verify','--strict',app],{timeout:30000,maxBuffer:65536});
@@ -66,7 +129,7 @@ async function registerCommands(live,nodePath) {
 export async function deployMac({sourceRoot,liveRoot,desktopPath,skipLiveActions=false,nodePath=process.execPath,buildApp=buildMacControlApp,control,register,afterCommit}={}) {
   const source=await directory(sourceRoot),live=await directory(liveRoot),desktop=await directory(desktopPath);
   for(const [a,b] of [[source,live],[source,desktop],[live,desktop]])if(inside(a.path,b.path)||inside(b.path,a.path))throw Error('deployment-directories-overlap');
-  const marker=await fs.readFile(await safePath(source.path,'README.md'),'utf8');if(!marker.startsWith('# Codex Discord 私有命令控制台'))throw Error('repository-marker-invalid');
+  const marker=await fs.readFile(await safePath(source.path,'README.md'),'utf8');if(!['# 码驿 · CodexRelay','# CodexRelay'].includes(marker.split(/\r?\n/,1)[0])&&!marker.startsWith('# Codex Discord 私有命令控制台'))throw Error('repository-marker-invalid');
   const manifest=[];
   for(const relative of MAC_DEPLOY_FILES){const sourceFile=await safePath(source.path,relative),dest=await safePath(live.path,relative),s=await snapshot(sourceFile);if(!s)throw Error(`required-source-missing: ${relative}`);await snapshot(dest);manifest.push({relative,source:sourceFile,hash:s.hash,mode:s.mode});}
   await safePath(live.path,MAC_APP_NAME);
@@ -98,16 +161,14 @@ export async function deployMac({sourceRoot,liveRoot,desktopPath,skipLiveActions
       if(afterCommit)await afterCommit(records.filter(x=>x.committed).length);
     }
     if(!skipLiveActions){
-      const target=path.join(desktop.path,MAC_APP_NAME),destination=path.join(live.path,MAC_APP_NAME);let old=null;
-      try{const s=await fs.lstat(target);if(!s.isSymbolicLink())throw Error('desktop-shortcut-unowned');old=await fs.readlink(target);if(old!==destination)throw Error('desktop-shortcut-unowned');}catch(error){if(error.code!=='ENOENT')throw error;}
-      shortcut={target,old,destination};const temp=path.join(desktop.path,`.codex-discord-shortcut.${id}.tmp`);await fs.symlink(destination,temp);await fs.rename(temp,target);
+      shortcut=await createMacDesktopShortcut({liveRoot:live.path,desktopPath:desktop.path});
       registrationAttempted=true;await register();await restoreService();
     }
     return {ok:true,backupPath:backup,appPath:path.join(live.path,MAC_APP_NAME),fileCount:records.length};
   } catch(primary) {
     const rollbackErrors=[];
     if(mutationAttempted)try{const result=await control('stop-temporary');if(!result.ok)throw Error();}catch{rollbackErrors.push('service-stop');}
-    if(shortcut)try{await sameDirectory(desktop);if(await fs.readlink(shortcut.target)!==shortcut.destination)throw Error();await fs.unlink(shortcut.target);if(shortcut.old!==null)await fs.symlink(shortcut.old,shortcut.target);}catch{rollbackErrors.push('shortcut-restore');}
+    if(shortcut)try{await shortcut.rollback();}catch{rollbackErrors.push('shortcut-restore');}
     for(const record of records.toReversed())if(record.committed)try{
       await assertRoots();await safePath(live.path,record.relative);if(!await fileEquals(record.dest,{hash:record.hash}))throw Error('rollback-concurrent-change');
       if(record.old){const temp=`${record.dest}.${id}.rollback.tmp`;await fs.writeFile(temp,record.old.bytes,{mode:record.old.mode,flag:'wx'});await fs.rename(temp,record.dest);}else await fs.unlink(record.dest);
