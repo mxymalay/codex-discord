@@ -1,5 +1,7 @@
 # macOS 安装与 Windows 迁移
 
+[PR #1](https://github.com/mxymalay/codex-discord/pull/1) 已于 2026-09-06 合并到 `main`（`0453c82`）。安装和更新使用 `main` 的代码；完整流程见 [入门指南](GETTING-STARTED.md)，合并与 CI 基线见 [验收记录](ACCEPTANCE.md)。
+
 两套系统共用 11 个 Slash Commands、通知格式与路由、回复队列、任务索引、新建任务、额度快照和 rollout 补发逻辑。Windows 使用 DPAPI、计划任务和 WinForms；macOS 使用 Keychain、launchd 和 AppKit 控制台。仍需 PowerShell 7 来运行完整通知逻辑。
 
 ## 环境
@@ -23,7 +25,7 @@ xcode-select -p
 
 Windows DPAPI 文件不能由 macOS 或其他 Windows 账户直接解密。本仓库的导出脚本在原账户内解密，然后立即生成密码加密的迁移包；Mac 导入后用自己的 Keychain 密钥重新加密 Token。Token、迁移密码均不应粘贴到聊天、命令参数或 Git 中。
 
-旧电脑取得此兼容分支的代码后，在仓库目录使用 **PowerShell 7**：
+旧电脑取得 `main` 的最新代码后，在仓库目录使用 **PowerShell 7**：
 
 ```powershell
 $codexRoot = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $env:USERPROFILE '.codex' }
@@ -71,7 +73,7 @@ open './Codex Discord 控制台.app'
 | 长期开启 / `enable-long-term` | 启动并恢复通知 | 启用 |
 | 长期停用 / `disable-long-term` | 停止并暂停通知 | 禁用 |
 
-启停同时更新本工具的通知开关，停止后原生通知 hook 也不会继续发送本工具的通知。临时停止保留登录自启选择；下次服务真正启动时恢复通知。旧 Windows 版本应先更新本分支，才能获得同样的停止行为。
+启停同时更新本工具的通知开关，停止后原生通知 hook 也不会继续发送本工具的通知。临时停止保留登录自启选择；下次服务真正启动时恢复通知。旧 Windows 版本请先按 [入门指南](GETTING-STARTED.md) 更新运行文件，才能获得同样的停止行为。
 
 所有操作只控制安装目录对应的用户服务；Token、配置和队列保留。可随时查询：
 
@@ -92,6 +94,8 @@ guard 只修复通知 hook，独立于桥接服务，不会改变桥接服务的
 
 ## 更新和隔离验收
 
+取得 `main` 最新代码后，在仓库根目录执行：
+
 ```sh
 node ./deploy-macos.mjs --source-root "$PWD" \
   --live-root "${CODEX_HOME:-$HOME/.codex}/mobile-notify" --desktop-path "$HOME/Desktop"
@@ -111,4 +115,4 @@ pwsh -NoProfile -File ./tests/run-tests.ps1
 
 独立 App Server 的初始化、项目列表、任务列表和模型列表已在本机通过只读验证；协议见 [OpenAI App Server 文档](https://learn.chatgpt.com/docs/app-server)。若桌面拒绝接管，桥接保留原来的安全回退：提交前失败才尝试 App Server，活动写入冲突排队；已提交而结果未知的请求不自动重复发送。不能把这些回退视为当前桌面版本完整接管能力已验收。
 
-2026-09-06 用户已确认旧 Windows 更新后停用通知正常，以及当前 Mac 的断网恢复、系统休眠/唤醒后自动恢复连接和快速检查通过。中断期间任务通知的完整性、主动退出桌面端、关机重启及退出登录/重新登录仍需分别验收；具体证据和边界见 [验收记录](ACCEPTANCE.md)。自动测试通过不等同于保证没有缺陷。
+2026-09-06 用户已确认旧 Windows 更新后停用通知正常，以及当前 Mac 的断网恢复、系统休眠/唤醒后自动恢复连接和快速检查通过。电源记录中的实际睡眠约 23 秒，未验证两分钟或长时间睡眠。中断期间任务通知的完整性、主动退出桌面端、关机重启及退出登录/重新登录仍需分别验收；具体证据和边界见 [验收记录](ACCEPTANCE.md)。自动测试通过不等同于保证没有缺陷。

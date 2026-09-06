@@ -2,43 +2,29 @@
 
 这个工具把 Codex 的任务完成、待确认和周额度通知发送到三个独立的 Discord 频道，并在同一个私有 Bot 中提供 11 个中文 Slash Commands。桥接器只服务配置中的一个 Discord 服务器和一个授权用户；查询结果、按钮回执、Modal 回执和错误信息均为 Ephemeral，且禁用 mentions。
 
-所有能力运行在一个 `Codex Discord Bridge` 进程中：Discord Gateway、Slash Commands、任务索引、新建/继续任务、通知回复补收、继续队列重试和 rollout 完成补发共享同一份状态。无需公网地址或第二个命令服务。
+Discord Gateway、Slash Commands、任务索引、新建/继续任务、通知回复补收、继续队列重试和 rollout 完成补发由同一个 `Codex Discord Bridge` 进程管理，共享桥接状态。Codex 原生通知 hook 是独立通知入口；控制台停止桥接时也会暂停本工具的通知。无需公网地址或第二个命令服务。
+
+Windows/macOS 支持已合入 `main`，首次安装和后续更新都从主分支获取源码。当前 Mac 的活动桌面任务接管仍受接口权限限制；已通过与未完成的项目见 [验收记录](docs/ACCEPTANCE.md)。
 
 ## 安装
 
 首次安装或把源码交给别人，请从 [中文新手指南：Windows / macOS 完整流程](docs/GETTING-STARTED.md) 开始，包含自己的 Discord Bot 配置、桌面控制台安装和真实通知测试。
 
-支持 Windows 和 macOS，要求 PowerShell 7、Node.js 24，以及可从当前环境启动的 Codex。macOS 的安装、旧 Windows 配置迁移和当前桌面接口限制见 [macOS 指南](docs/MACOS.md)。以下为 Windows 安装步骤。克隆仓库后，在仓库目录执行：
+两套系统都需要 PowerShell 7、Node.js 24，以及已安装、登录并启动过的 Codex。Mac 另需 Xcode Command Line Tools 来构建原生控制台。
 
-```powershell
-Copy-Item .\config.example.json .\config.json
+```sh
+git clone --branch main https://github.com/mxymalay/codex-discord.git
+cd codex-discord
 ```
 
-编辑被 Git 忽略的 `config.json`，填入 Discord Application ID、Guild ID、唯一授权用户 ID，以及任务完成、待确认和额度三个频道 ID。不要把 Bot Token、Webhook 地址或个人目录写入受版本控制的文件。
+| 系统 | 首次安装 | Token 存储 | 后台服务与控制台 |
+| --- | --- | --- | --- |
+| Windows | [Windows 完整步骤](docs/GETTING-STARTED.md#4a-windows-首次安装) | 当前用户 DPAPI | Task Scheduler、原生 EXE 与桌面快捷方式 |
+| macOS | [Mac 完整步骤](docs/GETTING-STARTED.md#4b-macos-首次安装) | Keychain 密钥与本地密文文件 | launchd、原生 App 与桌面入口 |
 
-在 Discord Developer Portal 中创建私有应用，并只安装到目标服务器。Bot 至少需要查看三个目标频道、发送消息、嵌入链接和读取消息历史的权限；安装时启用 `bot` 与 `applications.commands` scopes。不要把 Bot 加入无关服务器。
+每位使用者配置自己的 Discord Bot、服务器、授权用户及三个频道。新手指南包含 Message Content Intent、邀请权限、六个配置 ID、保存 Token、命令注册、启动和测试的完整顺序。配置写在本机运行目录中；Token、配置及任务状态不随源码分享。
 
-从剪贴板读取 Token，并用当前 Windows 用户的 DPAPI 保存：
-
-```powershell
-.\save-discord-token.ps1 -FromClipboard -AllowedUserId <Discord用户ID>
-.\activate-discord-bot.ps1
-.\install-discord-bridge-task.ps1
-```
-
-`config.json` 和 `discord-token.dpapi` 都已被 `.gitignore` 排除。计划任务只启动 `start-discord-bridge.ps1`；guard 每次启动子进程时动态查找 Node 和 Codex，因此 Codex 更新或 CC Switch 切换后不会继续固定旧的可执行文件路径。
-
-首次安装或命令定义变化后，可单独注册并 GET 核验命令。该模式不会启动 Codex、Gateway、频道轮询或任务创建：
-
-```powershell
-node .\discord-bridge.mjs --register-commands --once
-```
-
-成功输出应确认 11 个 Guild Commands。正常服务由计划任务启动：
-
-```powershell
-Get-ScheduledTask -TaskName 'Codex Discord Bridge'
-```
+已有旧 Windows 配置的人使用 [Windows → macOS 迁移流程](docs/MACOS.md#从旧-windows-电脑恢复配置和-token)。迁移包只搬运 Bot 配置和加密 Token，不会搬运 Codex 账户、项目或任务历史。
 
 ## Slash Commands
 
@@ -62,7 +48,7 @@ Get-ScheduledTask -TaskName 'Codex Discord Bridge'
 
 - Git 项目：在 `discordWorktreeRoot` 下创建 `codex/discord-...` 分支和隔离工作树。任务创建后保留工作树，以便继续执行。
 - 确认不是 Git 工作树的已保存项目：直接使用该项目的保存目录。
-- 无项目：使用 `discordProjectlessRoot`，默认可配置为 `%USERPROFILE%\Documents\Codex\Discord Tasks`。
+- 无项目：使用 `discordProjectlessRoot`；默认 Windows 为 `%USERPROFILE%\Documents\Codex\Discord Tasks`，macOS 为 `~/Documents/Codex/Discord Tasks`。
 
 工作树计划会在外部文件操作前持久化。若失败发生在 `thread/start` 前，启动恢复只清理能证明属于该操作的工作树和分支；线程一旦可能已经创建，就保留现场而不猜测删除。重复 Interaction ID 返回已持久化结果，不重复创建线程或工作树。
 
@@ -74,71 +60,69 @@ Get-ScheduledTask -TaskName 'Codex Discord Bridge'
 
 续接成功回执带“查看当前运行状态”按钮。点击后实时刷新并显示进行中、待确认或已完成卡片；进行中卡片使用灰色左侧边框，并按“项目名 / 任务名 / 任务”展示。该查询不会中断任务。
 
-`/退出codex` 不会直接结束程序。它先刷新活动主任务并显示风险预览，用户按下二次确认后还会复核清单；出现新活动任务时旧确认失效。退出范围只限于已验证的 Microsoft Store Codex 桌面进程树，不会按名称结束其他 `codex.exe`。
+当前 Mac 桌面版本拒绝外部桥接访问活动任务的内部控制接口；独立 App Server 创建任务或续接已完成任务的通过结果，不能视作正在运行的桌面任务已可接管。当前限制与回退边界见 [macOS 指南](docs/MACOS.md#当前桌面接口限制)。
+
+`/退出codex` 不会直接结束程序。它先刷新活动主任务并显示风险预览，用户按下二次确认后还会复核清单；出现新活动任务时旧确认失效。Windows 核验 Microsoft Store Codex 桌面进程身份，macOS 核验 Codex 应用签名和进程身份；两者仅处理核验过的桌面进程树。Mac 主动退出及退出后的恢复仍属于未完成的实机验收。
 
 从 Discord `/新建任务` 或 `/继续任务` 发起的工作，会向发起任务的原频道发送该任务的待确认和最终结果；多项任务不会串频道。不会转发 commentary、工具调用或其他“任务进行中”过程信息。Codex 桌面端自己发起的任务仍整理到固定的“任务完成”或“任务待确认”频道，额度变化仍只发额度频道。
 
 桥接服务驻留在本机，Codex 桌面端可以关闭，不会因此让 Bot 下线。电脑仍必须开机、保持当前系统用户已登录、处于唤醒状态并已联网；关机、休眠、注销或 Bot 离线期间不能执行 Slash Commands。Discord 会保留普通频道回复，下一次电脑恢复、登录并联网后，桥接器从持久游标补读；已进入本地队列的内容会在重启后继续恢复。
 
-Codex 原生 `notify` 仍是快速通知通道。桥接器同时监听 rollout 的 `task_complete`，在原生通知未送达时补发，并通过 turn ID 去重。两条旧路径都由单进程集成保留。
+Codex 原生 `notify` 仍是快速通知通道。桥接器同时监听 rollout 的 `task_complete`，在原生通知未送达时补发，并通过 turn ID 去重。原生 hook 与桥接补发共享投递去重状态；各发送入口会重读通知开关，停止服务后也会暂停独立 hook 的本工具通知。
 
-## Windows 控制台与四种运行方式
+## Windows / macOS 控制台与四种运行方式
 
-桌面的 `Codex Discord 控制台` 使用仓库 `assets` 中的专用图标，每两秒刷新桥接服务、开机自启、Discord、Codex 桌面端、继续队列和最后活动状态。桥接服务以隐藏窗口方式在后台运行，不会常驻一个终端窗口。四个按钮的含义是：
+两套系统的桌面入口均为 `Codex Discord 控制台`，每两秒刷新桥接服务、登录自启、Discord、Codex 桌面端、继续队列和最后活动状态。Mac 右上角小圈提示刷新，只更新变化的文字，后台轮询时按钮保持可用。桥接服务在后台运行，关闭控制台窗口后仍会运行。四个按钮的含义是：
 
 - `临时开启`：立即运行桥接，但不改变长期自启设置；若长期处于停用，下一次登录不会自动恢复。
 - `临时停止`：立即停止桥接并暂停本工具的通知，但不改变长期自启设置；若长期开启，下次登录仍会自动运行并恢复通知。
-- `长期开启`：立即运行桥接，并启用当前 Windows 用户登录时自动启动。
+- `长期开启`：立即运行桥接，并启用当前系统用户登录时自动启动。
 - `长期停用`：停止桥接、暂停本工具的通知并禁用登录自启；通知 guard 不会越权重新安装或拉起它。Token、队列和历史状态均保留。
 
-临时操作只改变“现在是否运行”，不会偷偷改变长期选择。要重新运行，打开控制台选择对应的开启按钮；要长期停用，使用按钮并确认，也可以执行：
-
-```powershell
-pwsh -NoProfile -File .\codex-control.ps1 -Action disable-long-term
-```
+临时操作保留长期自启选择。要重新运行，打开控制台选择对应的开启按钮；要长期停用，使用“长期停用”按钮并确认。日常操作见 [控制台使用说明](docs/GETTING-STARTED.md#5-桌面怎么用怎样确认装好了)，Mac 命令行入口见 [Mac 服务控制](docs/MACOS.md)。
 
 ## 安全部署、更新与恢复
 
-在仓库根目录执行下面一条部署命令，可更新受控运行文件、重建 EXE、更新桌面快捷方式和恢复服务。部署只复制固定白名单，先完整暂存并校验 SHA-256，再把将被覆盖的旧文件放入时间戳备份；不会用源码覆盖配置、Token、队列、额度、任务索引、健康状态、日志或其他未知文件。服务恢复会同步通知开关：已停止的旧服务在更新后也暂停通知，其他配置保持不变。
+先从 `main` 获取最新源码，再部署到运行目录。Git 安装和旧功能分支切换步骤见 [更新指南](docs/GETTING-STARTED.md#6-更新与常见恢复)；ZIP 安装先完整解压，不能直接在压缩包中双击启动器。
+
+Windows：在解压后的源码根目录双击 `update-windows.cmd`，或在 PowerShell 7 中运行：
 
 ```powershell
-.\deploy.ps1 -SourceRoot (Resolve-Path .).Path -LiveRoot (Join-Path $env:CODEX_HOME 'mobile-notify') -DesktopPath ([Environment]::GetFolderPath('Desktop'))
+.\update-windows.cmd
 ```
 
-如果只删除了桌面快捷方式或 `CodexDiscordControl.exe`，从仓库再次执行同一条命令即可重建并恢复。若只想验证安全文件部署和 EXE 构建，可向一个隔离目录使用 `-SkipLiveActions`；它不会停止/启动服务、注册 Discord 命令或改桌面快捷方式。
+macOS：在源码根目录的终端运行：
+
+```sh
+node ./deploy-macos.mjs --source-root "$PWD" \
+  --live-root "${CODEX_HOME:-$HOME/.codex}/mobile-notify" --desktop-path "$HOME/Desktop"
+```
+
+部署只复制固定白名单，暂存并校验 SHA-256，将被覆盖的旧文件保存在时间戳备份中，再更新运行文件并重建桌面控制台。配置、Token、队列、额度、任务索引、健康状态、日志和其他未知文件会保留。已停止的旧服务在更新后也会暂停本工具通知。
+
+桌面入口或生成的控制台被误删时，重新执行对应平台的部署步骤即可重建。隔离部署验证可使用 Windows 的 `-SkipLiveActions` 或 macOS 的 `--skip-live-actions`；这两个选项均跳过服务启停、命令注册和桌面入口修改。
 
 部署失败会以非零状态退出，已提交的文件自动回滚；输出中的备份目录会保留，可人工恢复。部署不会调用 `/退出codex`，也不会结束 Codex 桌面端。长期停用的用户选择会保留，不会因更新而擅自改成长期开启。
 
-Markdown 标题、字段名和列表结构由 Bot 生成；来自任务或用户的值会先转义、截断并禁用 mentions。`config.json`、`discord-token.dpapi`、运行时 JSON、日志、备份、EXE 和快捷方式属于 live 状态或生成物，不进入 Git、不提交到仓库。
+Markdown 标题、字段名和列表结构由 Bot 生成；来自任务或用户的值会先转义、截断并禁用 mentions。`config.json`、Token 密文文件、运行时 JSON、日志、备份、EXE、生成的 App 和快捷方式属于 live 状态或生成物，不进入 Git、不提交到仓库。
 
 ## 系统测试
 
 快速检查不向频道发送消息，检查 Token 解密、Gateway、Discord REST、三个频道权限、任务索引、继续队列、临时原子写、额度状态和 rollout 监听。完整检查会产生三条真实且标记清楚的测试通知；它们不写任务消息映射、不创建 Codex 任务，也不修改额度历史。
 
-开发时可运行 focused 测试：
+双系统完整回归测试使用统一入口。它在 Windows 上运行 Windows API 测试，在 macOS 上运行平台适用的 PowerShell 测试和原生服务/控制台验收；两者都运行全部适用的 Node 测试及语法、仓库检查。
 
-```powershell
-node --test .\tests\discord-bridge.test.mjs .\tests\discord-commands.test.mjs .\tests\discord-gateway.test.mjs .\tests\discord-interactions.test.mjs
-pwsh -NoProfile -File .\tests\discord-bridge-startup.tests.ps1
+```sh
+pwsh -NoProfile -File ./tests/run-tests.ps1
 ```
 
-完整验证：
-
-双系统统一入口为 `pwsh -NoProfile -File ./tests/run-tests.ps1`。它在 Windows 上运行全部原有 Windows API 测试，在 macOS 上运行平台适用的 PowerShell 测试和原生服务/控制台验收；两者都运行全部适用的 Node 测试。
-
-```powershell
-pwsh -NoProfile -File .\tests\repository-hygiene.tests.ps1
-$failed = @(); Get-ChildItem .\tests\*.tests.ps1 | ForEach-Object { & pwsh -NoProfile -File $_.FullName; if ($LASTEXITCODE -ne 0) { $failed += $_.Name } }; if ($failed.Count) { throw ($failed -join ', ') }
-node --test .\tests\*.test.mjs
-node --check .\discord-bridge.mjs
-node --check .\discord-interactions.mjs
-git diff --check
-```
+主分支运行 Windows/macOS CI。实际验证结果、代码基线及剩余实机项目见 [验收记录](docs/ACCEPTANCE.md)；自动测试不替代自己的 Token、频道权限和实际通知验收。
 
 ## 状态文件与恢复
 
 - `config.json`：私有 Guild、授权用户、频道和工作目录配置；不含明文 Token。
 - `discord-token.dpapi`：仅当前 Windows 用户可解密的 Bot Token。
+- `discord-token.keychain`：macOS 本地 Token 密文，加密密钥保存在当前用户的 Keychain 中。
 - `discord-message-map.json`：正式任务通知到 Codex 任务的回复映射。
 - `discord-inbox-state.json`：频道游标、Interaction 去重、新建任务 journal 和统一继续队列。
 - `discord-task-index.json`：可重建的侧边栏主任务元数据；不保存完整对话。

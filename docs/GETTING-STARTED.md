@@ -14,14 +14,14 @@
 
 重新打开终端，确认 `node --version` 为 `v24.x`、`pwsh --version` 为 `7.x`，并且 `git --version` 可执行。Windows 原生控制台通过系统的 .NET Framework C# 编译器构建，Mac 通过 `xcrun clang` 构建。
 
-当前双系统版本位于 `codex/windows-macos-support` 分支。把源码放在普通工作目录，例如“文稿/项目”，不要放在桌面或下面的运行目录内：
+Windows/macOS 支持已合入 `main`，新安装和更新都使用主分支。把源码放在普通工作目录，例如“文稿/项目”，不要放在桌面或下面的运行目录内：
 
 ```sh
-git clone --branch codex/windows-macos-support https://github.com/mxymalay/codex-discord.git
+git clone --branch main https://github.com/mxymalay/codex-discord.git
 cd codex-discord
 ```
 
-也可在[该分支页面](https://github.com/mxymalay/codex-discord/tree/codex/windows-macos-support)选择 **Code → Download ZIP** 并解压，然后在解压后的仓库根目录打开终端。私有仓库需要仓库所有者授予访问权限，或由所有者提供仅含源码的压缩包。仓库不需要额外执行 `npm install`。
+也可在[主分支页面](https://github.com/mxymalay/codex-discord/tree/main)选择 **Code → Download ZIP** 并完整解压，然后在解压后的仓库根目录打开终端。GitHub ZIP 解压后的源码文件夹通常叫 `codex-discord-main`；分享的源码包可能叫 `codex-discord`，以包含 `README.md` 和安装脚本的文件夹为准。私有仓库需要仓库所有者授予访问权限，或由所有者提供仅含源码的压缩包。仓库不需要额外执行 `npm install`。
 
 默认 Codex 数据目录为 Windows 的 `%USERPROFILE%\.codex`、Mac 的 `~/.codex`；运行目录是其中的 `mobile-notify`。已有自定义 `CODEX_HOME` 的人沿用它，且必须是绝对路径；不要为安装本工具另建一个与 Codex 实际使用位置不同的数据目录。
 
@@ -157,11 +157,19 @@ pwsh -NoProfile -File ./tests/run-tests.ps1
 
 ## 6. 更新与常见恢复
 
-更新前回到**源码根目录**，Git 用户运行 `git pull --ff-only`；ZIP 用户下载同一分支的新源码到独立目录。再运行对应平台的部署命令，保留原自启选择和私有状态：
+更新前回到**源码根目录**。Git 用户先运行 `git status`，确认本地修改已经妥善保存，再依次执行以下命令。即使以前安装的是 `codex/windows-macos-support`，以后也切换到 `main` 获取更新：
+
+```sh
+git fetch origin
+git switch main
+git pull --ff-only
+```
+
+如果切换或快进更新失败，先保留本地修改并处理提示，不要强制覆盖。ZIP 用户从[主分支页面](https://github.com/mxymalay/codex-discord/tree/main)下载最新源码并解压到独立目录。获取源码后，继续运行下面对应平台的部署命令；仅执行 Git 更新或解压 ZIP 不会更新后台运行的文件。部署会保留原自启选择和私有状态。
 
 Windows 可在解压后的源码根目录双击 `update-windows.cmd`，它会更新默认运行目录并保留原服务选择。旧服务如果已经停止，更新时会同步关闭本工具的通知开关。源码目录仍须独立于桌面和运行目录；请先阅读窗口中的错误或成功信息。
 
-ZIP 用户先在资源管理器中右键压缩包，选择 **全部解压缩 / Extract All → 提取**，再进入解压后的 `codex-discord` 文件夹。确认 `update-windows.cmd` 和 `update-windows.ps1` 位于同一文件夹，再双击 CMD。直接在压缩包中运行会只临时提取 CMD，导致找不到配套脚本；新版启动器会对此提示完整解压。
+ZIP 用户先在资源管理器中右键压缩包，选择 **全部解压缩 / Extract All → 提取**，再进入解压后的源码文件夹（通常为 `codex-discord-main` 或 `codex-discord`）。确认 `update-windows.cmd` 和 `update-windows.ps1` 位于同一文件夹，再双击 CMD。直接在压缩包中运行会只临时提取 CMD，导致找不到配套脚本；新版启动器会对此提示完整解压。
 
 也可以在 PowerShell 7 手动执行：
 
@@ -197,8 +205,8 @@ node ./deploy-macos.mjs --source-root "$PWD" \
 
 迁移用于**同一个人的旧 Bot 和配置**，不是把自己的凭据交给另一位新用户。Windows DPAPI 文件无法直接搬到 Mac 或另一个 Windows 账户解密。
 
-在旧电脑的原 Windows 账户中，用本分支的 `export-discord-migration.ps1` 生成口令加密包；在新电脑用 `import-discord-migration.ps1` 导入。脚本交互询问口令，包和口令分开保管。具体命令见 [Windows → macOS 迁移步骤](MACOS.md#从旧-windows-电脑恢复配置和-token)。
+在旧电脑的原 Windows 账户中，用主分支源码中的 `export-discord-migration.ps1` 生成口令加密包；在新电脑用 `import-discord-migration.ps1` 导入。脚本交互询问口令，包和口令分开保管。具体命令见 [Windows → macOS 迁移步骤](MACOS.md#从旧-windows-电脑恢复配置和-token)。
 
 新电脑应**先导入，再安装**，避免首次安装的占位配置触发默认拒绝覆盖。若已经生成了占位配置，停止目标桥接、确认目标和备份后，才用导入器的 `-ReplaceExisting`。导入成功后安装、激活、注册和启用服务；无需再次从剪贴板保存同一 Token。
 
-先处理旧机队列并停止旧桥接，再开启新机桥接，避免两个实例同时消费同一个 Bot 的消息。旧版本的“停止桥接”不会暂停独立通知脚本；应先在旧 Windows 安装本分支更新，再点“临时停止”或“长期停用”，确保旧机器的通知开关也已关闭。迁移包不包含 Codex 登录、任务数据库、项目文件、待执行回复或旧任务映射；这些不会因为导入 Bot 设置而出现在新电脑。
+先处理旧机队列并停止旧桥接，再开启新机桥接，避免两个实例同时消费同一个 Bot 的消息。旧版本的“停止桥接”不会暂停独立通知脚本；应先在旧 Windows 安装主分支的最新版本，再点“临时停止”或“长期停用”，确保旧机器的通知开关也已关闭。迁移包不包含 Codex 登录、任务数据库、项目文件、待执行回复或旧任务映射；这些不会因为导入 Bot 设置而出现在新电脑。

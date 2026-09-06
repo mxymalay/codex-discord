@@ -1,6 +1,8 @@
 # 双系统验收记录
 
-基线：从 `main` 的 `d4726be` 创建 `codex/windows-macos-support`。本次保留原来的 Discord/通知业务逻辑，补齐系统适配与配置迁移。自动化测试不会连接真实 Discord 发送消息，也不会主动退出用户正在使用的 Codex。
+2026-09-06，[PR #1](https://github.com/mxymalay/codex-discord/pull/1) 已合并到 `main`，合并提交为 `0453c8213e32c1ef642e2c15c3cf98d5f9478310`。合并前最终验收提交为 `0131f333420f952d1fcb681f88b21079ee646bd7`，其文件树与合并提交一致。安装和更新使用 `main`；合并不代表下文保留的真实环境验收项目已经通过。
+
+历史开发基线：从 `main` 的 `d4726be` 创建 `codex/windows-macos-support`。本次保留原来的 Discord/通知业务逻辑，补齐系统适配与配置迁移。自动化测试不会连接真实 Discord 发送消息，也不会主动退出用户正在使用的 Codex。
 
 ## 功能覆盖
 
@@ -55,7 +57,16 @@ macOS 本机验证使用 Apple Silicon、Node.js 24 和 PowerShell 7.6。基线 
 
 托管 Mac CI 还暴露了测试夹具编译占用就绪预算及服务停止时的退出竞争。夹具的 C# 编译移至独立 60 秒准备阶段，仍保留原 20 秒实际进程就绪校验；后续两份托管日志中该原生 guard 用例均通过。进程组已退出但尚未回收时返回 EPERM 已在自有隔离子进程上复现，修复只接受后续明确 ESRCH 的消失证据。另一次 scheduled 启动未在检查窗口内被判定运行的原因尚无充分日志证据，因此四模式测试增加有界状态历史、操作时间和 runtime 身份诊断，不将后续单次通过当作已证明该次失败的根因。
 
-最新本机完整验收通过：563 项 Node 测试，4 项 Windows 原生启动器测试跳过；26 套适用于 macOS 的 PowerShell 测试、Node/PowerShell 语法检查和仓库隐私检查通过。四套 Windows API 专用 PowerShell 测试及 Windows 原生启动器用例由 Windows CI 运行。[此前提交 `08a45b8` 的双平台 CI](https://github.com/mxymalay/codex-discord/actions/runs/33990116433)为 macOS 497 项 Node / 26 套 PowerShell、Windows 489 项 Node / 30 套 PowerShell，均为 0 失败；当前提交的结果见 [PR 检查结果](https://github.com/mxymalay/codex-discord/pull/1/checks)。运行方法：
+合并前最终本机完整验收通过：Node 共 567 项，563 项通过，4 项 Windows 原生启动器测试跳过；26 套适用于 macOS 的 PowerShell 测试、Node/PowerShell 语法检查和仓库隐私检查通过。四套 Windows API 专用 PowerShell 测试及 Windows 原生启动器用例由 Windows CI 运行。
+
+最终提交 `0131f33` 的 [PR CI](https://github.com/mxymalay/codex-discord/actions/runs/34004962297) 和 [push CI](https://github.com/mxymalay/codex-discord/actions/runs/34004960447) 共四个 job 全部通过，两组结果一致：
+
+| 平台 | Node 总数 | 通过 | 失败 | 跳过 | PowerShell 套数 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| macOS | 567 | 563 | 0 | 4 | 26 |
+| Windows | 567 | 559 | 0 | 8 | 30 |
+
+合并提交 `0453c82` 的 [main CI](https://github.com/mxymalay/codex-discord/actions/runs/34005447078) 也已完成，Windows、macOS 两个 job 均通过。历史对照：[此前提交 `08a45b8` 的双平台 CI](https://github.com/mxymalay/codex-discord/actions/runs/33990116433) 为 macOS 497 项 Node / 26 套 PowerShell、Windows 489 项 Node / 30 套 PowerShell，均为 0 失败。运行方法：
 
 ```sh
 pwsh -NoProfile -File ./tests/run-tests.ps1
