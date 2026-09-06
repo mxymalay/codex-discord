@@ -25,16 +25,30 @@ test('native launchd and detached supervisor satisfy all four service modes with
     await fs.writeFile(configPath,JSON.stringify({enabled:false,unrelated:{value:'retained'}}),{mode:0o600});
     await fs.writeFile(path.join(toolDir,'discord-bridge.mjs'),"import fs from 'node:fs';import {spawn} from 'node:child_process';if(fs.existsSync(new URL('./resist',import.meta.url))){const child=spawn(process.execPath,['-e',`process.on('SIGTERM',()=>{});setInterval(()=>{},1000);`],{stdio:'ignore'});fs.writeFileSync(new URL('./resistant.pid',import.meta.url),String(child.pid));}fs.writeFileSync(new URL('./dummy.pid',import.meta.url),String(process.pid));setInterval(()=>{},1000);\n");
     await buildMacControlApp({sourceRoot:repo,outputDirectory:toolDir,nodePath:process.execPath});
-    const operationFailures=[];
+    const operationFailures=[], statusHistory=[], actionHistory=[];
     ops=Object.fromEntries(Object.entries(await createMacControlOperations({toolDir,home:root})).map(([name,operation])=>[name,async(...args)=>{
-      try{return await operation(...args);}catch(error){operationFailures.push(`${name}: ${error.stack}\n${error.stderr||''}`);throw error;}
+      try{
+        const value=await operation(...args);
+        if(name==='serviceStatus'){
+          statusHistory.push({at:new Date().toISOString(),installed:value.taskInstalled,loaded:value.taskRunning,running:value.running,autoStart:value.autoStartEnabled,pid:value.runtime?.processId,mode:value.runtime?.mode});
+          if(statusHistory.length>12)statusHistory.shift();
+        }
+        return value;
+      }catch(error){operationFailures.push(`${name}: ${error.stack}\n${error.stderr||''}`);throw error;}
     }]));
     const action=async name=>{
+      actionHistory.push({action:name,startedAt:new Date().toISOString()});
       const result=await invokeMacControlAction(name,{toolDir,operations:ops,pollAttempts:50,pollMs:100});
       if(!result.ok){
         const log=await fs.readFile(path.join(toolDir,'discord-bridge-guard.log'),'utf8').catch(()=>'(unavailable)');
         const loaded=await exec('/bin/launchctl',['print',`gui/${process.getuid()}/${macAgentLabel(toolDir)}`]).then(({stdout})=>stdout.split('\n').filter(line=>/^\t(?:path|program|working directory|state|pid|active count|last exit code|runs) = /.test(line)).join('\n')).catch(()=>'(unloaded)');
-        assert.fail(`${name}: ${JSON.stringify(result)}\n${operationFailures.join('\n')}\nIsolated supervisor log:\n${log.slice(-12000)}\nIsolated launchd state:\n${loaded}`);
+        let runtimeEvidence;
+        try{
+          const runtime=JSON.parse(await fs.readFile(path.join(toolDir,'discord-bridge-runtime.json'),'utf8'));
+          const info=await ops.getInfo(runtime.processId);
+          runtimeEvidence={runtime:Object.fromEntries(['version','processId','startToken','nodePath','toolDir','mode'].map(key=>[key,runtime[key]])),process:info?Object.fromEntries(['pid','uid','ppid','pgid','executable','startToken','argv'].map(key=>[key,info[key]])):null};
+        }catch(error){runtimeEvidence={unavailable:error.code||error.name};}
+        assert.fail(`${name}: ${JSON.stringify(result)}\n${operationFailures.join('\n')}\nIsolated actions:\n${JSON.stringify(actionHistory)}\nRecent isolated statuses:\n${JSON.stringify(statusHistory)}\nRuntime identity evidence:\n${JSON.stringify(runtimeEvidence)}\nIsolated supervisor log:\n${log.slice(-12000)}\nIsolated launchd state:\n${loaded}`);
       }
       assert.deepEqual(await config(),{enabled:['start-temporary','enable-long-term'].includes(name),unrelated:{value:'retained'}});
       return result;

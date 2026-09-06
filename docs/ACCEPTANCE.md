@@ -11,7 +11,7 @@
 | 新建任务、Git/非 Git/无项目 | journal、幂等与恢复回归；真实本机 Git 工作树创建、提交前失败清理 |
 | 回复续接、继续队列、停止当前回合 | bridge/takeover/router 回归；提交前回退、提交后不确定状态、防止重复发送 |
 | 完成、待确认、额度三个通知通道 | PowerShell 路由、来源频道、额度快照、消息映射、去重与长 JSON 测试 |
-| rollout 补发、离线补收 | 新旧用户输入格式、内部续行识别、逐项失败重试、部分推进时间、归档精确定位与发送资格、去重及损坏状态处理 |
+| rollout 补发、离线补收 | 新旧用户输入格式、压缩历史中的明确回合归属、内部续行识别、逐项失败重试、部分推进时间、归档精确定位与发送资格、去重及损坏状态处理 |
 | 自动目标续行与 Gateway 重连 | 仅有明确 goal 内部上下文的完整回合不进入通知重试；真实/未知输入及 Discord 来源保留保护；RESUMED 恢复 ready，旧连接和已停止客户端不能改变状态 |
 | 未命名任务标题 | 首条真实输入摘要；保留真实名称与旧 inbox，过滤注入上下文，不用尾部续接作为原始标题，Unicode 安全截断 |
 | 系统状态和系统测试 | health、dispatcher synthetic tests；快速/完整检查边界 |
@@ -21,6 +21,7 @@
 | macOS 四种服务操作 | 真实隔离 launchd + 假桥接进程；自启选择保持、临时/长期切换、停用通知与启动恢复 |
 | 停止后禁止通知 | 两平台真实配置读写与受控服务；六种出站通道重读开关、失败重关、启动失败回滚、单实例及登录恢复 |
 | 服务故障恢复 | SIGKILL 后 launchd 恢复；旧锁恢复；父进程退出后清理拒绝 TERM 的子进程 |
+| Mac 退出竞争 | TERM 返回 EPERM 后，仅在有界 signal 0 重检明确得到 ESRCH 时继续原身份清理；持续权限错误、仍存活或未知探测错误保持失败 |
 | 桌面控制台 | 原生编译、应用签名验证、实际进程身份读取、已签名 Codex 桌面状态读取；Mac 原生交互验收保证刷新时按钮可用、旧查询不覆盖新状态、每两秒只更新变化文本 |
 | 退出 Codex 的边界 | 原有 Windows 测试；macOS 受控子进程验证、PID 重用拒绝、孤儿子进程保留与退出等待 |
 | 部署和恢复 | 固定白名单、哈希暂存、私有/未知文件保持、失败回滚、符号链接拒绝、服务选择恢复 |
@@ -50,7 +51,11 @@ macOS 本机验证使用 Apple Silicon、Node.js 24 和 PowerShell 7.6。基线 
 
 旧 Windows 用户于 2026-09-06 确认更新后已修复、不再发送任何消息，因此旧机更新与通知停用验收已取得用户报告。安装时还发现直接在 ZIP 中双击 CMD 会丢失兄弟脚本，现已补上明确的完整解压提示和指南。该用户报告针对当时交付的通知停用修复，不代表此后新增补丁已在旧机重新运行。
 
-最新本机完整验收通过：536 项 Node 测试，4 项 Windows 原生启动器测试跳过；26 套适用于 macOS 的 PowerShell 测试、Node/PowerShell 语法检查和仓库隐私检查通过。四套 Windows API 专用 PowerShell 测试及 Windows 原生启动器用例由 Windows CI 运行。[此前提交 `08a45b8` 的双平台 CI](https://github.com/mxymalay/codex-discord/actions/runs/33990116433)为 macOS 497 项 Node / 26 套 PowerShell、Windows 489 项 Node / 30 套 PowerShell，均为 0 失败；当前提交的结果见 [PR 检查结果](https://github.com/mxymalay/codex-discord/pull/1/checks)。运行方法：
+另一轮持续检查发现两条真实用户记录在历史压缩后保留了明确回合元数据和完成事件，但没有 `task_started`。修复按当前 root 和精确元数据恢复真实输入，保留已归属的旧格式输入，跨 root 清除继承状态；内部抑制和 Discord 来源的终止证明未放宽。真实两条副本分别恢复 2 条、1 条输入，均通过 dispatcher 的 `DryRun` 完成通知资格校验；旧版两条均因空输入拒绝。该验证未实际发送消息或新增模型任务。
+
+托管 Mac CI 还暴露了测试夹具编译占用就绪预算及服务停止时的退出竞争。夹具的 C# 编译移至独立 60 秒准备阶段，仍保留原 20 秒实际进程就绪校验；后续两份托管日志中该原生 guard 用例均通过。进程组已退出但尚未回收时返回 EPERM 已在自有隔离子进程上复现，修复只接受后续明确 ESRCH 的消失证据。另一次 scheduled 启动未在检查窗口内被判定运行的原因尚无充分日志证据，因此四模式测试增加有界状态历史、操作时间和 runtime 身份诊断，不将后续单次通过当作已证明该次失败的根因。
+
+最新本机完整验收通过：563 项 Node 测试，4 项 Windows 原生启动器测试跳过；26 套适用于 macOS 的 PowerShell 测试、Node/PowerShell 语法检查和仓库隐私检查通过。四套 Windows API 专用 PowerShell 测试及 Windows 原生启动器用例由 Windows CI 运行。[此前提交 `08a45b8` 的双平台 CI](https://github.com/mxymalay/codex-discord/actions/runs/33990116433)为 macOS 497 项 Node / 26 套 PowerShell、Windows 489 项 Node / 30 套 PowerShell，均为 0 失败；当前提交的结果见 [PR 检查结果](https://github.com/mxymalay/codex-discord/pull/1/checks)。运行方法：
 
 ```sh
 pwsh -NoProfile -File ./tests/run-tests.ps1

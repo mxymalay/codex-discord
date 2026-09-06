@@ -916,8 +916,10 @@ async function reconstructNotification(item, turnId) {
   const payloadBelongsToTurn = (payload) => [payload?.internal_chat_message_metadata_passthrough?.turn_id, payload?.turn_id]
     .every((value) => value == null || value === '' || String(value) === String(turnId));
   const appendInput = (payload, source) => {
-    if (activeTurnId !== String(turnId)) return;
-    if (!payloadBelongsToTurn(payload)) return;
+    if (!currentRootEligible || !payloadBelongsToTurn(payload)) return;
+    // Compacted history can retain explicit user turn tags while omitting task_started.
+    const explicitlyAttributed = payload?.internal_chat_message_metadata_passthrough?.turn_id === String(turnId);
+    if (activeTurnId !== String(turnId) && !explicitlyAttributed) return;
     const message = boundedText(getUserAuthoredMessageText(payload));
     if (!message) return;
     if (lastInput && !lastInput.mirrored && lastInput.source !== source && lastInput.message === message) {
@@ -931,8 +933,15 @@ async function reconstructNotification(item, turnId) {
     await scanJsonLines(String(item.rolloutPath ?? ''), (entry) => {
       if (entry?.type === 'session_meta') {
         rootMetadataCount++;
+        const previousRootEligible = currentRootEligible;
         currentRootEligible = rootSessionMeta(entry, item.threadId);
-        if (activeTurnId === String(turnId)) rootEligible = rootEligible && currentRootEligible;
+        if (!previousRootEligible || !currentRootEligible) {
+          // A target root must not inherit an active turn or inputs from another root.
+          activeTurnId = '';
+          inputMessages = [];
+          lastInput = null;
+          rootEligible = false;
+        }
       }
       if (activeTurnId !== String(turnId) && ['event_msg', 'response_item'].includes(entry?.type) &&
           (entry.payload?.type === 'user_message' || entry.type === 'response_item' && String(entry.payload?.role ?? '').toLocaleLowerCase() === 'user') &&
@@ -964,11 +973,11 @@ async function reconstructNotification(item, turnId) {
       if (payload.type === 'task_started') {
         activeTurnId = String(payload.turn_id ?? '');
         if (activeTurnId === String(turnId)) { targetStarts++; rootEligible = currentRootEligible; }
-        inputMessages = [];
+        // Collected inputs already belong to this target; only mirror adjacency ends here.
         lastInput = null;
         return undefined;
       }
-      if (payload.type === 'user_message' && activeTurnId === String(turnId)) {
+      if (payload.type === 'user_message') {
         appendInput(payload, 'event');
         return undefined;
       }

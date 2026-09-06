@@ -52,6 +52,26 @@ export function validateRuntimeIdentity(runtime,info,{toolDir,uid=process.getuid
     typeof runtime.startToken==='string' && info.startToken===runtime.startToken && runtime.nodePath===info.executable &&
     JSON.stringify(info.argv?.slice(1))===JSON.stringify([path.join(runtime.toolDir,'discord-macos-control.mjs'),'--supervisor',runtime.mode]);
 }
+export async function terminateVerifiedMacProcessGroup(processGroupId,{signal=(pid,value)=>process.kill(pid,value),pollAttempts=20,pollMs=100,wait=delay}={}) {
+  if(!Number.isSafeInteger(processGroupId)||processGroupId<=1)throw Error('invalid-process-group');
+  try{signal(-processGroupId,'SIGTERM');}
+  catch(error){
+    if(error.code==='ESRCH')return;
+    if(error.code!=='EPERM')throw error;
+    // Darwin can return EPERM for a group containing only unreaped exits.
+    // Only an explicit ESRCH proves the group disappeared after bootout;
+    // native identity lookup failures are not evidence of process exit.
+    for(let attempt=0;attempt<pollAttempts;attempt++) {
+      try{signal(-processGroupId,0);}
+      catch(probeError){
+        if(probeError.code==='ESRCH')return;
+        if(probeError.code!=='EPERM')throw error;
+      }
+      if(attempt+1<pollAttempts)await wait(pollMs);
+    }
+    throw error;
+  }
+}
 async function readJsonBounded(file,max=65536) {
   const stat=await fs.lstat(file); if(!stat.isFile() || stat.isSymbolicLink() || stat.size>max) throw Error('invalid-state');
   return JSON.parse(await fs.readFile(file,'utf8'));
@@ -180,7 +200,7 @@ export async function createMacControlOperations({toolDir=DEFAULT_DIR,nodePath=p
     if(await readLoaded(agent)){await launch(['bootout',target]);}
     const same=(a,b)=>a&&b&&a.pid===b.pid&&a.uid===b.uid&&a.startToken===b.startToken&&a.executable===b.executable;
     if(runtime && validateRuntimeIdentity(runtime,await getInfo(runtime.processId),{toolDir,uid})) {
-      try{process.kill(-runtime.processId,'SIGTERM');}catch(error){if(error.code!=='ESRCH')throw error;}
+      await terminateVerifiedMacProcessGroup(runtime.processId);
     }
     // Retain identities after the group leader exits, so TERM-resistant descendants cannot escape cleanup.
     for(let n=0;n<20;n++){

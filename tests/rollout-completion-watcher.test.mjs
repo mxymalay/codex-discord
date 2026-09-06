@@ -69,6 +69,16 @@ function goalContextMessage() {
   };
 }
 
+function taggedUserMessage(text) {
+  return {
+    type: 'response_item',
+    payload: {
+      type: 'message', role: 'user', content: [{ type: 'input_text', text }],
+      internal_chat_message_metadata_passthrough: { turn_id: turnId, content_item_kinds: ['user.text'] },
+    },
+  };
+}
+
 function taskComplete(message = '已经完成修复。') {
   return {
     timestamp: '2026-09-01T00:00:10.000Z',
@@ -801,6 +811,128 @@ test('legacy and unlabelled response inputs preserve the last real message acros
     await pollRolloutCompletions({sessionsRoot:paths.sessionsRoot,state,nowMs:Date.parse('2026-09-01T00:00:20.000Z'),graceMs:0,retryMs:0,dispatchNotification:async(value)=>captured.push(value)});
     assert.deepEqual(captured[0]['input-messages'],['A','B','A']);
   } finally { await fs.rm(paths.root,{recursive:true,force:true}); }
+});
+
+test('reconstructs exact tagged user inputs from compacted root turns without a task-started event', async (t) => {
+  for (const variant of ['two-text-messages', 'text-and-image']) {
+    await t.test(variant, async () => {
+      const paths = await fixture();
+      try {
+        const inherited = { ...sessionMeta(), payload: { ...sessionMeta().payload, id: 'inherited-child', thread_source: 'subagent', parent_thread_id: threadId } };
+        const inputs = variant === 'two-text-messages' ? [taggedUserMessage('first request'), taggedUserMessage('second request')] : [{
+          type: 'response_item', payload: { type: 'message', role: 'user',
+            content: [{ type: 'input_text', text: 'first text' }, { type: 'input_text', text: 'second text' }, { type: 'input_image', image_url: 'private-image-canary' }, { type: 'input_text', text: 'last text' }],
+            internal_chat_message_metadata_passthrough: { turn_id: turnId, content_item_kinds: ['user.text', 'user.text', 'user.image', 'user.text'] },
+          },
+        }];
+        await fs.writeFile(paths.rolloutPath, [inherited, sessionMeta(), { type: 'compacted', payload: {} }, { type: 'world_state', payload: {} },
+          turnContext(), ...inputs, taskComplete('compacted target result'),
+        ].map(jsonLine).join(''), 'utf8');
+        let state = createEmptyRolloutWatcherState(); state.initialized = true;
+        const captured = [];
+        for (let attempt = 0; attempt < 2; attempt++) {
+          await pollRolloutCompletions({ sessionsRoot: paths.sessionsRoot, state, nowMs: Date.parse('2026-09-01T00:00:20.000Z'), graceMs: 0, retryMs: 0,
+            dispatchNotification: async (notification) => captured.push(notification),
+          });
+          assert.equal(captured.length, 1);
+          assert.deepEqual(captured[0]['input-messages'], variant === 'two-text-messages' ? ['first request', 'second request'] : ['first text\nsecond text\nlast text']);
+          assert.equal(captured[0]['last-assistant-message'], 'compacted target result');
+          assert.equal(captured[0].model, 'gpt-5.6-sol');
+          assert.equal(captured[0]['reasoning-effort'], 'ultra');
+          assert.equal(state.suppressedInternalTurnCount, undefined);
+          assert.deepEqual(state.pending, {});
+          assert.doesNotMatch(JSON.stringify(state), /first request|last text|private-image-canary|compacted target result/);
+          state = JSON.parse(JSON.stringify(state));
+        }
+      } finally { await fs.rm(paths.root, { recursive: true, force: true }); }
+    });
+  }
+});
+
+test('later task starts preserve explicitly attributed inputs and their adjacent legacy mirrors', async (t) => {
+  for (const variant of ['tagged-before-start', 'legacy-mirror-promoted', 'same-text-after-boundary']) {
+    await t.test(variant, async () => {
+      const paths = await fixture();
+      try {
+        const first = variant === 'legacy-mirror-promoted' ? [taskStarted(), userMessage('first request'), taggedUserMessage('first request')] : [taggedUserMessage('first request')];
+        const nextText = variant === 'same-text-after-boundary' ? 'first request' : 'second request';
+        const mirrored = userMessage(nextText);
+        mirrored.payload.internal_chat_message_metadata_passthrough = { turn_id: turnId, content_item_kinds: ['user.text'] };
+        await fs.writeFile(paths.rolloutPath, [sessionMeta(), ...first,
+          { type: 'event_msg', payload: { type: 'task_started', turn_id: 'other-turn' } }, userMessage('unrelated untagged input'),
+          ...(variant === 'same-text-after-boundary' ? [mirrored] : [taggedUserMessage(nextText), mirrored]), taskComplete(),
+        ].map(jsonLine).join(''), 'utf8');
+        const state = createEmptyRolloutWatcherState(); state.initialized = true;
+        const captured = [];
+        await pollRolloutCompletions({ sessionsRoot: paths.sessionsRoot, state, nowMs: Date.parse('2026-09-01T00:00:20.000Z'), graceMs: 0, retryMs: 0,
+          dispatchNotification: async (notification) => captured.push(notification),
+        });
+        assert.equal(captured.length, 1);
+        assert.deepEqual(captured[0]['input-messages'], ['first request', nextText]);
+      } finally { await fs.rm(paths.root, { recursive: true, force: true }); }
+    });
+  }
+});
+
+test('later task starts retain every user input already attributed within the current root target span', async () => {
+  const paths = await fixture();
+  try {
+    await fs.writeFile(paths.rolloutPath, [sessionMeta(), taskStarted(), taggedUserMessage('first tagged request'),
+      userMessage('latest legacy request'), { type: 'event_msg', payload: { type: 'task_started', turn_id: 'other-turn' } },
+      userMessage('unrelated input'), taskComplete(),
+    ].map(jsonLine).join(''), 'utf8');
+    const state = createEmptyRolloutWatcherState(); state.initialized = true;
+    const captured = [];
+    await pollRolloutCompletions({ sessionsRoot: paths.sessionsRoot, state, nowMs: Date.parse('2026-09-01T00:00:20.000Z'), graceMs: 0, retryMs: 0,
+      dispatchNotification: async (notification) => captured.push(notification),
+    });
+    assert.equal(captured.length, 1);
+    assert.deepEqual(captured[0]['input-messages'], ['first tagged request', 'latest legacy request']);
+  } finally { await fs.rm(paths.root, { recursive: true, force: true }); }
+});
+
+test('explicit input recovery rejects wrong roots and ambiguous turn tags without weakening origin boundaries', async (t) => {
+  for (const variant of ['wrong-root', 'wrong-root-with-start', 'inherited-input-before-root', 'inherited-start-before-root', 'wrong-turn', 'conflicting-turn-tags', 'missing-tag', 'missing-tag-with-payload-id', 'discord-origin-without-start']) {
+    await t.test(variant, async () => {
+      const paths = await fixture();
+      try {
+        const input = taggedUserMessage('must not borrow this input');
+        if (variant === 'wrong-turn') input.payload.internal_chat_message_metadata_passthrough.turn_id = 'other-turn';
+        if (variant === 'conflicting-turn-tags') input.payload.turn_id = 'other-turn';
+        if (variant.startsWith('missing-tag')) delete input.payload.internal_chat_message_metadata_passthrough.turn_id;
+        if (variant === 'missing-tag-with-payload-id') input.payload.turn_id = turnId;
+        const wrongMeta = { ...sessionMeta(), payload: { ...sessionMeta().payload, id: 'other-root' } };
+        const entries = variant === 'inherited-input-before-root' ? [wrongMeta, taskStarted(), input, sessionMeta(), taskComplete()]
+          : variant === 'inherited-start-before-root' ? [wrongMeta, taskStarted(), sessionMeta(), userMessage('must not borrow this input'), taskComplete()]
+          : [variant.startsWith('wrong-root') ? wrongMeta : sessionMeta(), ...(variant === 'wrong-root-with-start' ? [taskStarted()] : []), input, taskComplete()];
+        const content = entries.map(jsonLine).join('');
+        await fs.writeFile(paths.rolloutPath, content, 'utf8');
+        const state = createEmptyRolloutWatcherState(); state.initialized = true;
+        state.files[path.resolve(paths.rolloutPath)] = { offset: Buffer.byteLength(content), threadId, cwd: sessionMeta().payload.cwd, activeTurnId: '', rootEligible: true };
+        state.pending[turnId] = { completedAtMs: Date.parse('2026-09-01T00:00:10.000Z'), lastAttemptAtMs: 0, rolloutPath: paths.rolloutPath, threadId, cwd: sessionMeta().payload.cwd };
+        const inboxState = createEmptyInboxState();
+        if (variant === 'discord-origin-without-start') inboxState.discordTurnOrigins[turnId] = {
+          threadId, guildId: '222222222222222222', channelId: '777777777777777777', source: 'slash',
+          createdAt: '2026-09-01T00:00:01.000Z', rolloutCursor: 0, deliveredEventIds: [], deliveryState: 'pending',
+        };
+        let dispatches = 0;
+        await pollRolloutCompletions({ sessionsRoot: paths.sessionsRoot, state, inboxState, persistInboxState: async () => {},
+          nowMs: Date.parse('2026-09-01T00:00:20.000Z'), graceMs: 0, retryMs: 0,
+          dispatchNotification: async (notification) => {
+            dispatches++;
+            assert.deepEqual(notification['input-messages'], []);
+            throw new Error('retain-ambiguous-explicit-input');
+          },
+        }).catch((error) => assert.match(error.message, /retain-ambiguous-explicit-input/));
+        assert.equal(Object.hasOwn(state.pending, turnId), true);
+        assert.equal(state.suppressedInternalTurnCount, undefined);
+        if (variant === 'discord-origin-without-start') {
+          assert.equal(dispatches, 0, 'input recovery must not bypass the existing exact origin terminal boundary');
+          assert.equal(inboxState.discordTurnOrigins[turnId].deliveryState, 'pending');
+        } else assert.equal(dispatches, 1);
+      } finally { await fs.rm(paths.root, { recursive: true, force: true }); }
+    });
+  }
 });
 
 test('one failed terminal dispatch preserves its retry while later completions are delivered and the error propagates', async () => {
